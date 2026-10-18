@@ -76,7 +76,7 @@
   },
   "gate_threshold": {
     "type": "int",
-    "description": "触发阈值（0-100，越高越矜持）",
+    "description": "触发阈值（允许 1–100，越高越矜持；超过 100 会永久沉默，保存时被拦下）",
     "default": 80
   },
   "gate_window_seconds": {
@@ -86,12 +86,12 @@
   },
   "gate_backoff_base": {
     "type": "int",
-    "description": "被拦下后最小静默间隔（秒）",
+    "description": "被拦下后最小静默间隔（秒，允许 1–60）",
     "default": 15
   },
   "gate_backoff_max": {
     "type": "int",
-    "description": "被拦下后最大静默间隔（秒）",
+    "description": "被拦下后最大静默间隔（秒，允许 15–600，且必须 ≥ 起步值）",
     "default": 300
   },
   "memory_inject_enabled": {
@@ -102,12 +102,12 @@
   "memory_inject_top_k": {
     "type": "int",
     "description": "每轮最多注入几条记忆",
-    "default": 5
+    "default": 8
   },
   "memory_inject_budget_tokens": {
     "type": "int",
-    "description": "每轮注入记忆的长度预算（字符；粗上限，防挤爆上下文。约等于 1/4 的 token 数）",
-    "default": 600
+    "description": "每轮注入记忆的长度预算（字符，不是 token；粗上限，防止挤爆上下文）",
+    "default": 1200
   },
   "favour_enabled": {
     "type": "bool",
@@ -165,6 +165,11 @@
       "中（最多 2 处）"
     ]
   },
+  "output_typo_rate": {
+    "type": "float",
+    "description": "错字率（允许 0–0.03；错字机制档位见 output_typo_mode）",
+    "default": 0.01
+  },
   "import_layers": {
     "type": "list",
     "description": "LivingMemory 导入层：documents（整段记忆）/ atoms（原子事实）",
@@ -186,16 +191,16 @@
   "memory_capture_turns": {
     "type": "int",
     "description": "记忆捕获：攒够几轮对话总结一次",
-    "default": 6
+    "default": 4
   },
   "memory_capture_min_interval": {
     "type": "int",
-    "description": "记忆捕获：两次总结的最短间隔（秒）",
-    "default": 300
+    "description": "记忆捕获：两次总结的最短间隔（秒，允许 0–3600）",
+    "default": 120
   },
   "memory_capture_max_per_run": {
     "type": "int",
-    "description": "记忆捕获：单轮最多写入几条记忆",
+    "description": "记忆捕获：单轮最多写入几条记忆（允许 1–20）",
     "default": 5
   },
   "cross_session_enabled": {
@@ -216,12 +221,12 @@
   "memory_decay_half_life_days": {
     "type": "float",
     "description": "记忆强度半衰期（天）：越久没被提及越弱",
-    "default": 21
+    "default": 45
   },
   "memory_evict_below": {
     "type": "float",
     "description": "强度低于此值的记忆优先淘汰",
-    "default": 0.08
+    "default": 0.05
   },
   "forget_enabled": {
     "type": "bool",
@@ -230,22 +235,22 @@
   },
   "archive_after_days": {
     "type": "int",
-    "default": 30,
-    "description": "归档周期（天）：多久没被提及就归档"
+    "default": 90,
+    "description": "归档周期（天）：多久没被提及就归档（允许 1–3650；归档≠删除，仍可被召回并自动拉回）"
   },
   "forget_after_days": {
     "type": "int",
-    "default": 30,
-    "description": "遗忘周期（天）：归档后再多久没被提及且不重要就遗忘"
+    "default": 180,
+    "description": "遗忘周期（天）：归档后再多久没被提及且不重要才遗忘（允许 1–365）"
   },
   "forget_min_strength": {
     "type": "float",
-    "default": 0.35,
+    "default": 0.2,
     "description": "遗忘强度下限：低于它才可能被遗忘（重要记忆受保护）"
   },
   "forget_keep_poignancy": {
     "type": "float",
-    "default": 8,
+    "default": 6,
     "description": "情绪强度保护线：达到它的一律不遗忘"
   },
   "forget_batch_per_tick": {
@@ -265,17 +270,17 @@
   },
   "output_typing_delay": {
     "type": "bool",
-    "description": "补发的后续条目按打字时长延迟（首条立即发）",
-    "default": true
+    "description": "补发的后续条目按打字时长延迟（首条立即发）；新装默认关，库里已有值不受影响",
+    "default": false
   },
   "output_typing_per_char": {
     "type": "float",
-    "description": "每个字的打字秒数",
+    "description": "每个字的打字秒数（允许 0.2–2.0，越小越快）",
     "default": 0.3
   },
   "output_typing_max": {
     "type": "float",
-    "description": "单条打字延迟上限（秒）",
+    "description": "单条打字延迟上限（秒，允许 3–30）",
     "default": 6.0
   },
   "sticker_slot": {
@@ -290,12 +295,12 @@
   },
   "favour_daily_cap": {
     "type": "int",
-    "description": "好感日上限：当天正增量累计到此封顶（0=不限）",
+    "description": "好感日上限：当天正增量累计到此封顶（0=不限，上限 100）",
     "default": 15
   },
   "favour_daily_half_life_days": {
     "type": "float",
-    "description": "好感 daily 的半衰期天数（0=关闭衰减）",
+    "description": "好感 daily 的半衰期天数（0=关闭衰减；允许 0–60）",
     "default": 0
   },
   "favour_tag_required": {
@@ -307,6 +312,51 @@
     "type": "int",
     "description": "表达习惯至少生效过 N 次才算已验证",
     "default": 3
+  },
+  "expression_auto_min_corpus": {
+    "type": "int",
+    "description": "未学语料自动提取门槛（攒够 N 条自动学一次；0 = 只手动）",
+    "default": 20
+  },
+  "output_expr_max_inject": {
+    "type": "int",
+    "description": "单轮最多注入几条表达习惯（允许 0–10）",
+    "default": 5
+  },
+  "expression_review_first": {
+    "type": "bool",
+    "description": "先审后用：学到的新表达先等你过目才进注入池（默认关 = 自动通过，学到就能用）",
+    "default": false
+  },
+  "jargon_enabled": {
+    "type": "bool",
+    "description": "黑话理解：听懂群友的特殊用语/梗（只做理解，不进回复库）",
+    "default": true
+  },
+  "jargon_name_filter": {
+    "type": "bool",
+    "description": "黑话人名过滤：候选挖掘时滤掉已知昵称/群名（防止把某人昵称学成黑话）",
+    "default": true
+  },
+  "jargon_candidate_min_sessions": {
+    "type": "int",
+    "description": "黑话机械候选门槛：跨几个会话才送推断（默认 2；参数中心可调）",
+    "default": 2
+  },
+  "jargon_candidate_min_hits": {
+    "type": "int",
+    "description": "黑话机械候选门槛：出现几次才送推断（默认 4；参数中心可调）",
+    "default": 4
+  },
+  "jargon_infer_daily_batches": {
+    "type": "int",
+    "description": "黑话含义推断每日批数（默认 1；0 = 关自动推断）",
+    "default": 1
+  },
+  "jargon_try_daily_quota": {
+    "type": "int",
+    "description": "试解读每日配额（默认 20；单次 1 条短请求、输出 ≤200 tokens；0 = 不限）",
+    "default": 20
   },
   "memory_summary_prompt": {
     "type": "string",
@@ -366,7 +416,7 @@
   },
   "recall_keep_days": {
     "type": "int",
-    "description": "被撤回消息的留档天数（面板撤回页可查）",
+    "description": "被撤回消息的留档天数（允许 1–365）",
     "default": 30
   },
   "track_platforms": {
@@ -394,8 +444,8 @@
   },
   "proactive_shadow": {
     "type": "bool",
-    "description": "主动开口影子模式：只记录候选不真发（建议先跑几天）",
-    "default": true
+    "description": "影子模式：只记录候选，不真的发送",
+    "default": false
   },
   "proactive_idle_min": {
     "type": "int",
@@ -404,7 +454,7 @@
   },
   "proactive_daily_cap": {
     "type": "int",
-    "description": "每天最多主动开口几次（当天随机排布时间点）",
+    "description": "每个会话每天最多主动几条；多会话按会话数放大",
     "default": 3
   },
   "proactive_min_interval_min": {
@@ -414,18 +464,27 @@
   },
   "proactive_quiet_start": {
     "type": "string",
-    "description": "免打扰开始时间（HH:MM）",
-    "default": "23:30"
+    "description": "免打扰开始时间（HH:MM；默认 01:30）",
+    "default": "01:30"
   },
   "proactive_quiet_end": {
     "type": "string",
-    "description": "免打扰结束时间（HH:MM）",
-    "default": "08:00"
+    "description": "免打扰结束时间（HH:MM；默认 07:30）",
+    "default": "07:30"
   },
   "proactive_min_zone": {
     "type": "string",
-    "description": "至少到哪个关系区间才开口（NEUTRAL/FAMILIAR/CLOSE）",
-    "default": "FAMILIAR"
+    "description": "最低关系档位；留空 = 不设门槛（不依赖好感系统）",
+    "default": "",
+    "options": [
+      "",
+      "HOSTILE",
+      "COLD",
+      "NEUTRAL",
+      "FAMILIAR",
+      "CLOSE",
+      "DEVOTED"
+    ]
   },
   "proactive_last_only": {
     "type": "bool",
@@ -434,23 +493,38 @@
   },
   "proactive_style": {
     "type": "string",
-    "description": "开口风格提示词（短句、不追问最好用）",
-    "default": "自然地开一句话题，短、不追问、不解释自己为什么开口"
+    "description": "开口风格参考（软提示，不合适会被忽略）",
+    "default": "用你平时说话的方式，想说什么就说什么"
   },
   "proactive_mode_group": {
     "type": "string",
-    "description": "群聊开口名单模式：white=只发白名单 / black=只排除黑名单 / off=不开口",
-    "default": "white"
+    "description": "群聊主动名单：white=只对名单内 / black=只对名单内不主动 / off=不主动",
+    "default": "black",
+    "options": [
+      "white",
+      "black",
+      "off"
+    ]
   },
   "proactive_mode_private": {
     "type": "string",
-    "description": "私聊开口名单模式：white / black / off",
-    "default": "white"
+    "description": "私聊主动名单：white=只对名单内 / black=只对名单内不主动 / off=不主动",
+    "default": "black",
+    "options": [
+      "white",
+      "black",
+      "off"
+    ]
   },
   "proactive_auto_wl": {
     "type": "string",
-    "description": "自动把聊过的人加进主动名单（off=必须手填）",
-    "default": "off"
+    "description": "自动把聊过的人加进主动名单：off=关 / close=亲近的人 / familiar=熟人及以上",
+    "default": "off",
+    "options": [
+      "off",
+      "close",
+      "familiar"
+    ]
   },
   "proactive_wl_private": {
     "type": "list",
@@ -480,7 +554,37 @@
   "proactive_context_memories": {
     "type": "int",
     "description": "开口前注入几条记忆",
+    "default": 6
+  },
+  "proactive_instruction": {
+    "type": "string",
+    "description": "主动消息第 2 层提示词（本轮情境）：留空=用插件内置；面板「主动 → 参数」页底部可展开编辑；支持 {zone}/{tone}/{idle} 占位符",
+    "default": ""
+  },
+  "proactive_writeback": {
+    "type": "bool",
+    "description": "把主动消息写回 AstrBot 对话历史（用原生 content parts，bot 能记得自己说过什么）",
+    "default": true
+  },
+  "proactive_note_enabled": {
+    "type": "bool",
+    "description": "写回失败/空历史时的兜底：下一轮注入「你最近主动发过」",
+    "default": true
+  },
+  "proactive_note_hours": {
+    "type": "int",
+    "description": "主动消息知会回看窗口（小时）",
+    "default": 24
+  },
+  "proactive_note_max": {
+    "type": "int",
+    "description": "主动消息知会最多带几条",
     "default": 3
+  },
+  "proactive_prompt_max_age_min": {
+    "type": "int",
+    "description": "主动开口复用 AstrBot 完整提示词的缓存时效（分钟），超时降级为只吃人格并在流水标注",
+    "default": 720
   },
   "sys_prompt_memory_summary": {
     "type": "string",
@@ -565,5 +669,48 @@
     "default": "",
     "_special": "select_provider",
     "hint": "留空时自动挑 AstrBot 里配置的重排模型"
+  },
+  "conn_mode_group": {
+    "type": "string",
+    "description": "群聊可见性：black=黑名单（空=谁都不回）/ white=白名单（空=谁都不回）",
+    "default": "black",
+    "options": [
+      "black",
+      "white"
+    ]
+  },
+  "conn_mode_private": {
+    "type": "string",
+    "description": "私聊可见性：black=黑名单（空=谁都不回）/ white=白名单（空=谁都不回）",
+    "default": "black",
+    "options": [
+      "black",
+      "white"
+    ]
+  },
+  "conn_black_group": {
+    "type": "list",
+    "description": "群聊可见性黑名单（群号）",
+    "default": []
+  },
+  "conn_white_group": {
+    "type": "list",
+    "description": "群聊可见性白名单（群号；空白名单=谁都不回）",
+    "default": []
+  },
+  "conn_black_private": {
+    "type": "list",
+    "description": "私聊可见性黑名单（QQ 号）",
+    "default": []
+  },
+  "conn_white_private": {
+    "type": "list",
+    "description": "私聊可见性白名单（QQ 号；空白名单=谁都不回）",
+    "default": []
+  },
+  "persona_active_id": {
+    "type": "string",
+    "description": "当前人格 id；留空=跟随 AstrBot 原生当前人格",
+    "default": ""
   }
 }

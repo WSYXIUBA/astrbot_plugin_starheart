@@ -1,23 +1,31 @@
 /**
- * StarHeart 面板 · 总览 / 表达学习 / 人格 / 设置
+ * StarHeart 面板 · 总览 / 语言学习 / 人格 / 设置
  *
  * 图形化取舍：
  * - 总览：模块之间是**依赖关系**（门控决定开口、记忆喂门控、好感调语气），用迷你网络图标出来比平铺卡片更能说明结构。
- * - 表达学习：本质是「情景 → 表达」的映射，用二分图（桑基）画。
+ * - 语言学习：本质是「情景 → 表达」的映射，用二分图（桑基）画。
  * - Token：按任务与模型聚合是后端给的真数据，不做按天趋势（后端没有这个口径，不编）。
- * - 设置：模块开关 + 危险区，模块卡带状态灯。
+ * - 设置：模块开关 + 数据治理（破坏性操作集中卡），模块卡带状态灯。
  */
 
-import * as C from "./charts.js?v=1.0.1";
+import * as C from "./charts.js?v=1.0.2";
 import {
   $, $$, api, apiSafe, apiPostSafe, esc, fmtNum, fmtPct, fmt1, fmtTime, timeAgo, toast, openDrawer, closeDrawer,
   confirmModal, formModal, pageHead, card, kpiCard, kpis, secTitle, mount, emptyBlock, skelBlock, jsStr, STATE, segmentHtml,
-  syncSeg, bridge, EP, refreshCurrent, goPage, countUp,
-} from "./store.js?v=1.0.1";
-import { renderDomainConf, domainRowsHtml, CONFIG_META } from "./views-conf.js?v=1.0.1";
-import { ATOM_LABEL } from "./views-memory.js?v=1.0.1";
-import { GRAPH_PALETTE } from "./graph.js?v=1.0.1";
+  syncSeg, bridge, EP, refreshCurrent, goPage, countUp, configTouchedAt, noteConfigTouched, recentFirstKeys, takeConfigDirty, nativeWriteError,
+} from "./store.js?v=1.0.2";
+import { renderDomainConf, domainRowsHtml, CONFIG_META } from "./views-conf.js?v=1.0.2";
+// 收尾批：四个消息域的参数渲染器（原页底折叠区）——原样迁进本文件的「设置 · 模块与参数」页
+import { renderGateConf, renderProactiveConf, renderRecallConf, renderFavourConf } from "./views-events.js?v=1.0.2";
+import { ATOM_LABEL } from "./views-memory.js?v=1.0.2";
+import { GRAPH_PALETTE } from "./graph.js?v=1.0.2";
 
+// S4-2：「先审后用」开关挂语言学习域。CONFIG_META 由 views-conf.js 定义并被域页过滤读取，
+// 新键必须登记在这里，否则参数页不渲染、保存也会被 CONFIG_META 过滤掉（静默丢键）。
+CONFIG_META.expression_review_first = ["先审后用", "学到的新表达先等你过目（默认关 = 自动通过，学到就能用）", "bool"];
+
+// 菜单徽标「待审 N」：进应用时拉一次（N>0 才显示）
+setTimeout(() => { syncExpressionBadge().catch(() => {}); }, 1200);
 const ATOM_COLOR = GRAPH_PALETTE.memory;
 const MODULES = [
   { key: "memory", label: "记忆", icon: "◍", col: "#3c96ca" },
@@ -58,7 +66,7 @@ export async function renderOverview() {
     { n: "记忆系统", ok: c.master_switch !== false, d: `${fmtNum(ov.memories)} 条 · 平均强度 ${fmt1(ov.memory_avg_strength)}` },
     { n: "门控" + (c.gate_shadow ? "（影子）" : ""), ok: !!c.gate_enabled, d: c.gate_shadow ? "只记录不拦截" : "低于阈值会沉默" },
     { n: "关系链", ok: !gstatsErr && (gstats.avg_degree || 0) > 0.3, d: chainSub },
-    { n: "表达学习", ok: !!c.output_enabled, d: `习惯 ${fmtNum(ov.habits)} 条` },
+    { n: "语言学习", ok: !!c.output_enabled, d: `习惯 ${fmtNum(ov.habits)} 条` },
     { n: "主动消息", ok: !!c.proactive_enabled, d: c.proactive_enabled ? "已启用" : "未启用（默认关）" },
     { n: "LivingMemory", ok: !!lm.installed, d: lm.installed ? `可导入 ${fmtNum((lm.documents || 0) + (lm.atoms || 0))} 条 · 已导入 ${fmtNum(lm.imported)}` : "未检测到该插件" },
     { n: "好感结算", ok: !!c.favour_enabled, d: `跟踪 ${fmtNum(ov.favours)} 人` },
@@ -92,6 +100,10 @@ export async function renderOverview() {
           </div></div>`
           )
           .join("")}
+      </div>
+      <div class="row bt wrap" style="gap:9px;margin-top:11px;padding-top:9px;border-top:1px solid var(--bd)">
+        <button class="btn xs" onclick="goPage('metrics')">去拟人指标 →</button>
+        <span class="mut" style="font-size:10.5px">行为质量不在这一页 —— 总览只说「存了多少」；说得像不像人，去「拟人指标」看</span>
       </div>`,
       { title: "模块状态", sub: "按当前配置实时判定" }
     )}
@@ -124,7 +136,7 @@ export async function renderOverview() {
         { id: "msg", stage: 0, label: "消息进来", icon: "✉", value: fmtNum(ov.gate_total), unit: "次评估", sub: "收到并被评估的消息", color: "#3c96ca", to: ["messages", "gate"] },
         { id: "gate", stage: 1, label: "门控决策", icon: "◐", value: fmtPct(ov.gate_rate, 1), unit: "开口率", sub: c.gate_shadow ? "影子模式：只记录不拦" : "低于阈值会沉默", color: "#03c9d7", to: ["messages", "gate"] },
         { id: "mem", stage: 2, label: "记忆库", icon: "◍", value: fmtNum(ov.memories), unit: "条", sub: `实体 ${fmtNum(ov.entities)} · 平均强度 ${fmt1(ov.memory_avg_strength)}`, color: "#4a90d9", to: ["memory", "graph"] },
-        { id: "exp", stage: 2, label: "表达学习", icon: "✎", value: fmtNum(ov.habits), unit: "条习惯", sub: c.output_enabled ? "会按习惯说话" : "输出拟人化未开", color: "#8b5cf6", to: ["expression", "lib"] },
+        { id: "exp", stage: 2, label: "语言学习", icon: "✎", value: fmtNum(ov.habits), unit: "条习惯", sub: c.output_enabled ? "会按习惯说话" : "输出拟人化未开", color: "#8b5cf6", to: ["expression", "lib"] },
         { id: "link", stage: 3, label: "关系链", icon: "⬡", value: fmtNum(ov.edges), unit: "条边", sub: chainSub, color: "#00c853", to: ["memory", "graph"] },
         { id: "fav", stage: 3, label: "好感结算", icon: "♥", value: fmtNum(ov.favours), unit: "人", sub: "区间会变成语气描述", color: "#e0559a", to: ["messages", "favour"] },
         { id: "out", stage: 4, label: "回复输出", icon: "➤", value: on(c.output_enabled), unit: "", sub: "拟人化 / 分条 / 错别字", color: "#f59e0b", to: ["settings", "main"] },
@@ -191,97 +203,520 @@ export async function hfRefreshOverview(btn) {
 }
 
 /* ==================================================================
-   表达学习
+   语言学习
    ================================================================== */
-let HB_FILTER = { q: "", kind: "all", on: "all", sort: "uses" };
+let HB_FILTER = { q: "", kind: "all", state: "all", on: "all", sort: "new" };
 let HB_EDIT = 0;     // 正在就地编辑哪一条（0 = 没有）
+let HB_BANS = { items: [], total: 0 };
+let HB_RUNS = { items: [], corpus: {}, health: {}, enum: [] };
+/* —— ② 黑话（S5）：清单 / 命中日志 / 试解读；阈值与配额读后端真值（config/domains） —— */
+let JG_FILTER = { q: "", status: "all" };
+let JG_DATA = { items: [], counts: {}, config: {}, check: null };
+let JG_EDIT = 0;                    // 正在改释义哪一条（0 = 没有）
+const JG_HITS = {};                 // term_id → 命中日志（懒加载，每次整页重渲染后重新缓存）
+const JG_STATUS = { pending: ["待确认", "warn"], confirmed: ["已确认", "ok"], denied: ["已否定", "gy"] };
+
+/** 审核态归一（一律读后端的 checked_state / status，不在前端猜） */
+function hbStateOf(h) {
+  if (String(h.status || "active") === "archived") return "archived";
+  const s = String(h.checked_state || "");
+  return s === "user_reject" ? "rejected" : s === "user_ok" ? "ok" : s === "ai_pending" ? "pending" : "other";
+}
+
+/** 审核 tag（待审 / 已通过 / 已驳回 / 已清空） */
+function hbStateTag(h) {
+  const st = hbStateOf(h);
+  if (st === "archived") return '<span class="tag gy" title="「只清表达」软删的行：移出「不再学」名单即可恢复">已清空</span>';
+  if (st === "rejected") return '<span class="tag dg" title="驳回＝写进「不再学」名单，模型不会重新学（可恢复）">已驳回</span>';
+  if (st === "ok") return '<span class="tag ok" title="已通过审核（默认自动通过）">已通过</span>';
+  if (st === "pending") return '<span class="tag warn" title="等你看一眼：开着「先审后用」时它不会进注入池">待审</span>';
+  return "";
+}
+
+/** 「当前人格可用」徽标：可用性只读后端求值（available_now / current_persona_ok），与注入侧同一判定 */
+function hbAvailBadge(h) {
+  if (h.current_persona_ok === true) {
+    return '<span class="tag ok" title="当前人格可用 · 与注入侧同一判定（scope + 审核 + 冷却 + 24h 名额）">当前人格可用</span>';
+  }
+  const label = String(h.available_now || "");
+  return label ? `<span class="chip gy" title="当前人格不可注入的原因（与注入侧同一判定）">✗ ${esc(label)}</span>` : "";
+}
+
+/** 菜单徽标：语言学习 →「待审 N」（N>0 才显示；窄轨下也可见 —— CSS 由本函数注入） */
+function ensureHbBadgeCss() {
+  if (typeof document === "undefined" || document.getElementById("hbBadgeCss")) return;
+  const st = document.createElement("style");
+  st.id = "hbBadgeCss";
+  st.textContent =
+    "#railNav .nav{position:relative}" +
+    "#railNav .nav .hbpend{position:absolute;top:4px;right:7px;min-width:17px;height:17px;line-height:17px;" +
+    "padding:0 5px;border-radius:999px;background:var(--gold,#c8a15a);color:#1a1a1a;font-size:10.5px;" +
+    "font-weight:700;text-align:center;pointer-events:none}";
+  document.head.appendChild(st);
+}
+
+/** 同步菜单徽标。传 n = 已知待审数（省一次请求）；不传就自己查一次。拿不到数字就不显示，绝不编数。 */
+export async function syncExpressionBadge(n) {
+  try {
+    ensureHbBadgeCss();
+    const nav = document.getElementById("railNav");
+    if (!nav) return;
+    const btn = nav.querySelector('[data-nav="expression"]');
+    if (!btn) return;
+    let num = n;
+    if (num === undefined || num === null) {
+      const r = await apiSafe("expr/review", {}, { counts: {} });
+      num = Number((((r || {}).counts) || {}).pending || 0);
+    }
+    num = Math.max(0, Number(num) || 0);
+    let el = btn.querySelector(".hbpend");
+    if (num <= 0) {                       // 默认自动通过 → 待审恒 0 → 徽标不显示
+      if (el) el.remove();
+      return;
+    }
+    if (!el) {
+      el = document.createElement("span");
+      el.className = "hbpend";
+      btn.appendChild(el);
+    }
+    el.textContent = String(num);
+    el.title = `待审 ${num} 条表达`;
+  } catch (err) {
+    /* 徽标拿不到就不显示 */
+  }
+}
+
+/** 「不再学」名单（独立卡）：可查、可移出 */
+function renderBansBlock() {
+  const rows = HB_BANS.items.length
+    ? HB_BANS.items
+        .map(
+          (b) => `<div class="card cp" style="padding:9px 12px">
+        <div class="row bt" style="gap:9px">
+          <div style="min-width:0">
+            <div class="pn">${esc(String(b.key || b.norm_key || "—"))}</div>
+            <div class="pd">理由：${esc(String(b.reason || "—"))} · ${esc(fmtTime(b.ts))} · 来源 ${esc(String(b.actor || "panel"))}${b.note ? "（" + esc(String(b.note)) + "）" : ""}</div>
+          </div>
+          <button class="btn xs" data-hbban="1" data-hbnk="${esc(String(b.norm_key || ""))}">移出名单</button>
+        </div>
+      </div>`
+        )
+        .join("")
+    : emptyBlock("名单是空的 —— 驳回或删除的表达会出现在这里，模型不会把它们学回来", "✩");
+  return `<div class="sec-t">「不再学」名单（${fmtNum(HB_BANS.total)}）</div>
+    <div class="mut" style="font-size:11px;margin:-4px 0 8px">写进这里 = 提取路径遇到同一条说法直接跳过（修「删了还会再学」）。移出后可以重新学到，被清空的同键条目也会一并恢复。</div>
+    <div class="col">${rows}</div>`;
+}
+
+/** ③ 学习诊断：每次提取的成败与跳过原因（S4-4）+ 语料存量 + 出处回查健康度（E3） */
+function renderExprRunsBlock() {
+  const enumList = HB_RUNS.enum || [];
+  const reasonText = (v) => {
+    const key = String(v || "");
+    if (!key) return "—（有产出）";
+    const e = enumList.find((x) => x.value === key);
+    return e ? String(e.text) + (e.reserved ? "（reserved）" : "") : key;
+  };
+  const rows = (HB_RUNS.items || []).length
+    ? HB_RUNS.items
+        .map(
+          (r) => `<tr>
+        <td class="mono">${esc(fmtTime(r.ts))}</td>
+        <td class="mono">${fmtNum(r.scanned)}</td>
+        <td class="mono">${fmtNum(r.saved)}</td>
+        <td>${r.skipped_reason ? `<span class="tag gy">${esc(String(r.skipped_reason))}</span>` : '<span class="tag ok">正常</span>'}
+          <div class="mut" style="font-size:10.5px">${esc(reasonText(r.skipped_reason))}</div></td>
+        <td class="mut">${esc(String(r.model || "—"))}</td>
+        <td>${r.ok ? "✓" : "✗"}</td>
+        <td class="mut">${esc(String(r.persona_id || "—"))}</td>
+      </tr>`
+        )
+        .join("")
+    : '<tr><td colspan="7" class="mut">还没有学习记录 —— 点右上角「立即学一批」跑一次就有了</td></tr>';
+  const h = HB_RUNS.health || {};
+  const healthText = h.value == null
+    ? `样本不足（n=${fmtNum(h.n || 0)}）`
+    : `${fmtPct(h.value)}（n=${fmtNum(h.n)}）`;
+  const healthWhy = h.value == null && h.reason ? esc(String(h.reason)) : "目标 ≥95%（E3：出处可点到原话）";
+  return card(
+    `<div class="grid g3" style="gap:9px">
+       <div class="kpi-mini"><div class="v">${fmtNum(HB_RUNS.corpus.unused)}</div><div class="l">可学 X 条未学</div></div>
+       <div class="kpi-mini"><div class="v">${fmtNum(HB_RUNS.corpus.peer)}</div><div class="l">群友/好友语料（含已学）</div></div>
+       <div class="kpi-mini"><div class="v">${healthText}</div><div class="l">出处可回查 · ${healthWhy}</div></div>
+     </div>
+     <div style="overflow-x:auto;margin-top:10px"><table><thead><tr>
+       <th>时间</th><th>看了几条语料</th><th>学了几条</th><th>跳过原因</th><th>模型</th><th>成败</th><th>人格</th>
+     </tr></thead><tbody>${rows}</tbody></table></div>
+     <div class="mut" style="font-size:11px;margin-top:8px">学 0 条时**直接给原因**（不再只回一句「完成」）。原因枚举：${enumList
+       .map((e) => `<span class="mono">${esc(String(e.value))}</span>${e.reserved ? "（reserved）" : ""}`)
+       .join(" / ")}</div>`,
+    { title: "学习诊断", sub: `最近 ${fmtNum((HB_RUNS.items || []).length)} 次提取 · 自动与手动两条路都记一行`, cls: "sec" }
+  );
+}
+
+/** ② 黑话行：状态三态 / 出现与最近命中 / 未进入回复库标记 / 人工闸门 / 证据与命中日志 */
+function jargonRow(it) {
+  const st = String(it.status || "pending");
+  const tag = JG_STATUS[st] || ["—", "gy"];
+  const editing = JG_EDIT === Number(it.id);
+  const meaning = String(it.meaning || "");
+  return `<div class="card cp" style="padding:9px 12px">
+    <div class="row bt" style="gap:9px">
+      <div style="min-width:0;flex:1">
+        <div class="row" style="gap:6px;flex-wrap:wrap;align-items:center">
+          <span class="pn" style="font-size:13px">${esc(String(it.term || ""))}</span>
+          <span class="tag ${tag[1]}" title="黑话状态三态（人工闸门）：待确认 / 已确认 / 已否定（否定 = 归档：不再推断、不再注入）">${esc(tag[0])}</span>
+          <span class="chip" title="「出现」= 被观察到的命中次数（机械匹配日志聚合，不是「被再次抽取到」的次数）">出现 ${fmtNum(it.hit_count)}</span>
+          <span class="chip" title="命中日志里出现过该词的会话数（跨 ≥2 会话是机械候选门槛之一）">${fmtNum(it.sessions)} 个会话</span>
+          <span class="chip" title="最近一次被机械匹配到的时间">最近命中 ${it.last_hit_at ? esc(fmtTime(it.last_hit_at)) : "—"}</span>
+          <span class="tag ${it.in_reply_lib ? "dg" : "ok"}" title="${it.in_reply_lib ? "该词出现在表达库里 —— 点「证据/命中」看漏在哪一条" : "唯一正向检查：黑话词没有进入表达库（只做理解、不进回复）"}">${it.in_reply_lib ? "✗ 漏进表达库" : "未进入回复库 ✓"}</span>
+          ${it.enabled ? "" : '<span class="tag dg">已停用</span>'}
+          <span class="chip gy" title="scope 取值域：全局 / 群·{gid} / 人·{uid}（过滤下推 SQL，不会串群串人）">${esc(String(it.scope || "全局"))}</span>
+        </div>
+        <div class="pd">释义：${meaning ? esc(meaning) : '<span class="mut">（待推断 / 待你补一句）</span>'}</div>
+      </div>
+      <div class="row" style="gap:5px;flex-shrink:0;flex-wrap:wrap;justify-content:flex-end">
+        ${st === "pending" ? `<button class="btn xs p" data-jg="decide" data-id="${it.id}" data-act="confirm" title="确认：就按这条释义理解">确认</button>
+          <button class="btn xs dg" data-jg="decide" data-id="${it.id}" data-act="deny" title="否定：判定不是黑话（归档；以后不再推断、不再注入）">否定</button>` : ""}
+        ${st === "denied" ? `<button class="btn xs" data-jg="decide" data-id="${it.id}" data-act="confirm" title="改主意了：从「已否定」恢复为「已确认」">恢复</button>` : ""}
+        <label class="sw" title="${it.enabled ? "停用（保留词条，只是不再参与理解注入）" : "启用"}"><input type="checkbox" data-jg="toggle" data-id="${it.id}" ${it.enabled ? "checked" : ""}><span class="tk"></span><span class="kb"></span></label>
+        <button class="btn xs" data-jg="edit" data-id="${it.id}">${editing ? "取消" : "改"}</button>
+        <button class="btn xs" data-jg="detail" data-id="${it.id}" title="证据长期保留（原话/时间/会话/说话人）+ 命中日志（哪一轮真的读到了它）">证据/命中</button>
+        <button class="btn xs dg" data-jg="delete" data-id="${it.id}" title="真删（连命中日志）；只想归档请用「否定」">删</button>
+      </div>
+    </div>
+    ${editing
+      ? `<div class="hbedit">
+           <input class="ipt" id="jgTerm_${it.id}" value="${esc(String(it.term || ""))}" placeholder="词条原文（≤40 字）">
+           <input class="ipt" id="jgMean_${it.id}" value="${esc(meaning)}" placeholder="释义（≤300 字，只写它在群里的意思）">
+           <div class="row" style="gap:6px;margin-top:6px"><button class="btn xs p" data-jg="save" data-id="${it.id}">保存</button>
+             <span class="mut" style="font-size:10.5px">保存后下一轮理解就用新释义（不写任何回复）</span></div>
+         </div>`
+      : ""}
+    <div id="jgx_${it.id}" style="display:none;margin-top:8px"></div>
+  </div>`;
+}
+
+/** ② 黑话块（S5-1/S5-2）：清单 + 三件验证物（命中日志 / 未进入回复库检查行 / 试解读）+ 四洞控件 */
+function renderJargonBlock() {
+  const d = JG_DATA || {};
+  const items = d.items || [];
+  const c = d.config || {};
+  const ck = d.check;
+  const chips = [["all", "全部"], ["pending", "待确认"], ["confirmed", "已确认"], ["denied", "已否定"]]
+    .map(([v, l]) => `<button class="hchip${JG_FILTER.status === v ? " on" : ""}" data-jg="fstatus" data-v="${v}">${l}</button>`)
+    .join("");
+  const shown = items
+    .filter((it) => (JG_FILTER.status === "all" ? true : String(it.status) === JG_FILTER.status))
+    .filter((it) => {
+      const q = JG_FILTER.q.trim();
+      if (!q) return true;
+      return (String(it.term || "") + String(it.meaning || "")).includes(q);
+    });
+  const viol = (ck && Array.isArray(ck.violations)) ? ck.violations : [];
+  const ckLine = ck == null
+    ? '<span class="tag gy">检查行未取到</span><span class="mut" style="font-size:11px">jargon/check 读取失败 —— 不假装 ✓，刷新重试</span>'
+    : ck.ok === true
+      ? `<span class="tag ok">未进入回复库 ✓</span><span class="mut" style="font-size:11px">检查了 ${fmtNum(ck.checked)} 个黑话词：没有一个出现在表达库（唯一正向检查）</span>`
+      : `<span class="tag dg">✗ 有黑话词漏进表达库</span><span class="mut" style="font-size:11px">${viol.slice(0, 3).map((v) => `「${esc(String(v.term || ""))}」出现在表达 #${fmtNum(v.expr_id)}`.replace(/</g, "&lt;")).join("；")}${viol.length > 3 ? ` 等 ${fmtNum(viol.length)} 处` : ""} —— 去①把含该词的说法改掉</span>`;
+  return `<div class="sec" id="jgBlock">
+    <div class="sec-t">② 黑话（听懂别人的词 · 只做理解，不进回复库）</div>
+    <div class="card sec" style="padding:10px 13px">
+      <div class="row bt wrap" style="gap:10px">
+        <div class="row wrap" style="gap:6px;align-items:center">
+          ${chips}
+          <span class="mut" style="margin:0 4px">·</span>
+          <input class="inp" id="jgQ" placeholder="搜词条 / 释义…" value="${esc(JG_FILTER.q)}" style="width:170px">
+          <button class="btn xs" data-jg="search">搜索</button>
+          ${JG_FILTER.q ? '<button class="btn xs" data-jg="qclear">清除</button>' : ""}
+        </div>
+        <div class="row wrap" style="gap:6px;align-items:center">
+          <span class="mut" style="font-size:11px" title="洞② 人名过滤：开=候选挖掘时滤掉已知昵称/群名">人名过滤</span>
+          <label class="sw"><input type="checkbox" data-jg="namefilter" ${c.jargon_name_filter ? "checked" : ""}><span class="tk"></span><span class="kb"></span></label>
+          <span class="chip gy" title="机械候选门槛（拍-16；参数中心可调）">跨 ≥${fmtNum(c.candidate_min_sessions)} 会话 · 出现 ≥${fmtNum(c.candidate_min_hits)} 次</span>
+          <span class="chip gy" title="含义推断每日批数上限（拍-16；0 = 关自动推断）">推断 ≤${fmtNum(c.infer_daily_batches)} 批/日</span>
+          <span class="chip gy" title="试解读每日配额（拍-19；单次 ≤1 条短请求、输出 ≤200 tokens）">试解读 ${fmtNum(c.try_used_today)}/${fmtNum(c.try_daily_quota)}（今日）</span>
+          <button class="btn xs" onclick="hfGoParams('expression')" title="阈值 / 配额 / 开关都在「设置 · 模块与参数」语言学习域（唯一编辑地）">去参数中心 →</button>
+        </div>
+      </div>
+      <div class="row bt wrap" style="gap:8px;margin-top:8px;padding-top:8px;border-top:1px solid var(--bd)">
+        <div style="min-width:0;flex:1">
+          <div class="row" style="gap:6px;flex-wrap:wrap;align-items:center">${ckLine}</div>
+          <div class="row wrap" style="gap:6px;margin-top:7px">
+            <input class="inp" id="jgTryText" placeholder="试解读：打一句话，看它读懂什么（只理解、不产生回复）" style="flex:1;min-width:220px">
+            <button class="btn p" data-jg="try">试解读</button>
+          </div>
+          <div id="jgTryOut" class="mut" style="font-size:11.5px;margin-top:6px;line-height:1.7">试解读默认只手动触发；模型走「表达提取」离线槽位（单次 ≤1 条短请求）；结果不进回复库、不产生任何回复。</div>
+        </div>
+      </div>
+      <div class="mut" style="font-size:10.5px;margin-top:7px;line-height:1.7">
+        「出现」= 被观察到的命中次数（机械匹配日志聚合）；命中日志与证据在每行「证据/命中」里。
+        黑话与表达**不共享动作语义**：黑话审「对不对」（否定=归档），表达审「像不像」（驳回=降权进「不再学」）。
+      </div>
+    </div>
+    <div class="col">${shown.length ? shown.map(jargonRow).join("") : emptyBlock(items.length ? "当前筛选下没有条目" : "还没有黑话词 —— 机械候选攒够门槛后由「黑话推断」每天自动过一批；结果先待确认，由你确认或否定", "☷")}</div>
+  </div>`;
+}
+
+/** 证据 / 命中日志（懒加载，直接填行内容器，不整页重渲染） */
+async function jgToggleDetail(id) {
+  const box = document.getElementById("jgx_" + id);
+  if (!box) return;
+  if (box.style.display !== "none") {
+    box.style.display = "none";
+    return;
+  }
+  box.style.display = "block";
+  box.innerHTML = '<div class="mut" style="font-size:11px">读命中日志…</div>';
+  const it = (JG_DATA.items || []).find((x) => Number(x.id) === Number(id)) || {};
+  let hits = JG_HITS[id];
+  if (!hits) {
+    const r = await apiSafe("jargon/hits", { term_id: id, limit: 20 }, { items: [], __err: "读取失败" });
+    hits = r.items || [];
+    if (!r.__err) JG_HITS[id] = hits;
+  }
+  const ev = Array.isArray(it.evidence) ? it.evidence : [];
+  const evRows = ev.length
+    ? ev.map((e) => `<div class="chip" style="white-space:pre-wrap;width:100%;line-height:1.7">「${esc(String(e.text || ""))}」 · ${esc(String(e.who || "?"))} · ${esc(fmtTime(e.ts))} · ${esc(String(e.session || "").slice(0, 30))}</div>`).join("")
+    : '<div class="mut" style="font-size:11px">这条没有证据快照（旧数据，或由人工改写过）</div>';
+  const hitRows = hits.length
+    ? hits.map((h) => `<tr><td class="mono">${esc(fmtTime(h.ts))}</td><td class="mono">${esc(String(h.session_id || "").slice(0, 26))}</td>
+        <td>${esc(String(h.msg || "").slice(0, 60))}</td><td>${h.injected ? "✓ 进了本轮理解" : "仅命中"}</td></tr>`).join("")
+    : '<tr><td colspan="4" class="mut">还没有命中记录（等群里出现这个词就会记）</td></tr>';
+  box.innerHTML = `
+    <div class="pd" style="font-weight:600">证据（长期保留 —— 原话 / 时间 / 会话 / 说话人）</div>
+    <div class="col" style="gap:4px">${evRows}</div>
+    <div class="pd" style="font-weight:600;margin-top:9px">命中日志（最近 ${fmtNum(hits.length)} 条）</div>
+    <div style="overflow-x:auto"><table><thead><tr><th>时间</th><th>会话</th><th>原话</th><th>理解注入</th></tr></thead><tbody>${hitRows}</tbody></table></div>`;
+}
+
+async function jgDecide(id, act) {
+  const r = await apiPostSafe("jargon/decide", { id, action: act });
+  if (!r.ok) { toast("操作失败：" + r.error, "err"); return; }
+  toast(act === "confirm" ? "已确认（按这条释义理解）" : "已否定：归档，不再推断、不再注入", "ok");
+  refreshCurrent();
+}
+
+async function jgSave(id) {
+  const t = document.getElementById("jgTerm_" + id);
+  const m = document.getElementById("jgMean_" + id);
+  const r = await apiPostSafe("jargon/save", { id, term: t ? String(t.value || "") : "", meaning: m ? String(m.value || "") : "" });
+  if (!r.ok) { toast("保存失败：" + r.error, "err"); return; }
+  JG_EDIT = 0;
+  toast("已保存", "ok");
+  refreshCurrent();
+}
+
+async function jgToggleEnabled(id, on) {
+  const it = (JG_DATA.items || []).find((x) => Number(x.id) === Number(id)) || {};
+  const r = await apiPostSafe("jargon/save", { id, term: String(it.term || ""), meaning: String(it.meaning || ""), enabled: !!on });
+  if (!r.ok) { toast("操作失败：" + r.error, "err"); refreshCurrent(); return; }
+  toast(on ? "已启用" : "已停用（词条保留）", "ok");
+  refreshCurrent();
+}
+
+async function jgSetNameFilter(on) {
+  const r = await apiPostSafe("config/save", { patch: { jargon_name_filter: !!on } });
+  if (!r.ok) { toast("保存失败：" + r.error, "err"); refreshCurrent(); return; }
+  toast(on ? "人名过滤已开（候选里不再出现昵称/群名）" : "人名过滤已关", "ok");
+  refreshCurrent();
+}
+
+function jgDelete(id) {
+  const it = (JG_DATA.items || []).find((x) => Number(x.id) === Number(id)) || {};
+  confirmModal(
+    "删除这条黑话？",
+    `「${String(it.term || "")}」的词条与它的命中日志都会删掉。只想归档（不再推断、不再注入）请用「否定」。`,
+    async () => {
+      const r = await apiPostSafe("jargon/delete", { id });
+      if (!r.ok) { toast("删除失败：" + r.error, "err"); return; }
+      toast("已删除", "ok");
+      refreshCurrent();
+    },
+    "删除"
+  );
+}
+
+async function jgTry(btn) {
+  const inp = document.getElementById("jgTryText");
+  const out = document.getElementById("jgTryOut");
+  const text = inp ? String(inp.value || "").trim() : "";
+  if (!text) { toast("先打一句话再试解读", "err"); return; }
+  if (btn) { btn.classList.add("loading"); btn.disabled = true; }
+  const r = await apiPostSafe("jargon/try", { text });
+  if (btn) { btn.classList.remove("loading"); btn.disabled = false; }
+  if (!out) return;
+  if (!r.ok) {
+    out.innerHTML = `<span style="color:var(--error,#e05555)">试解读失败：${esc(String(r.error))}</span>`;
+    return;
+  }
+  const d = r.data || {};
+  if (d.ok === false) {
+    out.innerHTML = `<span class="tag warn">配额</span> ${esc(String(d.error || "今日配额已用完"))}`;
+    return;
+  }
+  const matched = (d.matched || [])
+    .map((x) => `<span class="chip">${esc(String(x.term || ""))}${x.meaning ? "：" + esc(String(x.meaning).slice(0, 40)) : ""}</span>`)
+    .join(" ");
+  out.innerHTML = `<div class="row" style="gap:6px;flex-wrap:wrap">
+      <span class="tag ok">reply_side=${esc(String(d.reply_side || "blocked"))}</span>
+      <span class="mut" style="font-size:10.5px">只理解、不产生任何回复 · 今日已用 ${fmtNum((d.quota || {}).used)}/${fmtNum((d.quota || {}).limit)}</span>
+    </div>
+    <div style="margin-top:5px">${esc(String(d.reading || "")) || "（模型没给出解读）"}</div>
+    ${matched ? `<div class="row" style="gap:5px;flex-wrap:wrap;margin-top:5px">命中的词条：${matched}</div>` : ""}`;
+}
 
 export async function renderExpressionLib() {
-  const [res, log, dom] = await Promise.all([
-    apiSafe("habits", {}, { items: [] }),
-    apiSafe("habits/log", {}, { items: [], events: [], corpus: {} }),
+  const [res, log, dom, rev, bans, runs, jg, jgck] = await Promise.all([
+    apiSafe("habits", {}, { items: [], counts: {}, banned: [] }),
+    apiSafe("habits/log", {}, { items: [], events: [], corpus: {}, runs: [] }),
     apiSafe("config/domains", {}, { domains: {}, values: {} }),
+    apiSafe("expr/review", {}, { items: [], counts: {} }),
+    apiSafe("expr/bans", {}, { items: [], total: 0 }),
+    apiSafe("expr/runs", { limit: 20 }, { items: [], corpus: {}, health: {}, skipped_reason_enum: [] }),
+    // S5 黑话块②：清单（含命中聚合/未进回复库标记）+「未进入回复库」检查行
+    apiSafe("jargon", {}, { items: [], counts: {}, config: {} }),
+    apiSafe("jargon/check", {}, { ok: null, violations: [], checked: 0 }),
   ]);
   const items = res.items || [];
   STATE.habits = items;
-  const corpus = log.corpus || {};
-  const events = log.events || [];
+  HB_BANS = { items: bans.items || [], total: Number(bans.total || (bans.items || []).length || 0) };
+  HB_RUNS = {
+    items: runs.items || [],
+    corpus: runs.corpus || {},
+    health: runs.health || {},
+    enum: runs.skipped_reason_enum || [],
+  };
+  // 黑话（块②）：check 读取失败时保留 null（渲染层显式报「未取到」，不许假装 ✓）
+  JG_DATA = {
+    items: jg.items || [],
+    counts: jg.counts || {},
+    config: jg.config || {},
+    check: (jgck && !jgck.__err) ? jgck : null,
+  };
+  const corpus = runs.corpus || log.corpus || {};
   const values = dom.values || {};
-  const maxUses = Math.max(1, ...items.map((h) => h.uses || 0));
+  const rc = rev.counts || {};
+  const cc = res.counts || {};
+  const pending = Number(rc.pending == null ? cc.pending || 0 : rc.pending);
+  const bannedN = Number(rc.banned == null ? HB_BANS.total : rc.banned);
+  const reviewFirst = res.review_first === true || !!values.expression_review_first;
+  const availN = items.filter((h) => h.current_persona_ok === true).length;
+  const usesOf = (h) => Number(h.use_count == null ? h.uses || 0 : h.use_count);
+  const maxUses = Math.max(1, ...items.map(usesOf));
+  syncExpressionBadge(pending);
 
-  /** 学来的（推断）还是我手加的（声明）—— 必须分开标注 */
-  const kindOf = (h) => (/^学习/.test(String(h.scope || "")) ? "learned" : "manual");
+  /** 来源判定（以后端写入值为准）：scope「学习·xxx」/「学习」/「全局」= 学来的；「手加·xxx」/「手加」= 我手加 */
+  const kindOf = (h) => {
+    const s = String(h.scope || "");
+    return /^手加/.test(s) ? "manual" : /^学习/.test(s) || s === "全局" ? "learned" : "manual";
+  };
   const lastUsed = (h) => Number(h.updated_at || 0);
 
   const shown = items
     .filter((h) => (HB_FILTER.kind === "all" ? true : kindOf(h) === HB_FILTER.kind))
+    .filter((h) => (HB_FILTER.state === "all" ? true : hbStateOf(h) === HB_FILTER.state))
     .filter((h) => (HB_FILTER.on === "all" ? true : HB_FILTER.on === "on" ? !!h.enabled : !h.enabled))
     .filter((h) => {
       const q = HB_FILTER.q.trim();
       if (!q) return true;
-      return (String(h.scene) + String(h.way) + (h.cues || []).join(" ")).includes(q);
+      const ev = (h.evidence || []).map((e) => String(e.text || "")).join(" ");
+      return (String(h.scene) + String(h.way) + (h.cues || []).join(" ") + ev).includes(q);
     })
-    .sort((a, b) => (HB_FILTER.sort === "recent" ? lastUsed(b) - lastUsed(a) : (b.uses || 0) - (a.uses || 0)));
+    // 默认「新学置顶」= 按入库顺序（自增 id）倒序 —— 最新学到的排最前，不然新学的沉底看不见
+    .sort((a, b) =>
+      HB_FILTER.sort === "recent" ? lastUsed(b) - lastUsed(a)
+        : HB_FILTER.sort === "new" ? Number(b.id || 0) - Number(a.id || 0)
+          : usesOf(b) - usesOf(a));
 
   const chip = (label, active, onclick) => `<button class="hchip${active ? " on" : ""}" onclick="${onclick}">${esc(label)}</button>`;
+  const conclusion =
+    `共 ${fmtNum(items.length)} 条表达 · 当前人格可用 ${fmtNum(availN)} 条 · 待审 ${fmtNum(pending)} 条 · 「不再学」${fmtNum(bannedN)} 条 · `
+    + (reviewFirst
+      ? "「先审后用」已开：只有「已通过」进注入池（在参数中心关掉它／通过几条即可）"
+      : "审核默认自动通过：学到就能用；驳回或删除会写进「不再学」名单");
 
   const html = `
   ${pageHead(
-    "表达学习",
-    "机器人从群友/好友的原话里学到的「什么时候说 → 具体怎么说」。每一条都能核对出处、就地改、单独停用或删除",
+    "语言学习",
+    "机器人从群友/好友的原话里学到的「什么时候说 → 具体怎么说」。每条都能核对出处（对到原话与消息 id）、改说法、通过或驳回（驳回＝写进「不再学」名单，不会重新学）",
     `<button class="btn p" onclick="hfExtractHabits(this)">立即学一批</button>
-     <button class="btn" onclick="hfHabitAdd()">+ 手加一条</button>`,
-    "✎"
+     <button class="btn" onclick="hfHabitAdd()">+ 手加一条</button>
+     <button class="btn xs" data-hbrev="approve-all" title="把所有「待审」一次通过">待审全通过</button>`,
+    "✎",
+    conclusion
   )}
   ${kpis(
     kpiCard("hbAll", fmtNum(items.length), "表达条目")
     + kpiCard("hbOn", fmtNum(items.filter((h) => h.enabled).length), "启用中")
-    + kpiCard("hbUses", fmtNum(items.reduce((s, h) => s + (h.uses || 0), 0)), "累计使用")
-    + kpiCard("hbPeer", fmtNum(corpus.peer), "可学素材", `<span class="mut">群友/好友原话</span>`)
+    + kpiCard("hbUses", fmtNum(items.reduce((s, h) => s + usesOf(h), 0)), "出站命中次数", '<span class="mut">真用过才算</span>')
+    + kpiCard("hbPend", fmtNum(pending), "待审", reviewFirst ? '<span class="mut">先审后用已开</span>' : '<span class="mut">自动通过</span>')
+    + kpiCard("hbPeer", fmtNum(corpus.peer), "可学素材", '<span class="mut">群友/好友原话</span>')
   )}
   <div class="card sec" style="padding:10px 13px">
     <div class="row bt wrap" style="gap:10px">
       <div class="row wrap" style="gap:6px">
-        ${chip("全部", HB_FILTER.kind === "all", "hfHbFilter('kind','all')")}
+        ${chip("全部状态", HB_FILTER.state === "all", "hfHbFilter('state','all')")}
+        ${chip("待审", HB_FILTER.state === "pending", "hfHbFilter('state','pending')")}
+        ${chip("已通过", HB_FILTER.state === "ok", "hfHbFilter('state','ok')")}
+        ${chip("已驳回", HB_FILTER.state === "rejected", "hfHbFilter('state','rejected')")}
+        ${chip("不再学", HB_FILTER.state === "banned", "hfHbFilter('state','banned')")}
+        <span class="mut" style="margin:0 4px">·</span>
+        ${chip("全部来源", HB_FILTER.kind === "all", "hfHbFilter('kind','all')")}
         ${chip("学来的", HB_FILTER.kind === "learned", "hfHbFilter('kind','learned')")}
         ${chip("我手加", HB_FILTER.kind === "manual", "hfHbFilter('kind','manual')")}
         <span class="mut" style="margin:0 4px">·</span>
-        ${chip("不限状态", HB_FILTER.on === "all", "hfHbFilter('on','all')")}
+        ${chip("不限启用", HB_FILTER.on === "all", "hfHbFilter('on','all')")}
         ${chip("只看启用", HB_FILTER.on === "on", "hfHbFilter('on','on')")}
         ${chip("只看停用", HB_FILTER.on === "off", "hfHbFilter('on','off')")}
         <span class="mut" style="margin:0 4px">·</span>
+        ${chip("新学置顶", HB_FILTER.sort === "new", "hfHbFilter('sort','new')")}
         ${chip("按使用", HB_FILTER.sort === "uses", "hfHbFilter('sort','uses')")}
-        ${chip("按最近", HB_FILTER.sort === "recent", "hfHbFilter('sort','recent')")}
+        ${chip("按最近更新", HB_FILTER.sort === "recent", "hfHbFilter('sort','recent')")}
       </div>
       <span class="searchbox" style="width:200px"><i class="ic">⌕</i><input id="hbQ2" placeholder="搜场景 / 说法 / 原话…" value="${esc(HB_FILTER.q)}" oninput="hfHbFilter('q', this.value)"></span>
     </div>
     <div class="mut" style="font-size:11px;margin-top:7px">
-      共 ${fmtNum(shown.length)} 条 · 条子的色条长度 = 用过多少次（越常用越长）· 排序里「按最近」= 最近更新优先
-      ${items.filter((h) => !(h.cues || []).length).length ? ` · <b>${items.filter((h) => !(h.cues || []).length).length} 条还没记出处</b>（旧数据；点「立即学一批」重新学就有了）` : ""}
+      共 ${fmtNum(shown.length)} 条 · 色条长度 = 出站命中次数（越常用越长）· 「新学置顶」= 按入库顺序（默认）
+      ${items.filter((h) => !(h.cues || []).length).length ? ` · <b>${items.filter((h) => !(h.cues || []).length).length} 条还没记出处</b>（旧数据；再学一批就有了）` : ""}
     </div>
   </div>
-  <div class="hbgrid sec">
+  ${
+    HB_FILTER.state === "banned"
+      ? renderBansBlock()
+      : `<div class="hbgrid sec">
     ${
       shown.length
         ? shown
             .map((h) => {
               const cues = Array.isArray(h.cues) ? h.cues : [];
+              const evidence = Array.isArray(h.evidence) ? h.evidence : [];
               const learned = kindOf(h) === "learned";
-              const heat = Math.max(6, Math.round(((h.uses || 0) / maxUses) * 100));
+              const heat = Math.max(6, Math.round((usesOf(h) / maxUses) * 100));
               const editing = HB_EDIT === h.id;
+              const st = hbStateOf(h);
+              const cool = h.cooldown_active ? ` · 冷却中（到 ${esc(fmtTime(h.cooldown_until))} 前不再注入）` : "";
               return `<div class="hbcard${h.enabled ? "" : " off"}" data-hb="${esc(String(h.scene + h.way + cues.join(" ")))}">
         <div class="hbheat" style="width:${heat}%"></div>
         <div class="row bt" style="gap:8px;position:relative">
           <div class="row" style="gap:6px;flex-wrap:wrap;min-width:0">
             <span class="tag info">${esc(h.scene)}</span>
-            <span class="tag ${learned ? "gy" : "ok"}" title="${learned ? "模型从原话里推断出来的" : "你手动加进去的声明式习惯"}">${learned ? "学来的" : "我手加"}</span>
-            <span class="chip">用到 ${fmtNum(h.uses)} 次</span>
-            <span class="chip">权重 ${fmt1(h.weight)}</span>
+            <span class="tag ${learned ? "gy" : "ok"}" title="${learned ? "学来的 —— 模型从原话里推断" : "我手加 —— 手动添加的声明式习惯"} · 后端来源标记 scope=${esc(String(h.scope || "—"))}">${learned ? "学来的" : "我手加"}</span>
+            ${hbStateTag(h)}
+            ${hbAvailBadge(h)}
+            <span class="chip">用到 ${fmtNum(usesOf(h))} 次</span>
+            ${h.used_24h ? `<span class="chip">24h 命中 ${fmtNum(h.used_24h)}</span>` : ""}
             ${h.enabled ? "" : '<span class="tag dg">已停用</span>'}
           </div>
           <div class="row" style="gap:5px;flex-shrink:0">
+            ${
+              st === "pending"
+                ? `<button class="btn xs p" data-hbrev="approve" data-hbid="${h.id}" title="通过：立刻可用">通过</button>
+                   <button class="btn xs dg" data-hbrev="reject" data-hbid="${h.id}" title="驳回：写进「不再学」名单">驳回</button>`
+                : ""
+            }
             <label class="sw" title="${h.enabled ? "停用（保留条目，只是不再参考）" : "启用"}"><input type="checkbox" ${h.enabled ? "checked" : ""} onchange="hfHabitToggle(${h.id}, this)"><span class="tk"></span><span class="kb"></span></label>
-            <button class="btn xs" onclick="hfHabitEdit(${h.id})">${editing ? "取消" : "改"}</button>
+            <button class="btn xs" onclick="hfHabitEdit(${h.id})">${editing ? "取消" : "改说法"}</button>
             <button class="btn xs dg" onclick="hfHabitDelete(${h.id})">删</button>
           </div>
         </div>
@@ -296,15 +731,14 @@ export async function renderExpressionLib() {
             : `<div class="hway">"${esc(String(h.way))}"</div>`
         }
         <div class="row" style="gap:7px;margin-top:6px;flex-wrap:wrap;align-items:center">
-          ${cues.length
-            ? `<button class="btn xs" onclick="hfHabitCues(this, ${h.id})">出处（${cues.length}）</button>`
-            : `<span class="chip gy" title="这条是旧数据，提取时没记录来源">没记出处</span>`}
-          <span class="mut" style="font-size:10.5px">最近更新 ${fmtTime(h.updated_at)}</span>
+          ${
+            evidence.length || cues.length
+              ? `<button class="btn xs" onclick="hfHabitCues(this, ${h.id})" data-n="${evidence.length || cues.length}">出处（${evidence.length || cues.length}）</button>`
+              : '<span class="chip gy" title="这条是旧数据，提取时没记录来源">没记出处</span>'
+          }
+          <span class="mut" style="font-size:10.5px">最近更新 ${fmtTime(h.updated_at)}${esc(cool)}</span>
         </div>
-        <div class="hcues" id="hcues_${h.id}" style="display:none">
-          <div class="mut" style="font-size:10.5px;margin:7px 0 4px">学自这些原话（真数据，可核对）</div>
-          ${cues.map((c) => `<div class="cq">「${esc(String(c))}」</div>`).join("")}
-        </div>
+        <div class="hcues" id="hcues_${h.id}" style="display:none"></div>
       </div>`;
             })
             .join("")
@@ -315,20 +749,63 @@ export async function renderExpressionLib() {
             "✎"
           )
     }
-  </div>
-  ${foldCard("foldLog", "学习轨迹", `${events.length} 次提取 / 审核事件 · 简洁↔详细可切`, renderLogSection(events, items), HF_LOG_MODE === "full")}
-  ${foldCard("foldData", "语料与进度", `可学素材 ${fmtNum(corpus.peer)} 条 · 机器人自身 ${fmtNum(corpus.bot)} 条（自身发言不算素材）`, renderCorpusSection(corpus), false)}
-  ${foldCard("foldConf", "学习开关与参数", `${values.expression_enabled ? "表达学习：开" : "表达学习：关"}`, `
-    <div class="grid g2" style="gap:9px">
-      <div class="prow"><div><div class="pn">表达学习总开关</div>
-        <div class="pd">关掉＝不再学、也不再参考已有条目；<b>已学到的条目会原样保留</b>（暂停 ≠ 清空）</div></div>
-        <div class="pc"><label class="sw"><input type="checkbox" data-lp="expression_enabled" ${values.expression_enabled ? "checked" : ""} onchange="hfLearnParamSave()"><span class="tk"></span><span class="kb"></span></label></div></div>
-      <div class="prow"><div><div class="pn">模型分配</div><div class="pd">提取只走「表达提取」一个模型，没有二次审校</div></div>
-        <div class="pc"><button class="btn xs" onclick="goPage('settings','models')">去设置</button></div></div>
+  </div>`
+  }
+  ${renderJargonBlock()}
+  ${renderExprRunsBlock()}
+  ${foldCard("foldConf", "学习开关与参数（只读摘要）", `${values.expression_enabled ? "语言学习：开" : "语言学习：关"} · 注入名额 ${cfgTxt(values.output_expr_max_inject, " 条")}`, `
+    <div class="kv">语言学习总开关<span>${values.expression_enabled ? "开" : "关"}</span></div>
+    <div class="kv">先审后用<span>${reviewFirst ? "开（只有「已通过」进注入池）" : "关（默认：学到就能用）"}</span></div>
+    <div class="kv">已验证门限<span class="mono">${cfgTxt(values.expression_min_uses, " 次")}</span></div>
+    <div class="kv">每轮注入名额<span class="mono">${cfgTxt(values.output_expr_max_inject, " 条")}</span></div>
+    <div class="kv">自动提取门槛<span class="mono">${cfgTxt(values.expression_auto_min_corpus, " 条")}</span></div>
+    <div class="kv">模型分配<span>提取只走「表达提取」一个模型，没有二次审校 · <button class="btn xs" onclick="goPage('settings','models')">去设置</button></span></div>
+    <div class="row wrap" style="gap:8px;margin-top:10px">
+      <button class="btn xs p" onclick="hfGoParams('expression')" title="去「设置 · 模块与参数」语言学习域，带域锚点">去参数中心 →</button>
+      <span class="mut" style="font-size:10.5px">开关与参数都在「设置 · 模块与参数」的语言学习域里改（本页只读展示，参数只有一个编辑地）</span>
     </div>`, false)}`;
   return {
     html,
     mount: (host) => {
+      // 审核 / 名单动作走 data 属性 + 监听器：内联 onclick 的 handler 必须挂在 window 上，
+      // 而本页新函数不在 app.js 的 bindActions 清单里 —— 这里不挂 window、也不用内联 onclick。
+      host.querySelectorAll("[data-hbrev]").forEach((b) => {
+        b.addEventListener("click", () => {
+          const act = String(b.dataset.hbrev || "");
+          if (act === "approve-all") {
+            hfExprApproveAll();
+            return;
+          }
+          hfExprReview(Number(b.dataset.hbid || 0), act);
+        });
+      });
+      host.querySelectorAll("[data-hbban]").forEach((b) => {
+        b.addEventListener("click", () => hfExprBanRemove(String(b.dataset.hbnk || "")));
+      });
+      // —— ② 黑话块（S5）：行内动作走 data 属性 + 监听器（同审核按钮，不挂 window、不用内联 onclick） ——
+      host.querySelectorAll("#jgBlock [data-jg]").forEach((el) => {
+        const act = String(el.dataset.jg || "");
+        const jid = Number(el.dataset.id || 0);
+        if (act === "decide") el.addEventListener("click", () => jgDecide(jid, String(el.dataset.act || "")));
+        else if (act === "edit") el.addEventListener("click", () => { JG_EDIT = JG_EDIT === jid ? 0 : jid; refreshCurrent(); });
+        else if (act === "save") el.addEventListener("click", () => jgSave(jid));
+        else if (act === "delete") el.addEventListener("click", () => jgDelete(jid));
+        else if (act === "detail") el.addEventListener("click", () => jgToggleDetail(jid));
+        else if (act === "try") el.addEventListener("click", () => jgTry(el));
+        else if (act === "search") el.addEventListener("click", () => {
+          const inp2 = host.querySelector("#jgQ");
+          JG_FILTER.q = inp2 ? String(inp2.value || "").trim() : "";
+          refreshCurrent();
+        });
+        else if (act === "qclear") el.addEventListener("click", () => { JG_FILTER.q = ""; refreshCurrent(); });
+        else if (act === "fstatus") el.addEventListener("click", () => { JG_FILTER.status = String(el.dataset.v || "all"); JG_EDIT = 0; refreshCurrent(); });
+        else if (act === "namefilter") el.addEventListener("change", () => jgSetNameFilter(el.checked));
+        else if (act === "toggle") el.addEventListener("change", () => jgToggleEnabled(jid, el.checked));
+      });
+      const jgq = host.querySelector("#jgQ");
+      if (jgq) jgq.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") { JG_FILTER.q = String(jgq.value || "").trim(); refreshCurrent(); }
+      });
       const q = host.querySelector("#hbQ2");
       if (!q) return;
       // 同记忆库搜索框：每次重渲染都是新 input，组字监听在这里重绑。
@@ -364,6 +841,12 @@ function foldCard(id, title, sub, inner, open) {
     </div>
     <div id="${id}" style="display:${open ? "block" : "none"};padding:0 13px 13px">${inner}</div>
   </div>`;
+}
+
+/** 配置值展示：拿不到就写「—」，绝不拿 0 顶替（零假数据红线） */
+function cfgTxt(v, unit) {
+  if (v === undefined || v === null || v === "") return "—";
+  return `${esc(String(v))}${unit || ""}`;
 }
 
 function renderLogSection(events, items) {
@@ -452,7 +935,7 @@ export function hfFold(btn, id) {
   if (btn) btn.textContent = open ? "展开" : "收起";
 }
 
-/** 就地编辑：点「改」进入输入态 */
+/** 就地编辑：点「改说法」进入输入态 */
 export function hfHabitEdit(id) {
   HB_EDIT = HB_EDIT === id ? 0 : id;
   refreshCurrent();
@@ -492,8 +975,7 @@ export function hfHabitAdd() {
       scene: scene.slice(0, 40),
       way: way.slice(0, 120),
       cues: [],
-      weight: 0.5,
-      scope: "手加",
+      scope: "手加",           // 归属由后端归一成 '手加·{pid}'（拍-4）
       enabled: 1,
     });
     toast(res.ok ? "已加入（标为「我手加」）" : "保存失败：" + (res.error || ""), res.ok ? "ok" : "err");
@@ -502,35 +984,85 @@ export function hfHabitAdd() {
   });
 }
 
-/** 学习开关（暂停 ≠ 清空，文案里说清楚）；就地更新副标题，不整页重渲染 */
-export async function hfLearnParamSave() {
-  const patch = {};
-  document.querySelectorAll("[data-lp]").forEach((el) => {
-    patch[el.getAttribute("data-lp")] = el.type === "checkbox" ? !!el.checked : el.value;
-  });
-  const res = await apiPostSafe("config/save", { patch });
-  toast(res.ok ? "已保存" : "保存失败：" + (res.error || ""), res.ok ? "ok" : "err");
-  if (!res.ok) {
-    refreshCurrent();   // 失败时把开关拉回真实状态
-    return;
-  }
-  if (Object.prototype.hasOwnProperty.call(patch, "expression_enabled")) {
-    const body = document.getElementById("foldConf");
-    const pd = body && body.closest(".card") ? body.closest(".card").querySelector(".row.bt .pd") : null;
-    if (pd) pd.textContent = patch.expression_enabled ? "表达学习：开" : "表达学习：关";
-  }
+/** 出处核对：优先读条目自己的证据快照（E3：原话+时间+会话+说话人+message_id，逐字可回查） */
+let HB_CORPUS = { at: 0, items: null, err: "" };
+
+async function hbCorpusItems() {
+  if (HB_CORPUS.items && Date.now() - HB_CORPUS.at < 30000) return HB_CORPUS;
+  const res = await apiSafe("corpus", { limit: 500 }, { items: [] });
+  HB_CORPUS = { at: Date.now(), items: (res && res.items) || [], err: (res && res.__err) || "" };
+  return HB_CORPUS;
 }
 
-/** 展开/收起"这条习惯学自哪些原话" */
-export function hfHabitCues(btn, id) {
+export async function hfHabitCues(btn, id) {
   const box = document.getElementById("hcues_" + id);
   if (!box) return;
+  const n = btn ? String(btn.dataset.n || "") : "";
   const open = box.style.display !== "none";
-  box.style.display = open ? "none" : "block";
-  if (btn) {
-    const n = (btn.textContent.match(/[0-9]+/) || [""])[0];
-    btn.textContent = (open ? "来源（" : "收起来源（") + n + "）";
+  if (open) {
+    box.style.display = "none";
+    if (btn) btn.textContent = "出处（" + n + "）";
+    return;
   }
+  box.style.display = "block";
+  if (btn) btn.textContent = "收起出处（" + n + "）";
+  if (box.dataset.ready === "1") return;     // 已核对过：直接切换显示，不再重复拉
+  const h = (STATE.habits || []).find((x) => String(x.id) === String(id));
+  const evidence = h && Array.isArray(h.evidence) ? h.evidence : [];
+  if (evidence.length) {
+    // 新学到的条目：直接用落库时的证据快照（原话逐字 + 消息 id + 可回查判定）
+    const rows = evidence
+      .map((e) => {
+        const mid = String(e.message_id || "");
+        const ok = e.recoverable === true;
+        return `<div class="cq">「${esc(String(e.text || ""))}」
+        <span class="tag ${ok ? "ok" : "gy"}" style="font-size:10px">${ok ? "语料库在档（逐字相等）" : "语料已被清理，这是学习时的快照"}</span>
+        <span class="mut" style="font-size:10.5px">${esc(fmtTime(e.ts))}${e.who ? " · " + esc(String(e.who)) : ""}${mid ? " · 消息 " + esc(mid) : ""}</span></div>`;
+      })
+      .join("");
+    box.innerHTML = `<div class="mut" style="font-size:10.5px;margin:7px 0 4px">学自这些原话 · 出处随条目落库（E3），不依赖语料表还在不在</div>
+      ${rows}
+      <div class="mut" style="font-size:10px;margin-top:5px">「在档」＝语料库里还找得到逐字相同的原话；被清理掉的仍留有快照，不假装有出处。</div>`;
+    box.dataset.ready = "1";
+    return;
+  }
+  const cues = h && Array.isArray(h.cues) ? h.cues.map((c) => String(c)).filter(Boolean) : [];
+  if (!cues.length) {
+    box.innerHTML = '<div class="mut" style="font-size:10.5px;margin:7px 0 4px">这条没有记录出处（旧数据）</div>';
+    box.dataset.ready = "1";
+    return;
+  }
+  box.innerHTML = '<div class="mut" style="font-size:10.5px;margin:7px 0 4px">正在与语料库逐字核对…</div>';
+  const corpus = await hbCorpusItems();
+  const byText = new Map();
+  (corpus.items || []).forEach((c) => {
+    const t = String(c.text == null ? "" : c.text).trim();
+    if (!t) return;
+    const arr = byText.get(t) || [];
+    arr.push(c);
+    byText.set(t, arr);
+  });
+  const rows = cues
+    .map((cue) => {
+      const hits = corpus.err ? [] : byText.get(cue.trim()) || [];
+      if (hits.length) {
+        return hits
+          .slice(0, 3)
+          .map(
+            (c) => `<div class="cq">「${esc(cue)}」 <span class="tag ok" style="font-size:10px">语料库在档</span>
+        <span class="mut" style="font-size:10.5px">${esc(fmtTime(c.ts))}${c.user_name ? " · " + esc(String(c.user_name)) : ""}</span></div>`
+          )
+          .join("");
+      }
+      return `<div class="cq">「${esc(cue)}」 <span class="mut" style="font-size:10.5px">语料库已没有这条原话（可能被清理）—— 这是学习当时留下的 60 字快照</span></div>`;
+    })
+    .join("");
+  box.innerHTML = `
+    <div class="mut" style="font-size:10.5px;margin:7px 0 4px">学自这些原话 · 与语料库（hf_corpus）逐字核对${corpus.err ? "；本次语料库读取失败，以下均为快照" : ""}</div>
+    ${rows}
+    <div class="mut" style="font-size:10px;margin-top:5px">旧条目只有 60 字快照（当时没记 corpus_id）；新学的条目会带完整出处与消息 id。</div>
+    ${corpus.err ? `<div class="mut" style="font-size:10px;margin-top:3px">语料库读取失败：${esc(corpus.err)}</div>` : ""}`;
+  box.dataset.ready = "1";
 }
 
 /** 折叠辅助图表 */
@@ -585,10 +1117,58 @@ export async function hfHabitToggle(id, el) {
 }
 
 export async function hfHabitDelete(id) {
-  confirmModal("删除这条习惯", "删掉后模型不会再参考它。", async () => {
-    const res = await apiPostSafe("habit/delete", { id });
-    toast(res.ok ? "已删除" : "删除失败：" + res.error, res.ok ? "ok" : "err");
-    refreshCurrent();
+  confirmModal(
+    "删除这条表达",
+    `会把它写进「不再学」名单：条目软删（可恢复），模型不会再把它学回来。原话快照保留，真删请到「设置 · 数据治理 → 只清表达」。`,
+    async () => {
+      const res = await apiPostSafe("habit/delete", { id });
+      const d = (res.data || {});
+      toast(res.ok ? `已删除并写进「不再学」名单（${d.banned ? "新记入名单" : "名单里已有"}）` : "删除失败：" + res.error, res.ok ? "ok" : "err");
+      refreshCurrent();
+    }
+  );
+}
+
+/** 审核：通过 / 驳回（驳回可填理由，一并写进「不再学」名单） */
+export async function hfExprReview(id, action) {
+  const act = action === "reject" ? "reject" : "approve";
+  if (act === "reject") {
+    formModal("驳回这条表达", [{ key: "reason", label: "理由（可选，会写进「不再学」名单）", ph: "不像我会说的话" }], async (v) => {
+      const res = await apiPostSafe("expr/review", { ids: [id], action: "reject", reason: String(v.reason || "").trim() });
+      toast(res.ok ? "已驳回，并写进「不再学」名单" : "驳回失败：" + res.error, res.ok ? "ok" : "err");
+      if (res.ok) refreshCurrent();
+      return res.ok;
+    });
+    return;
+  }
+  const res = await apiPostSafe("expr/review", { ids: [id], action: "approve" });
+  toast(res.ok ? "已通过（下一轮就能用）" : "通过失败：" + res.error, res.ok ? "ok" : "err");
+  if (res.ok) refreshCurrent();
+}
+
+/** 批量：把当前所有「待审」一次通过 */
+export async function hfExprApproveAll() {
+  const pend = (STATE.habits || []).filter((h) => hbStateOf(h) === "pending");
+  if (!pend.length) {
+    toast("没有待审的条目", "ok");
+    return;
+  }
+  confirmModal("一键通过待审", `把 ${pend.length} 条「待审」全部标记为已通过（立刻进注入池）。`, async () => {
+    const res = await apiPostSafe("expr/review", { ids: pend.map((h) => h.id), action: "approve" });
+    toast(res.ok ? `已通过 ${((res.data || {}).changed) || pend.length} 条` : "失败：" + res.error, res.ok ? "ok" : "err");
+    if (res.ok) refreshCurrent();
+  });
+}
+
+/** 移出「不再学」名单（同键可再学；被软删的同键条目一并恢复） */
+export async function hfExprBanRemove(normKey) {
+  const key = String(normKey || "");
+  if (!key) return;
+  confirmModal("移出「不再学」名单", "移出后模型可以重新学到这条说法，被清空的同键条目也会恢复成可用。", async () => {
+    const res = await apiPostSafe("expr/ban/remove", { norm_key: key });
+    const d = (res.data || {});
+    toast(res.ok ? `已移出（恢复 ${fmtNum(d.restored || 0)} 条）` : "移出失败：" + res.error, res.ok ? "ok" : "err");
+    if (res.ok) refreshCurrent();
   });
 }
 
@@ -603,98 +1183,23 @@ export async function hfExtractHabits(btn) {
     btn.disabled = false;
   }
   const d = res.data || {};
-  toast(res.ok && d.ok !== false ? `提取完成：新增 ${d.saved || 0} 条（看了 ${d.scanned || 0} 条语料）` : "提取失败：" + (d.error || res.error || ""), res.ok && d.ok !== false ? "ok" : "err");
+  const ok = res.ok && d.ok !== false;
+  const saved = Number(d.saved || 0);
+  if (!ok && !d.skipped_reason) {
+    toast("提取失败：" + (d.error || res.error || ""), "err");
+  } else if (saved > 0) {
+    toast(`提取完成：新增 ${saved} 条（看了 ${d.scanned || 0} 条语料）`, "ok");
+  } else {
+    // 学 0 条时直接给原因（不能只回一句「完成」）
+    const e = (HB_RUNS.enum || []).find((x) => x.value === d.skipped_reason);
+    toast(`这批没学到新表达（看了 ${d.scanned || 0} 条语料）：${e ? e.text : (d.skipped_reason || d.error || "没有可学的新说法")}`, ok ? "" : "err");
+  }
   refreshCurrent();
 }
 
-/** 学习日志：简洁（只看发生了什么）/ 详细（每条都能展开看全貌） */
-let HF_LOG_MODE = "brief";
-
+/** 老 hash（学习日志）落到这里：不再保留「第三份日志」视图，统一回语言学习页的③学习诊断 */
 export async function renderExpressionLog() {
-  const log = await apiSafe("habits/log", {}, { items: [], events: [], corpus: {} });
-  const corpus = log.corpus || {};
-  const events = log.events || [];
-  const items = log.items || [];
-  const brief = HF_LOG_MODE !== "full";
-  const html = `
-  ${pageHead(
-    "学习日志",
-    brief
-      ? "简洁：只看每一批学了什么。要核对细节就切「详细」（每条都能展开看全貌）"
-      : "详细：每批的完整轨迹 —— 看了哪些原话、抽出哪些条目、模型花了多少 token",
-    `<button class="btn ${brief ? "" : "p"}" onclick="hfLogMode('${brief ? "full" : "brief"}')">${brief ? "切到详细" : "切到简洁"}</button>
-     <button class="btn p" onclick="hfExtractHabits(this)">立即提取一批</button>`,
-    "☰"
-  )}
-  ${kpis(
-    kpiCard("hlEvt", fmtNum(events.length), "学习事件")
-    + kpiCard("hlAll", fmtNum(items.length), "习惯条目")
-    + kpiCard("hlPeer", fmtNum(corpus.peer), "群友语料", `<span class="mut">可学素材</span>`)
-    + kpiCard("hlBot", fmtNum(corpus.bot), "机器人语料", `<span class="mut">自身发言</span>`)
-  )}
-  <div class="sec-t">学习轨迹（${events.length}）</div>
-  <div class="col">
-    ${
-      events.length
-        ? events
-            .map((e) => {
-              const act = String(e.action || "");
-              const kind = act.includes("extract") ? "提取" : act.includes("delete") ? "删除" : act.includes("save") ? "修改" : act.replace(/^habit[._]?/, "") || "事件";
-              const cls = act.includes("delete") ? "dg" : act.includes("extract") ? "info" : "gy";
-              return `<div class="card cp" style="padding:9px 12px">
-        <div class="row bt" style="gap:9px">
-          <div class="row" style="gap:8px;min-width:0">
-            <span class="tag ${cls}">${esc(kind)}</span>
-            <span class="mut mono" style="font-size:11px">${fmtTime(e.ts)}</span>
-            <span class="mut" style="font-size:11.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(String(e.target || "").slice(0, 60))}</span>
-          </div>
-          ${brief ? "" : `<button class="btn xs" onclick="hfLogToggle(${e.id})">展开</button>`}
-        </div>
-        ${
-          brief
-            ? `<div class="mut" style="font-size:11px;margin-top:4px">${esc(String(e.detail || "").slice(0, 90) || "—")}</div>`
-            : `<div id="logd_${e.id}" style="display:none;margin-top:8px">
-                 <div class="mut" style="font-size:10.5px;margin-bottom:4px">完整记录（审计原文）</div>
-                 <div class="chip" style="white-space:pre-wrap;line-height:1.7;width:100%;max-height:240px;overflow:auto">${esc(String(e.detail || "—"))}</div>
-                 <div class="mut" style="font-size:10.5px;margin:7px 0 4px">当前已入库的习惯（${items.length} 条，按用量）</div>
-                 ${items.slice().sort((a, b) => (b.uses || 0) - (a.uses || 0)).slice(0, 6).map((h) => `<div class="cq">「${esc(String(h.way))}」<span class="mut"> — ${esc(h.scene)} · 用到 ${fmtNum(h.uses)} 次</span></div>`).join("") || '<div class="mut">还没有条目</div>'}
-               </div>`
-        }
-      </div>`;
-            })
-            .join("")
-        : emptyBlock("还没有学习记录 —— 点右上角「立即提取一批」跑一次就有了", "☰")
-    }
-  </div>
-  ${card(
-    `<div class="row bt" style="gap:8px">
-       <div><div class="pn">语料构成</div><div class="pd">表达学习只从「群友/好友」的语料里学；机器人自己的发言不算素材</div></div>
-       <button class="btn xs" onclick="hfChartToggle(this, 'hlCharts')">图表</button>
-     </div>
-     <div id="hlCharts" style="display:none;margin-top:9px">
-       <div class="grid g2" style="gap:9px"><div id="hlCorpus"></div><div id="hlByPersona"></div></div>
-     </div>`,
-    { title: "辅助图表（默认收起）", cls: "sec" }
-  )}`;
-  return {
-    html,
-    mount: (host) => {
-      mount(host, "#hlCorpus", (el) =>
-        C.barSplit(el, {
-          items: [
-            { label: "群友 / 好友", value: corpus.peer || 0, color: "#3aa76d" },
-            { label: "机器人自己", value: corpus.bot || 0, color: "#8b5cf6" },
-            { label: "未判定", value: corpus.unknown || 0, color: "#94a3b8" },
-          ].filter((x) => x.value),
-        })
-      );
-      mount(host, "#hlByPersona", (el) =>
-        C.bars(el, {
-          items: Object.keys(corpus.by_persona || {}).map((k) => ({ label: k || "（未指定）", value: corpus.by_persona[k], color: "#3c96ca" })),
-        })
-      );
-    },
-  };
+  return renderExpressionLib();
 }
 
 /** 简洁 / 详细 切换（记住选择，刷新后不丢） */
@@ -710,8 +1215,12 @@ export function hfLogToggle(id) {
   box.style.display = box.style.display === "none" ? "block" : "none";
 }
 
-export async function renderExpressionConf() {
+export async function renderExpressionConf(opts = {}) {
   return renderDomainConf("expression", {
+    // 收尾批：同一个渲染器嵌进「设置 · 模块与参数」（bare=用卡头代替整页页头）
+    bare: !!opts.bare,
+    recentFirst: !!opts.recentFirst,
+    chartId: "dcChart_expression",
     side: card(
       `<div class="mut" style="font-size:11.5px;line-height:1.8">
         提取流程：取语料 → 让「表达提取」模型写出「情景 | 表达方式」→ 去重后入库（只有这一次模型调用）。<br>
@@ -1065,32 +1574,125 @@ export async function hfPersonaDecide(id, approve) {
 /* ==================================================================
    设置：模块与参数 / 用户与群聊 / 模型分配 / Token
    ================================================================== */
+/* ---------------- 参数中心：搜索 + 最近改过置顶（收尾批） ----------------
+   搜索：纯前端过滤 .prow（键名 / 中文名），**不重渲染** —— 不丢光标、不打接口，输入法组字不受影响。
+   最近改过置顶：本次会话里「改过并保存成功」的参数排到各自域分区最前（store.js 登记，保存成功才记）。 */
+let PARAMS_QUERY = "";
+let PARAMS_RECENT_FIRST = true;
+
+/** 参数分区渲染失败时的兜底卡（单个域失败不影响整页；保留 data-pdom 让域深链仍有着落） */
+function paramsSectionErr(domain, title, err) {
+  return {
+    html: `<div class="sec" data-pdom="${esc(domain)}">${card(
+      `<div class="mut">「${esc(title)}」读取失败：<b>${esc(String((err && err.message) || err))}</b></div>`,
+      { title }
+    )}</div>`,
+  };
+}
+
+/** 搜索够用就行：键名和中文名都按子串匹配（大小写不敏感） */
+export function hfParamsSearch(v) {
+  PARAMS_QUERY = String(v == null ? "" : v);
+  applyParamsFilter();
+}
+
+export function hfParamsRecentToggle() {
+  PARAMS_RECENT_FIRST = !PARAMS_RECENT_FIRST;
+  refreshCurrent();
+}
+
+function applyParamsFilter() {
+  const host = document.getElementById("pagehost");
+  if (!host) return;
+  const q = PARAMS_QUERY.trim().toLowerCase();
+  let total = 0;
+  let hit = 0;
+  host.querySelectorAll("[data-pdom]").forEach((sec) => {
+    let secHit = 0;
+    sec.querySelectorAll(".prow[data-key]").forEach((row) => {
+      total += 1;
+      const key = String(row.getAttribute("data-key") || "").toLowerCase();
+      const nameEl = row.querySelector(".pn");
+      const name = String((nameEl && nameEl.textContent) || "").toLowerCase();
+      const ok = !q || key.indexOf(q) >= 0 || name.indexOf(q) >= 0;
+      row.style.display = ok ? "" : "none";
+      if (ok) {
+        secHit += 1;
+        hit += 1;
+      }
+    });
+    sec.style.display = secHit || !q ? "" : "none";
+  });
+  const info = document.getElementById("paramsSearchInfo");
+  if (info) info.textContent = q ? `匹配 ${hit} / ${total} 项` : `共 ${total} 项参数`;
+  const noMatch = document.getElementById("paramsNoMatch");
+  if (noMatch) noMatch.style.display = q && !hit ? "" : "none";
+}
+
+function paramsToolbar() {
+  return `<div class="card cp sec" style="padding:10px 13px">
+    <div class="row bt wrap" style="gap:9px">
+      <span class="searchbox" style="flex:1;min-width:220px"><i class="ic">⌕</i>
+        <input id="paramsQ" placeholder="搜索参数（键名 / 中文名）…" value="${esc(PARAMS_QUERY)}" oninput="hfParamsSearch(this.value)"></span>
+      <button class="btn xs" onclick="hfParamsRecentToggle()" style="flex-shrink:0" title="本次会话里「改过并保存成功」的参数，置顶显示">最近改过置顶：${PARAMS_RECENT_FIRST ? "开" : "关"}</button>
+      <span class="mut" id="paramsSearchInfo" style="font-size:11px;flex-shrink:0"></span>
+    </div>
+    <div class="mut" id="paramsNoMatch" style="display:none;margin-top:7px">没有匹配的参数 —— 换个词试试（键名和中文名都能搜）</div>
+  </div>`;
+}
+
 export async function renderSettingsMain() {
-  const [cfg, detect, stats, dom] = await Promise.all([
+  // 域参数渲染器来自 views-events（与原页底折叠区**同一批函数**：控件 / 保存逻辑 / 接口原样，bare=嵌进本页）
+  const [cfg, detect, stats, dom, pExp, pGate, pPro, pRec, pFav] = await Promise.all([
     apiSafe("config", {}, {}),
     apiSafe("import/detect", {}, {}),
     apiSafe("stats", { persona_id: "" }, {}),
     apiSafe("config/domains", {}, { domains: {} }),
+    renderExpressionConf({ bare: true, recentFirst: PARAMS_RECENT_FIRST }).catch((err) => paramsSectionErr("expression", "语言学习参数", err)),
+    renderGateConf({ bare: true, recentFirst: PARAMS_RECENT_FIRST }).catch((err) => paramsSectionErr("gate", "门控参数", err)),
+    renderProactiveConf({ bare: true, recentFirst: PARAMS_RECENT_FIRST }).catch((err) => paramsSectionErr("proactive", "主动消息", err)),
+    renderRecallConf({ bare: true, recentFirst: PARAMS_RECENT_FIRST }).catch((err) => paramsSectionErr("recall", "撤回处理参数", err)),
+    renderFavourConf({ bare: true, recentFirst: PARAMS_RECENT_FIRST }).catch((err) => paramsSectionErr("favour", "结算参数", err)),
   ]);
+  if (cfg && cfg.__err) {
+    return {
+      html: pageHead(
+        "设置读取失败",
+        `配置接口现在拿不到：${esc(String(cfg.__err))}`,
+        `<button class="btn p" onclick="hfRefresh()">重试</button>`,
+        "⚠"
+      ) + card(
+        `<div class="fnote">⚠ 为避免把空值/关闭状态写回，本次不渲染开关。请重试。</div>`,
+        { title: "读取失败" }
+      ),
+    };
+  }
   // 「输出拟人」域（分段 / 打字延迟 / 表情包 / 语音）此前在面板里没有任何卡片 ——
   // 只有 AstrBot 原生配置弹窗能看到，等于"控件有、面板点不到"。这里给它一张真卡片（能保存）。
   const outKeys = ((dom || {}).domains || {}).output || [];
+  const orderKeys = (keys) => (PARAMS_RECENT_FIRST ? recentFirstKeys(keys) : keys.slice());
   STATE.config = cfg;
   STATE.stats = stats;
-  const rows = [
+  const coreAll = [
     ["master_switch", "总开关", "关掉后StarHeart整体不介入，适合排查问题"],
     ["session_context_enabled", "会话上下文", "把同会话最近消息一起给模型"],
     ["memory_persona_isolated", "记忆人格隔离", "记忆按人格分开存放"],
   ];
+  // 最近改过置顶：核心开关这几行也按同一口径排序
+  const rows = orderKeys(coreAll.map((r) => r[0]))
+    .map((k) => coreAll.find((r) => r[0] === k))
+    .filter(Boolean);
   const lm = detect || {};
   const html = `
-  ${pageHead("设置", "模块开关、输出拟人参数、记忆导入与危险操作都在这一页；其余参数按域分散在各功能页里", "", "⚙")}
-  ${card(
+  ${pageHead("设置", "模块开关与全部域的护栏参数（门控 / 主动 / 撤回 / 好感 / 输出 / 语言学习）都收拢在这一页；搜索框可直接找键名或中文名", "", "⚙")}
+  ${paramsToolbar()}
+  <div data-pdom="core">${card(
     rows
       .map(([key, name, desc]) => {
         const v = cfg[key];
         const isBool = key !== "output_typo_mode";
-        return `<div class="prow"><div><div class="pn">${esc(name)}</div><div class="pd">${esc(desc)} · <span class="mono">${key}</span></div></div>
+        const touched = configTouchedAt(key);
+        return `<div class="prow${touched ? " modified" : ""}" data-key="${key}"${touched ? ` title="本次会话里改过并保存成功 · ${esc(fmtTime(touched))}"` : ""}><div><div class="pn">${esc(name)}</div><div class="pd">${esc(desc)} · <span class="mono">${key}</span></div></div>
           <div class="pc">${
             isBool
               ? `<label class="sw"><input type="checkbox" data-hf-cfg="${key}" ${v ? "checked" : ""}><span class="tk"></span><span class="kb"></span></label>`
@@ -1099,10 +1701,10 @@ export async function renderSettingsMain() {
       })
       .join("") + `<div class="row" style="justify-content:flex-end;margin-top:12px"><button class="btn p" onclick="hfSaveConfig(this)">保存</button></div>`,
     { title: "核心开关", cls: "sec" }
-  )}
-  ${outKeys.length
+  )}</div>
+  <div data-pdom="output">${outKeys.length
     ? card(
-        domainRowsHtml("output", cfg, outKeys) +
+        domainRowsHtml("output", cfg, orderKeys(outKeys)) +
           `<div class="row" style="justify-content:flex-end;margin-top:12px"><button class="btn p" onclick="hfSaveDomain('output',this)">保存输出参数</button></div>`,
         {
           title: "输出拟人 · 分段 / 打字延迟 / 表情包 / 语音",
@@ -1110,7 +1712,12 @@ export async function renderSettingsMain() {
           cls: "sec",
         }
       )
-    : ""}
+    : ""}</div>
+  ${pExp.html}
+  ${pGate.html}
+  ${pPro.html}
+  ${pRec.html}
+  ${pFav.html}
   <div class="grid g2 sec">
     ${card(
       `<div class="grid g2" style="gap:9px">
@@ -1133,7 +1740,7 @@ export async function renderSettingsMain() {
       { title: "记忆导入", sub: "从 astrbot_plugin_livingmemory 的源库导入历史记忆（导入会一并重建关系链）" }
     )}
     ${card(
-      `<table><thead><tr><th>开始时间</th><th>来源</th><th>导入</th><th>跳过</th><th>失败</th><th>状态</th></tr></thead>
+      `<div style="overflow-x:auto"><table><thead><tr><th>开始时间</th><th>来源</th><th>导入</th><th>跳过</th><th>失败</th><th>状态</th></tr></thead>
         <tbody id="hfImportHistory">${
           ((detect || {}).batches || [])
             .map(
@@ -1142,22 +1749,29 @@ export async function renderSettingsMain() {
               <td><span class="tag ${b.status === "done" ? "ok" : "info"}">${esc(b.status)}</span></td></tr>`
             )
             .join("") || `<tr><td colspan="6" class="mut">还没有导入记录</td></tr>`
-        }</tbody></table>`,
+        }</tbody></table></div>`,
       { title: "导入历史", sub: "每一批的去重结果" }
     )}
   </div>
   ${card(
     `<div class="danger-zone">
+      <div class="mut" style="font-size:11px;margin:0 0 7px">破坏性操作集中在这一张卡（原「危险区」已并入本卡）：每个入口只此一处，保留原有确认弹窗与后端接口，其它页面不再重复出现。</div>
       <div class="prow"><div><div class="pn">清空门控流水</div><div class="pd" id="hfDangerGateText">读取中…</div></div>
         <div class="pc"><button class="btn s dg" onclick="hfPurge('gate')">清空</button></div></div>
-      <div class="prow"><div><div class="pn">重置学习数据</div><div class="pd" id="hfDangerLearnText">读取中…</div></div>
+      <div class="prow"><div><div class="pn">清空表达（只清表达）</div><div class="pd" id="hfDangerExprText">读取中…</div></div>
+        <div class="pc"><button class="btn s dg" onclick="hfPurge('expressions')">清空表达</button></div></div>
+      <div class="prow"><div><div class="pn">重置学习数据（清全部学习）</div><div class="pd" id="hfDangerLearnText">读取中…</div></div>
         <div class="pc"><button class="btn s dg" onclick="hfPurge('learning')">重置</button></div></div>
       <div class="prow"><div><div class="pn">按会话删除记忆</div><div class="pd">填会话 id（如 aiocqhttp:GroupMessage:12345），删掉该会话全部记忆</div></div>
         <div class="pc"><input class="inp" id="hfDangerSession" placeholder="会话 id" style="width:230px"><button class="btn s dg" onclick="hfPurge('session')">删除</button></div></div>
+      <div class="prow"><div><div class="pn">衰减 / 淘汰（立即运行）</div><div class="pd">按半衰期降低所有记忆强度；低于阈值的标成 stale（不在图谱与召回里出现）。原在「记忆设置」页头</div></div>
+        <div class="pc"><button class="btn s" onclick="hfMemMaintain(this)">立即运行</button></div></div>
+      <div class="prow"><div><div class="pn">清理冻结记忆</div><div class="pd">删掉没有任何关系链且已 stale 的记忆（不可恢复）。原在「记忆设置 · 维护」</div></div>
+        <div class="pc"><button class="btn s dg" onclick="hfPurgeStale(this)">清理冻结记忆</button></div></div>
       <div class="prow"><div><div class="pn">重建关系链</div><div class="pd">把记忆之间的实体/时序/语义边重新算一遍（幂等，可反复点）</div></div>
         <div class="pc"><button class="btn s" onclick="hfGraphBuild(this)">重建</button></div></div>
     </div>`,
-    { title: "危险区", sub: "这里的操作直接改库，不可恢复", cls: "sec" }
+    { title: "数据治理", sub: "破坏性操作合并成一张卡 · 数据库直改，不可恢复；执行前的确认弹窗与原来一致", cls: "sec" }
   )}`;
   return {
     html,
@@ -1166,18 +1780,56 @@ export async function renderSettingsMain() {
       const gateEl = host.querySelector("#hfDangerGateText");
       if (gateEl) gateEl.textContent = `7 天自动滚动，当前 ${fmtNum(st.gate_total || 0)} 条评分记录`;
       const learnEl = host.querySelector("#hfDangerLearnText");
-      if (learnEl) learnEl.textContent = `删除全部 ${fmtNum(st.memories || 0)} 条记忆、${fmtNum(st.habits || 0)} 条表达习惯与全部关系链，好感保留。不可恢复。`;
+      if (learnEl) learnEl.textContent = `删除全部 ${fmtNum(st.memories || 0)} 条记忆、${fmtNum(st.habits || 0)} 条表达与全部关系链，好感保留。执行前自动备份到 backups/（保留最近 5 份），但仍属不可恢复操作。`;
+      const exprEl = host.querySelector("#hfDangerExprText");
+      if (exprEl) exprEl.textContent = `把 ${fmtNum(st.habits || 0)} 条表达软删（可恢复）并全部写进「不再学」名单，记忆/关系/好感一律不动。执行前自动备份。`;
+      // 域参数分区：各自的小图 / 触发率条在本页挂载（与旧折叠区同一批渲染器）
+      [pExp, pGate, pPro, pRec, pFav].forEach((o) => {
+        try {
+          if (o && typeof o.mount === "function") o.mount(host);
+        } catch (err) {
+          console.warn("[starheart] 参数分区挂载失败", err);
+        }
+      });
+      // 软刷新（保存 / 切置顶）后还原搜索过滤；输入框 value 已在渲染时还原
+      applyParamsFilter();
     },
   };
 }
 
 export async function hfSaveConfig(btn) {
+  const root = btn && btn.closest("[data-pdom]");
+  if (!root) {
+    toast("拿不到本域容器，请刷新后重试（不会写入整页）", "err");
+    return;
+  }
   const patch = {};
-  $$("[data-hf-cfg]").forEach((el) => {
+  const empty = [];
+  root.querySelectorAll("[data-hf-cfg]").forEach((el) => {
     const key = el.getAttribute("data-hf-cfg");
-    if (!CONFIG_META[key]) return;
-    patch[key] = el.type === "checkbox" ? el.checked : el.value;
+    if (!key) return;
+    if (el.type === "checkbox") {
+      patch[key] = el.checked;
+    } else if (el.type === "number") {
+      const raw = String(el.value || "").trim();
+      if (!raw || !Number.isFinite(Number(raw))) {
+        empty.push(key);
+        return;
+      }
+      patch[key] = Number(raw);
+    } else {
+      patch[key] = el.value;
+    }
   });
+  if (empty.length) {
+    empty.forEach((k) => {
+      const el = root.querySelector(`[data-hf-cfg="${k}"]`);
+      const row = el && el.closest(".prow");
+      if (row) row.classList.add("guard-bad");
+    });
+    toast(`有 ${empty.length} 项为空/不是数字：${empty.join("、")}`, "err");
+    return;
+  }
   if (btn) {
     btn.classList.add("loading");
     btn.disabled = true;
@@ -1187,7 +1839,11 @@ export async function hfSaveConfig(btn) {
     btn.classList.remove("loading");
     btn.disabled = false;
   }
-  toast(res.ok ? `已保存 ${Object.keys(patch).length} 项` : "保存失败：" + res.error, res.ok ? "ok" : "err");
+  if (res.ok) noteConfigTouched(takeConfigDirty(Object.keys(patch)));
+  const nw = nativeWriteError(res);
+  toast(nw ? `已写入插件库，但原生配置写回失败：${nw}`
+           : (res.ok ? `已保存 ${Object.keys(patch).length} 项` : "保存失败：" + res.error),
+        nw ? "err" : (res.ok ? "ok" : "err"));
   refreshCurrent();
 }
 
@@ -1267,22 +1923,41 @@ export async function hfPurge(scope) {
     });
     return;
   }
-  const label = scope === "gate" ? "门控流水" : "全部学习数据（记忆 + 习惯 + 关系链）";
-  confirmModal(`清空${label}`, "不可恢复，确定继续？", async () => {
+  const bakNote = (d) => (d && d.backup ? `已备份：backups/${d.backup}（保留最近 5 份）` : "⚠ 备份没建成（不影响本次操作，但没有回滚副本）");
+  if (scope === "expressions") {
+    confirmModal(
+      "清空表达（只清表达）",
+      "会把所有表达软删（可恢复）并全部写进「不再学」名单；记忆、关系链、好感一律不动。执行前自动备份。确认继续？",
+      async () => {
+        const res = await apiPostSafe("purge/expressions", {});
+        const d = res.data || {};
+        toast(res.ok ? `已清空：软删 ${fmtNum((d.removed || {}).soft_deleted || 0)} 条 · ${bakNote(d)}` : "失败：" + res.error, res.ok ? "ok" : "err");
+        refreshCurrent();
+      }
+    );
+    return;
+  }
+  const label = scope === "gate" ? "门控流水" : "全部学习数据（记忆 + 表达 + 关系链）";
+  const tip =
+    scope === "gate"
+      ? "不可恢复，确定继续？"
+      : "会删除全部记忆、表达与关系链（好感保留）。执行前自动备份到 backups/。二次确认：确定继续？";
+  confirmModal(`清空${label}`, tip, async () => {
     const res = await apiPostSafe(scope === "gate" ? "purge/gate" : "purge/learning", {});
-    toast(res.ok ? "已清空" : "失败：" + res.error, res.ok ? "ok" : "err");
+    const d = res.data || {};
+    toast(res.ok ? `已清空${scope === "gate" ? "" : " · " + bakNote(d)}` : "失败：" + res.error, res.ok ? "ok" : "err");
     refreshCurrent();
   });
 }
 
 const CONN_MODES = [
-  { v: "white", label: "白名单", hint: "只有名单里的群/人能被StarHeart看到；其余全部当不存在。（本项直接读写 AstrBot 原生配置：平台配置 → 白名单；插件只做筛选与合并写回、不另存）" },
-  { v: "black", label: "黑名单", hint: "勾选 = 从原生白名单里剔除（其余原样保留）：不记忆、不学说话、不算好感、不进主动候选。（本项直接读写 AstrBot 原生配置：平台配置 → 白名单；插件只做筛选与合并写回、不另存）" },
+  { v: "white", label: "白名单", hint: "只有名单里的群/人能被StarHeart看到；其余全部当不存在。白名单为空 = 谁都不回。只写插件本地，不改 AstrBot 全局白名单。" },
+  { v: "black", label: "黑名单", hint: "勾选 = 对 StarHeart 不存在：不记忆、不学说话、不算好感、不进主动候选。只写插件本地，不改 AstrBot 全局白名单。" },
 ];
 
 /** 一对一的「可见性名单」编辑器：模式 + 多选 + 确定写入 */
 function connCard(kind, title, list, filter) {
-  const raw = String((filter.modes || {})[kind] || "white");
+  const raw = String((filter.modes || {})[kind] || "black");
   const mode = raw === "black" ? "black" : "white";   // 只有黑白两种；历史 off 归一到白名单
   const meta = CONN_MODES.find((x) => x.v === mode) || CONN_MODES[0];
   const picked = (STATE.pick && STATE.pick[`${kind}:${mode}`]) || new Set();
@@ -1323,7 +1998,7 @@ function connCard(kind, title, list, filter) {
     ${
       mode === "white" && !picked.size
         ? `<div class="noteblock" style="border-left-color:var(--error);margin-bottom:8px">
-             ⚠ <b>白名单是空的</b>：<b>全部放行</b>（AstrBot 原生语义：名单为空 = 不触发）（原生语义：空名单 = 全部放行，等于不触发白名单限制）。
+             ⚠ <b>白名单是空的</b>：<b>不能直接保存</b>（fail-closed，避免误点后整类静默）。
              想放行谁就勾上它，再点「保存」；也可以
              <button class="btn xs" onclick="hfConnSeedAll('${kind}', this)">全部放行</button>（把列出来的 ${list.length} 项一次加进白名单，之后慢慢删）。
            </div>`
@@ -1340,6 +2015,15 @@ export async function renderContacts() {
     apiSafe("contacts/filter", {}, { modes: {}, black: {}, white: {}, counts: {}, verdicts: {} }),
     apiSafe("proactive/rules", {}, { sessions: [] }),
   ]);
+  if ((contacts && contacts.__err) || (filter && filter.__err)) {
+    const why = (contacts && contacts.__err) || (filter && filter.__err);
+    return {
+      html: pageHead("联系人读取失败", `接口现在拿不到名单：${esc(String(why))}`,
+        `<button class="btn p" onclick="hfRefresh()">重试</button>`, "⚠")
+        + card(`<div class="fnote">⚠ 不渲染空名单，避免把「读取失败」误当成「没有联系人」再保存一次。</div>`,
+               { title: "读取失败" }),
+    };
+  }
   STATE.contacts = contacts;
   STATE.filter = filter;
   STATE.rules = rules;
@@ -1363,7 +2047,7 @@ export async function renderContacts() {
   const html = `
   ${pageHead(
     "名单与可见性",
-    "这里是「StarHeart能看到谁」的总闸门，只有<b>黑名单</b>和<b>白名单</b>两种：黑名单内 = 对 bot 不存在；白名单 = 只有名单内可见（默认、默认空选）。主动消息的黑白名单是在这之上的收窄；管理员名单读的是 AstrBot 原生配置；<b>白名单/黑名单也直接读写 AstrBot 原生「平台配置 → 白名单」</b>（enable_id_white_list / id_whitelist），插件只做筛选与合并写回、不另存第二份；<b>原生名单为空 = 全部放行（等于不触发）</b>。",
+    "这里是「StarHeart能看到谁」的总闸门，只有<b>黑名单</b>和<b>白名单</b>两种：黑名单内 = 对 bot 不存在；白名单 = 只有名单内可见，<b>白名单为空 = 谁都不回</b>（fail-closed）。主动消息的黑白名单是在这之上的收窄；管理员名单读的是 AstrBot 原生配置；<b>这里的名单只写插件本地</b>，不改 AstrBot 全局「平台配置 → 白名单」，避免影响其他插件与私聊。",
     `<button class="btn" onclick="hfContactsRefresh(this)">重新拉取</button>
      <button class="btn s" onclick="goPage('messages','proactive')">主动设置 →</button>`,
     "☰"
@@ -1455,7 +2139,7 @@ export async function hfConnMode(kind, mode) {
 
 /** 确定写入：多选的结果一次提交（不用一个一个点） */
 export async function hfConnSave(kind, btn) {
-  const raw = String((STATE.filter && STATE.filter.modes && STATE.filter.modes[kind]) || "white");
+  const raw = String((STATE.filter && STATE.filter.modes && STATE.filter.modes[kind]) || "black");
   const mode = raw === "black" ? "black" : "white";
   const ids = Array.from((STATE.pick && STATE.pick[`${kind}:${mode}`]) || []);
   if (btn) btn.classList.add("loading");
@@ -1466,7 +2150,7 @@ export async function hfConnSave(kind, btn) {
     return;
   }
   STATE.filter = res.data || STATE.filter;
-  const warn = mode === "white" && !ids.length ? "（白名单为空 = 全部放行）" : "";
+  const warn = mode === "white" && !ids.length ? "（白名单为空 = 谁都不回）" : "";
   toast(`已保存${kind === "group" ? "群聊" : "私聊"}${mode === "black" ? "黑名单" : "白名单"}：${ids.length} 项${warn}`, mode === "black" || ids.length ? "ok" : "err");
   refreshCurrent();
 }
@@ -1554,13 +2238,26 @@ const MODEL_TASKS = [
   ["rerank", L("≡ 结果重排", "≡ Rerank"), L("召回候选交给它重新定序（配了才生效）", "Reorder recall candidates (only when configured)"), "rerank"],
 ];
 
+let MODELS_CFG_READY = false;
+
 export async function renderModels() {
+
   const [prov, cfg, prompts] = await Promise.all([
     apiSafe("providers", {}, {}),
     apiSafe("config", {}, {}),
     // 插件自管任务的系统提示词清单（对话/主动开口/图像理解不在此列 —— 它们走 AstrBot 原生提示词）
     apiSafe("prompts", {}, { items: [] }),
   ]);
+  if (cfg && cfg.__err) {
+    MODELS_CFG_READY = false;
+    return {
+      html: pageHead("模型配置读取失败", `接口现在拿不到已保存的模型绑定：${esc(String(cfg.__err))}`,
+        `<button class="btn p" onclick="hfRefresh()">重试</button>`, "⚠")
+        + card(`<div class="fnote">⚠ 为避免把 7 个模型绑定清空，本次不渲染下拉。请重试。</div>`,
+               { title: "读取失败" }),
+    };
+  }
+  MODELS_CFG_READY = true;
   const plist = prompts.items || [];
   const promptErrHtml = plist.length
     ? ""
@@ -1676,6 +2373,10 @@ export async function renderModels() {
 }
 
 export async function hfSaveModels(btn) {
+  if (!MODELS_CFG_READY) {
+    toast("模型配置没读到，本次不保存（避免把绑定清空）", "err");
+    return;
+  }
   const patch = {};
   // 只提交「真的能选」的下拉：providers 读取失败时下拉会是 disabled/空，这时提交会把已存绑定清空
   $$("[data-hf-model]").forEach((el) => {
@@ -1712,9 +2413,13 @@ export async function hfPromptSave(task, btn) {
   const res2 = Object.keys(patch).length ? await apiPostSafe("config/save", { patch }) : { ok: true };
   if (btn) btn.classList.remove("loading");
   const ok = res.ok && res2.ok;
+  const nw = ok ? nativeWriteError(res2) : "";
   if (msg) {
-    msg.textContent = ok ? "✓ 已保存" + (ta.value.trim() ? "（自定义）" : "（用内置默认）") : "✗ " + (res.error || res2.error || "保存失败");
-    msg.style.color = ok ? "var(--success)" : "var(--error)";
+    msg.textContent = ok
+      ? (nw ? "✓ 已写入插件库，但原生配置写回失败：" + nw
+            : "✓ 已保存" + (ta.value.trim() ? "（自定义）" : "（用内置默认）"))
+      : "✗ " + (res.error || res2.error || "保存失败");
+    msg.style.color = (ok && !nw) ? "var(--success)" : "var(--error)";
   }
 }
 

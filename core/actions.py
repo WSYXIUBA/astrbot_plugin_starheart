@@ -344,7 +344,7 @@ def ago_text(ts: float, now: float | None = None) -> str:
 
 
 def where_text(kind: str, ident: str) -> str:
-    """会话的人类可读说法：群 512197097 / 私聊 3437390039。"""
+    """会话的人类可读说法：群 {群号} / 私聊 {QQ}。"""
     if kind == "group":
         return f"群 {ident}" if ident else "某个群"
     if kind == "private":

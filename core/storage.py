@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import re
 import time
@@ -19,6 +21,15 @@ from astrbot.api import logger
 from . import engine
 
 
+
+def _json_default(obj: Any) -> Any:
+    """备份用 JSON 序列化：embedding 是 BLOB，必须转 base64，否则整份备份失败。"""
+    if isinstance(obj, (bytes, bytearray)):
+        return base64.b64encode(bytes(obj)).decode("ascii")
+    if isinstance(obj, set):
+        return list(obj)
+    return str(obj)
+
 def _jlist(v: Any) -> list[str]:
     """JSON 数组字段容错解析（历史数据里可能是空串/None/半截 JSON）。"""
     if isinstance(v, list):
@@ -28,6 +39,33 @@ def _jlist(v: Any) -> list[str]:
         return [str(x) for x in out] if isinstance(out, list) else []
     except Exception:
         return []
+
+
+def _clip(text: Any, limit: int = 500) -> str:
+    """消息文本截断（流水只存前 limit 字，不存完整原文）。"""
+    return str(text or "")[: int(limit)]
+
+
+def _jobj_list(v: Any) -> list[dict[str, Any]]:
+    """JSON 对象数组字段容错解析（出处快照 source_ids / evidence_snap）。"""
+    if isinstance(v, list):
+        src: Any = v
+    else:
+        try:
+            src = json.loads(v or "[]")
+        except Exception:
+            return []
+    return [dict(x) for x in src if isinstance(x, dict)] if isinstance(src, list) else []
+
+
+def _hash16(text: Any) -> str:
+    """文本摘要（sha256 前 16 位十六进制）：流水对账锚点；不可原文回读。"""
+    return hashlib.sha256(str(text or "").encode("utf-8")).hexdigest()[:16]
+
+
+def _len_nows(text: Any) -> int:
+    """去空白后的字符数（长度口径：只算可见内容，空白与全角空格不计）。"""
+    return len(re.sub(r"\s+", "", str(text or "")))
 
 
 # 库结构版本档位。以前没有任何版本机制，全靠下面一长串 `if 列 not in cols: ALTER` 幂等探测 ——
@@ -71,7 +109,8 @@ SCHEMA = (
         updated_at REAL NOT NULL,
         external_source TEXT DEFAULT '',
         external_id TEXT DEFAULT '',
-        import_batch TEXT DEFAULT ''
+        import_batch TEXT DEFAULT '',
+        subject_id TEXT DEFAULT ''
     )
     """,
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_hf_mem_ext ON hf_memories(external_source, external_id) "
@@ -257,9 +296,13 @@ SCHEMA = (
         status TEXT NOT NULL DEFAULT 'candidate',
         reason TEXT DEFAULT '',
         guard TEXT DEFAULT '{}',
-        text TEXT DEFAULT ''
+        text TEXT DEFAULT '',
+        prompt_source TEXT NOT NULL DEFAULT '',
+        memory_ids TEXT NOT NULL DEFAULT ''
     )
     """,
+    "CREATE INDEX IF NOT EXISTS idx_hf_proactive_sess ON hf_proactive_log(session_id, ts DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_hf_proactive_status_ts ON hf_proactive_log(status, ts DESC)",
     """
     CREATE TABLE IF NOT EXISTS hf_persona_proposals (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -297,6 +340,19 @@ SCHEMA = (
         PRIMARY KEY (memory_id, gen_key)
     )""",
     """CREATE INDEX IF NOT EXISTS idx_hf_vec_gen ON hf_vectors(gen_key)""",
+    # 记忆捕获「先落库再总结」：模型超时/空响应时整批对话不会蒸发，可退避重试。
+    """CREATE TABLE IF NOT EXISTS hf_capture_pending (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL DEFAULT '',
+        persona_id TEXT NOT NULL DEFAULT '',
+        user_id TEXT NOT NULL DEFAULT '',
+        user_name TEXT NOT NULL DEFAULT '',
+        payload TEXT NOT NULL DEFAULT '[]',
+        tries INTEGER NOT NULL DEFAULT 0,
+        next_try_at REAL NOT NULL DEFAULT 0,
+        last_error TEXT DEFAULT '',
+        created_at REAL NOT NULL DEFAULT 0
+    )""",
     """CREATE TABLE IF NOT EXISTS hf_memory_src (
         memory_id INTEGER NOT NULL,
         seq INTEGER NOT NULL DEFAULT 0,
@@ -306,7 +362,283 @@ SCHEMA = (
         ts REAL NOT NULL DEFAULT 0,
         PRIMARY KEY (memory_id, seq)
     )""",
+    # ---------------- 流水四表（只记不拦；全部 additive，不动任何已有表与列） ----------------
+    # 建表纪律：仅 CREATE TABLE/INDEX IF NOT EXISTS，不动任何已有表与列。
+    # 保留期：hf_sent_log 30 天 / hf_decision_log 30 天 / hf_expr_use_log 90 天 / hf_send_plan 30 天（终态行），
+    # 由 purge_flow_logs() 按 FLOW_RETENTION_DAYS 清理。
+    # downgrade 路径（回退只需丢这四张表，旧表零影响）：
+    #   DROP TABLE IF EXISTS hf_sent_log; DROP TABLE IF EXISTS hf_decision_log;
+    #   DROP TABLE IF EXISTS hf_expr_use_log; DROP TABLE IF EXISTS hf_send_plan;
+    # 出站流水（msg_id = 对账锚点）：只存长度与哈希，不存原文。
+    # emit_ok 三态：1 = 确认发出；0 = 确认失败；NULL = 未确认（首条经框架管线发出，拿不到发送回执）。
+    """
+    CREATE TABLE IF NOT EXISTS hf_sent_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        msg_id TEXT NOT NULL DEFAULT '',
+        ts REAL NOT NULL,
+        session_id TEXT NOT NULL DEFAULT '',
+        kind TEXT NOT NULL DEFAULT 'reply',
+        seg_index INTEGER NOT NULL DEFAULT 0,
+        seg_total INTEGER NOT NULL DEFAULT 1,
+        length_chars INTEGER NOT NULL DEFAULT 0,
+        content_hash TEXT NOT NULL DEFAULT '',
+        delay_ms INTEGER NOT NULL DEFAULT 0,
+        emit_ok INTEGER,
+        plan_id TEXT NOT NULL DEFAULT '',
+        local_id TEXT NOT NULL DEFAULT '',
+        trigger TEXT NOT NULL DEFAULT '',
+        seed TEXT NOT NULL DEFAULT '',
+        exempt INTEGER NOT NULL DEFAULT 0,
+        confidence TEXT NOT NULL DEFAULT 'low',
+        platform_id TEXT NOT NULL DEFAULT ''
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_hf_sent_ts ON hf_sent_log(ts DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_hf_sent_sess ON hf_sent_log(session_id, ts)",
+    # 门控决策流水（只记不拦）：因子快照 + reason + 消息文本（截断 ≤500 字 + hash）。时间索引为建表前必修项。
+    # eligible：1 = 该消息具备门控拦截条件（非私聊且未被 @）；0 = 豁免场景（私聊/被 @，永远不会被拦）。
+    """
+    CREATE TABLE IF NOT EXISTS hf_decision_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts REAL NOT NULL,
+        event_id TEXT NOT NULL DEFAULT '',
+        session_id TEXT NOT NULL DEFAULT '',
+        user_id TEXT NOT NULL DEFAULT '',
+        eligible INTEGER NOT NULL DEFAULT 1,
+        decision TEXT NOT NULL DEFAULT '',
+        score REAL NOT NULL DEFAULT 0,
+        factors_json TEXT NOT NULL DEFAULT '{}',
+        reason TEXT NOT NULL DEFAULT '',
+        config_ver TEXT NOT NULL DEFAULT '',
+        gate_shadow INTEGER NOT NULL DEFAULT 0,
+        msg_text TEXT NOT NULL DEFAULT '',
+        text_hash TEXT NOT NULL DEFAULT ''
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_hf_decision_ts ON hf_decision_log(ts DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_hf_decision_sess ON hf_decision_log(session_id, ts)",
+    # 表达使用流水：只记「注入即命中」；emit_ok/outcome_score 留空（NULL）待出站对账回填，NULL ≠ 没发出。
+    """
+    CREATE TABLE IF NOT EXISTS hf_expr_use_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        expr_id INTEGER NOT NULL,
+        used_at REAL NOT NULL,
+        emit_ok INTEGER,
+        outcome_score REAL,
+        seed TEXT NOT NULL DEFAULT '',
+        session_id TEXT NOT NULL DEFAULT ''
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_hf_expr_use ON hf_expr_use_log(expr_id, used_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_hf_expr_use_at ON hf_expr_use_log(used_at)",
+    # 发送计划（建表先行，接线待后续）：五态状态机 pending→sending→partial→sent（failed/expired 为终态），
+    # 幂等键 = PRIMARY KEY(plan_id, seg_index)；TTL = max(30min, seg_total × output_typing_max × 1.5)，超龄置 expired。
+    # content_hash 可复算段文本；payload_text 仅截断 ≤500 字。
+    """
+    CREATE TABLE IF NOT EXISTS hf_send_plan (
+        plan_id TEXT NOT NULL,
+        seg_index INTEGER NOT NULL,
+        session_id TEXT NOT NULL DEFAULT '',
+        target_local TEXT NOT NULL DEFAULT '',
+        seg_total INTEGER NOT NULL DEFAULT 1,
+        state TEXT NOT NULL DEFAULT 'pending',
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_at REAL NOT NULL DEFAULT 0,
+        last_error TEXT NOT NULL DEFAULT '',
+        confidence TEXT NOT NULL DEFAULT 'low',
+        kind TEXT NOT NULL DEFAULT 'reply',
+        content_hash TEXT NOT NULL DEFAULT '',
+        payload_text TEXT NOT NULL DEFAULT '',
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        PRIMARY KEY (plan_id, seg_index)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_hf_send_plan_state ON hf_send_plan(state, next_at)",
+    "CREATE INDEX IF NOT EXISTS idx_hf_send_plan_upd ON hf_send_plan(updated_at)",
+    # 配置快照（参数护栏配套）：保存配置前自动存一份，也可在设置页手动命名存一份。
+    # 回滚 = 把快照里的键值原样写回 hf_config。保留份数见 CONFIG_SNAPSHOT_KEEP（超出的先删自动快照）。
+    # 只存配置键值，不含任何消息/记忆内容；downgrade：DROP TABLE IF EXISTS hf_config_snapshot;
+    """
+    CREATE TABLE IF NOT EXISTS hf_config_snapshot (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL DEFAULT '',
+        ts REAL NOT NULL,
+        n_keys INTEGER NOT NULL DEFAULT 0,
+        auto INTEGER NOT NULL DEFAULT 0,
+        actor TEXT NOT NULL DEFAULT 'panel',
+        note TEXT NOT NULL DEFAULT '',
+        config_json TEXT NOT NULL DEFAULT '{}'
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_hf_cfg_snap_ts ON hf_config_snapshot(ts DESC)",
+    # ---------------- S4 表达重建：hf_expr / 不再学名单 / 学习诊断 / 语料出处侧车 ----------------
+    # 建表纪律同上：仅 CREATE TABLE/INDEX IF NOT EXISTS 追加，不动任何已有表与列。
+    # 列名口径（拍-1）= 代码真列名 scene/way；无 weight（拍-11 死字段，不迁入）；
+    # 无 use_count/last_used 回写列（拍-5：一律从 hf_expr_use_log 查询聚合，防双写漂移）。
+    # scope：'学习·{pid}' / '全局' / '手加·{pid}'（pid 空退化 '学习' / '手加'，拍-4）。
+    # checked_state：ai_pending / user_ok / user_reject（默认自动通过 → 提取写入即 user_ok，拍-2）；
+    # status：active / archived（软删 = 'archived'，拍-14）；enabled：停用位（只关不删）；
+    # cooldown_until：冷却按时间（拍-10）。downgrade：DROP TABLE IF EXISTS hf_expr;（旧表零影响）
+    """
+    CREATE TABLE IF NOT EXISTS hf_expr (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        scene          TEXT NOT NULL,
+        way            TEXT NOT NULL,
+        cues           TEXT NOT NULL DEFAULT '[]',
+        scope          TEXT NOT NULL DEFAULT '全局',
+        enabled        INTEGER NOT NULL DEFAULT 1,
+        status         TEXT NOT NULL DEFAULT 'active',
+        norm_key       TEXT NOT NULL DEFAULT '',
+        duplicate_of   INTEGER,
+        checked_state  TEXT NOT NULL DEFAULT 'ai_pending',
+        ai_reason      TEXT NOT NULL DEFAULT '',
+        source_ids     TEXT NOT NULL DEFAULT '[]',
+        evidence_snap  TEXT NOT NULL DEFAULT '[]',
+        cooldown_until REAL,
+        outcome_score  REAL,
+        gate_override  TEXT NOT NULL DEFAULT '',
+        created_at     REAL NOT NULL,
+        updated_at     REAL NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_hf_expr_scope ON hf_expr(scope, enabled)",
+    "CREATE INDEX IF NOT EXISTS idx_hf_expr_state ON hf_expr(checked_state, enabled)",
+    "CREATE INDEX IF NOT EXISTS idx_hf_expr_norm ON hf_expr(scope, norm_key)",
+    "CREATE INDEX IF NOT EXISTS idx_hf_expr_upd ON hf_expr(updated_at DESC)",
+    # 「不再学」名单（拍-6 独立表）：删除/驳回都写进来，提取路径先过这张表 → 修「删了还会再学」。
+    # key = 当时写的原文（人看的）；norm_key = 规范化键（判重/移出的唯一键，主键）。
+    """
+    CREATE TABLE IF NOT EXISTS hf_expr_banned (
+        key      TEXT NOT NULL DEFAULT '',
+        norm_key TEXT PRIMARY KEY,
+        reason   TEXT NOT NULL DEFAULT '',
+        ts       REAL NOT NULL,
+        actor    TEXT NOT NULL DEFAULT 'panel',
+        note     TEXT NOT NULL DEFAULT ''
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_hf_expr_banned_ts ON hf_expr_banned(ts DESC)",
+    # 学习诊断（S4-4）：每次提取运行一行 —— 自动（_habit_auto_tick）与手动（面板按钮）两条路都写。
+    # skipped_reason 枚举见 service.EXPR_SKIP_REASONS（7 值；size_capped 为 reserved 占位）。
+    """
+    CREATE TABLE IF NOT EXISTS hf_expr_run_log (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts             REAL NOT NULL,
+        scanned        INTEGER NOT NULL DEFAULT 0,
+        saved          INTEGER NOT NULL DEFAULT 0,
+        skipped_reason TEXT NOT NULL DEFAULT '',
+        model          TEXT NOT NULL DEFAULT '',
+        ok             INTEGER NOT NULL DEFAULT 1,
+        persona_id     TEXT NOT NULL DEFAULT ''
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_hf_expr_run_ts ON hf_expr_run_log(ts DESC)",
+    # 语料出处侧车（E3）：hf_corpus 的「消息 id」。本期纪律禁 ALTER 既有表（拍-15），
+    # 所以不往 hf_corpus 加列，改用可 JOIN 的侧车表存 message_id/ext_id —— 出处回查与对树都靠它。
+    """
+    CREATE TABLE IF NOT EXISTS hf_corpus_ref (
+        corpus_id  INTEGER PRIMARY KEY,
+        message_id TEXT NOT NULL DEFAULT '',
+        ext_id     TEXT NOT NULL DEFAULT '',
+        session_id TEXT NOT NULL DEFAULT '',
+        ts         REAL NOT NULL DEFAULT 0
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_hf_corpus_ref_mid ON hf_corpus_ref(message_id)",
+    # ---------------- S5 黑话：hf_jargon + 命中日志（从零建，拍-18 列清单以 round1-C1 §5 块2 冻结） ----------------
+    # 建表纪律同上：仅 CREATE TABLE/INDEX IF NOT EXISTS 追加，不动任何已有表与列。
+    # 状态三态（洞③ 人工闸门）：pending 待确认 / confirmed 已确认 / denied 已否定（= 不再推断，留档）。
+    # scope（拍-17）：'全局' / '群·{gid}' / '人·{uid}' —— 匹配时过滤**下推 SQL**，索引 (scope, term)。
+    # hit_count 口径 = **被观察到的命中次数**（机械匹配日志聚合；不是上游「被再次抽取到」的次数 ——
+    # maibot-deepdive 01 §7-A3 再抽取污染教训不照抄）。证据 evidence_json 长期保留（洞①）。
+    # 唯一性：(term, scope) 逻辑唯一（应用层判重；上游「同词多行」属缺陷，不照抄）。
+    # downgrade：DROP TABLE IF EXISTS hf_jargon_hit; DROP TABLE IF EXISTS hf_jargon;
+    """
+    CREATE TABLE IF NOT EXISTS hf_jargon (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        term          TEXT NOT NULL,
+        meaning       TEXT NOT NULL DEFAULT '',
+        evidence_json TEXT NOT NULL DEFAULT '[]',
+        status        TEXT NOT NULL DEFAULT 'pending',
+        scope         TEXT NOT NULL DEFAULT '全局',
+        enabled       INTEGER NOT NULL DEFAULT 1,
+        hit_count     INTEGER NOT NULL DEFAULT 0,
+        last_hit_at   REAL,
+        created_at    REAL NOT NULL,
+        updated_at    REAL NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_hf_jargon_term ON hf_jargon(term)",
+    "CREATE INDEX IF NOT EXISTS idx_hf_jargon_scope_term ON hf_jargon(scope, term)",
+    "CREATE INDEX IF NOT EXISTS idx_hf_jargon_status ON hf_jargon(status, hit_count DESC)",
+    # 命中日志（验证物①）：每次入站消息机械匹配命中已知词写一行（term_id / 会话 / 原话 / ts）。
+    # 与理解注入共用同一匹配函数（round1-C1 §4「写一次两用」）；injected = 是否同轮进了理解注入。
+    # msg 截断 ≤500 字（同 hf_decision_log.msg_text 口径）。
+    """
+    CREATE TABLE IF NOT EXISTS hf_jargon_hit (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        term_id    INTEGER NOT NULL,
+        session_id TEXT NOT NULL DEFAULT '',
+        msg        TEXT NOT NULL DEFAULT '',
+        ts         REAL NOT NULL,
+        injected   INTEGER NOT NULL DEFAULT 0
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_hf_jargon_hit ON hf_jargon_hit(term_id, ts DESC)",
+
 )
+
+
+# 流水表保留期（天）：出站 30 / 决策 30 / 表达使用 90 / 发送计划 30（只清终态行）。
+FLOW_RETENTION_DAYS = {
+    "hf_sent_log": 30,
+    "hf_decision_log": 30,
+    "hf_expr_use_log": 90,
+    "hf_send_plan": 30,
+}
+
+# 配置快照保留份数：超出后先删最老的自动快照（手动命名的排最后）。
+CONFIG_SNAPSHOT_KEEP = 50
+
+# ---------------- S4 表达（hf_expr）运行时口径 ----------------
+# 拍-5：use_count/last_used 一律查询聚合（无回写列），索引靠 hf_expr_use_log 既有的 idx_hf_expr_use。
+# 拍-10：冷却按时间 —— 注入后同一条进 EXPR_COOLDOWN_SECONDS 冷却窗；「同表达 24h ≤ 2」用流水窗口计数。
+EXPR_COOLDOWN_SECONDS = 1800
+EXPR_WINDOW_SECONDS = 86400
+EXPR_WINDOW_MAX_INJECT = 2
+# 备份里允许整表导出的表名白名单（只给「只清表达 / 清全部学习」用；表名不来自外部输入）。
+EXPR_BACKUP_TABLES: tuple[str, ...] = ("hf_expr", "hf_habits", "hf_expr_banned")
+LEARNING_BACKUP_TABLES: tuple[str, ...] = ("hf_memories", "hf_edges", "hf_entities", "hf_expr", "hf_habits")
+BACKUP_KEEP = 5          # 拍-14：备份落 <数据目录>/backups/，保留最近 5 份
+
+# ---------------- S5 黑话（hf_jargon）运行时口径 ----------------
+# 机械候选门槛（拍-16：跨 ≥2 会话、出现 ≥4 次）与推断/试解读配额走 DEFAULT_CONFIG 的
+# jargon_* 键（参数中心可调）；这里只放不暴露的工程常量。
+JARGON_STATUSES: tuple[str, ...] = ("pending", "confirmed", "denied")
+JARGON_MATCH_LIMIT = 10            # 单轮理解注入最多几条（上游 MAX_JARGON_REFERENCE_MATCHES=10）
+JARGON_CANDIDATE_BATCH = 20        # 单次推断最多送几个候选（控 prompt 长度/成本）
+JARGON_TRY_MAX_TOKENS = 200        # 试解读单次输出上限（拍-19：单次 ≤1 条短请求、输出 ≤200 tokens）
+JARGON_TERM_MAX_CHARS = 40         # 词条最长（写入校验：超了拒绝，不静默截断）
+JARGON_MEANING_MAX_CHARS = 300     # 释义最长（同上）
+JARGON_HIT_MSG_MAX_CHARS = 500     # 命中日志原话截断（同 hf_decision_log.msg_text 口径）
+JARGON_CORPUS_SCAN = 800           # 机械候选只扫最近 N 条入站语料（性能闸，够单群日常量）
+# 规范化键要丢掉的字符：中英常见标点 + 各种引号（空白由 isspace 单独判，避免正则里写引号）。
+_EXPR_NORM_DROP = set(
+    "，。！？、,.!?~～…·:：;；()（）[]【】<>《》-—_/|"
+    + chr(34) + chr(39) + chr(92) + chr(0x201C) + chr(0x201D) + chr(0x2018) + chr(0x2019)
+)
+
+
+def expr_norm_key(scene: Any, way: Any) -> str:
+    """表达规范化键（F2 去重/合并键 +「不再学」名单键）：小写 + 去空白与常见标点。
+
+    只留「说法」骨架，所以「嘿嘿，谢谢夸奖～」与「嘿嘿谢谢夸奖」是同一个键。
+    scene 不参与（场景是分类，说法才是可复用的那条）。
+    """
+    s = "".join(ch for ch in str(way or "") if not ch.isspace() and ch not in _EXPR_NORM_DROP)
+    return s.lower()[:120]
+
 
 
 def _query_memory_id(q: str) -> int | None:
@@ -431,6 +763,18 @@ class Store:
         await self._db.execute("PRAGMA synchronous=NORMAL")
         for stmt in SCHEMA:
             await self._db.execute(stmt)
+        # 门控改判（S1）：决策流水补三列 —— 门控页行内「该回 / 判定正确」的落点。
+        # PRAGMA 探测 + ALTER，幂等：老库升级与新建库走同一条路（新库此时还没有这三列）。
+        try:
+            dl_cols = {str(r[1]) for r in await (await self._db.execute("PRAGMA table_info(hf_decision_log)")).fetchall()}
+            for col, ddl in (("user_verdict", "TEXT NOT NULL DEFAULT ''"),
+                             ("verdict_at", "REAL NOT NULL DEFAULT 0"),
+                             ("verdict_actor", "TEXT NOT NULL DEFAULT ''")):
+                if dl_cols and col not in dl_cols:
+                    await self._db.execute(f"ALTER TABLE hf_decision_log ADD COLUMN {col} {ddl}")
+            await self._db.commit()
+        except Exception as exc:                            # noqa: BLE001 列升级失败不该挡住启动
+            logger.warning(f"[StarHeart] 决策流水改判列升级跳过：{exc}")
         # 向量列（旧库平滑升级）
         cols = [r[1] for r in await (await self._db.execute("PRAGMA table_info(hf_memories)")).fetchall()]
         if "embedding" not in cols:
@@ -447,6 +791,17 @@ class Store:
             await self._db.execute("ALTER TABLE hf_memories ADD COLUMN last_used_at REAL NOT NULL DEFAULT 0")
         if "forget_stage" not in cols:
             await self._db.execute("ALTER TABLE hf_memories ADD COLUMN forget_stage TEXT NOT NULL DEFAULT ''")
+        # 记忆归属主体（谁的事）：同人格下多个私聊时，A 的记忆不该原样注入给 B。
+        # 旧库一律空串 = 未标注，召回时按「不惩罚」处理（不做猜测回填）。
+        if "subject_id" not in cols:
+            await self._db.execute("ALTER TABLE hf_memories ADD COLUMN subject_id TEXT DEFAULT ''")
+        # 主动流水升级：记下这条开口当时的「提示词来源（astrbot=完整 / persona=降级只吃人格）」与
+        # 「参考记忆编号」——以前只能翻 completion 原文才知道有没有降级，出问题无从核对。
+        pl_cols = [r[1] for r in await (await self._db.execute("PRAGMA table_info(hf_proactive_log)")).fetchall()]
+        if "prompt_source" not in pl_cols:
+            await self._db.execute("ALTER TABLE hf_proactive_log ADD COLUMN prompt_source TEXT NOT NULL DEFAULT ''")
+        if "memory_ids" not in pl_cols:
+            await self._db.execute("ALTER TABLE hf_proactive_log ADD COLUMN memory_ids TEXT NOT NULL DEFAULT ''")
         # 画像表升级：加「主体类型 user/group」与「人格」两列，主键从 person_id 单列变成三列复合。
         # 为什么要重建：① 群聊画像（L1）原来无处安放；② 两个人格共用一份画像 —— 违反人格隔离硬约束。
         # 旧数据一律按「人物 + 未归属人格」迁入，随后由 repair_profile_personas() 按记忆归属回填人格。
@@ -500,6 +855,11 @@ class Store:
             if cur_ver:
                 logger.info(f"[StarHeart] 库结构版本 {cur_ver} → {SCHEMA_VERSION}")
 
+        # ---- S4 表达回填（幂等；真机存量 = 0 → no-op）：旧表 hf_habits 只读保留、不删 ----
+        try:
+            await self.backfill_expr_from_habits()
+        except Exception as exc:                            # noqa: BLE001 回填失败不该挡住启动
+            logger.warning(f"[StarHeart] 表达回填跳过：{exc}")
     async def close(self) -> None:
         if self._db is not None:
             await self._db.close()
@@ -521,8 +881,9 @@ class Store:
                 INSERT INTO hf_memories
                     (summary, content, atom_type, strength, poignancy, source_mode, source_ref,
                      session_id, persona_id, tags, entities, cues, evidence, recalls, status,
-                     occurred_at, created_at, updated_at, external_source, external_id, import_batch)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                     occurred_at, created_at, updated_at, external_source, external_id, import_batch,
+                     last_used_at, subject_id)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     mem.get("summary", ""),
@@ -546,6 +907,10 @@ class Store:
                     mem.get("external_source", ""),
                     mem.get("external_id", ""),
                     mem.get("import_batch", ""),
+                    # 入库即视为「刚被提起」：导入的历史记忆若按原始发生日期算龄，
+                    # 第一个生命周期 tick 就会被归档、再一轮被遗忘（P0-13）。
+                    float(mem.get("last_used_at") or ts),
+                    str(mem.get("subject_id") or ""),
                 ),
             )
             await self.db.commit()
@@ -668,6 +1033,11 @@ class Store:
                 args.append(json.dumps(v if isinstance(v, list) else [v], ensure_ascii=False))
         if not sets:
             return False
+        # 改了强度就同步刷新衰减基线：否则「+0.15 加权」会被按旧基线一次性复利扣回去
+        # （衰减 = strength × 0.5^(距基线的龄期)，基线不动 = 补的强度等于白补）。
+        if "strength" in fields:
+            sets.append("strength_updated_at=?")
+            args.append(now())
         sets.append("updated_at=?")
         args += [now(), raw]
         await self.db.execute(f"UPDATE hf_memories SET {', '.join(sets)} WHERE id=?", args)
@@ -675,18 +1045,124 @@ class Store:
         return True
 
     async def delete_memory(self, mid: str | int) -> bool:
+        """单条删除 = **软删**（status='deleted'），关系边/向量/原文都留着，可恢复。
+
+        为什么不再物理删：面板一次误点就把记忆 + 关系链 + 原文一起抹掉，无撤销、无备份；
+        与本文件 purge_stale_memories 自己确立的「软删可回滚」原则相反。
+        硬删改为显式语义：只有「清空回收站」才会真删（purge_deleted_memories）。
+        """
         raw = str(mid).lstrip("m")
-        await self.db.execute("DELETE FROM hf_edges WHERE (src_type='memory' AND src_id=?) OR (dst_type='memory' AND dst_id=?)", (f"m{raw}", f"m{raw}"))
-        # 级联清向量与来源行：只删主表会在这两张表留下永远指向不存在记忆的孤儿行
-        # （向量表还会被 panel_stats 的覆盖率统计串进来，让「向量覆盖」虚高）
-        for tbl in ("hf_vectors", "hf_memory_src"):
-            try:
-                await self.db.execute(f"DELETE FROM {tbl} WHERE memory_id=?", (raw,))
-            except Exception as exc:                        # noqa: BLE001 老库可能没这张表
-                logger.warning(f"[StarHeart] 删除记忆时清理 {tbl} 跳过：{exc}")
-        await self.db.execute("DELETE FROM hf_memories WHERE id=?", (raw,))
+        cur = await self.db.execute(
+            "UPDATE hf_memories SET status='deleted', updated_at=? WHERE id=? AND status!='deleted'",
+            (now(), raw),
+        )
         await self.db.commit()
-        return True
+        return bool(cur.rowcount)
+
+    async def restore_memory(self, mid: str | int) -> bool:
+        """把回收站里的记忆恢复成 active。
+
+        覆盖两种终态：deleted（面板删除）与 forgotten（生命周期遗忘）。
+        forgotten 仍然不可被召回命中 —— 只有这里的人工恢复能把它拉回来，
+        与「遗忘是终点」的语义不冲突（这是显式的、一次一条的撤销）。
+        """
+        raw = str(mid).lstrip("m")
+        stamp = now()
+        cur = await self.db.execute(
+            "UPDATE hf_memories SET status='active', last_used_at=?, strength_updated_at=?, "
+            "strength=MAX(COALESCE(strength,0), 0.45), updated_at=? "
+            "WHERE id=? AND status IN ('deleted','forgotten')",
+            (stamp, stamp, stamp, raw),
+        )
+        await self.db.commit()
+        return bool(cur.rowcount)
+
+    async def purge_deleted_memories(self, older_than_days: float = 7) -> int:
+        """真删「回收站」里超过保留期的记忆（连同边/向量/来源行）。
+
+        这是唯一保留物理删除的路径，目的是不让 status='deleted' 的行永久堆积。
+        """
+        cut = now() - max(0.0, float(older_than_days)) * 86400
+        rows = await (await self.db.execute(
+            "SELECT id FROM hf_memories WHERE status='deleted' AND updated_at < ?", (cut,)
+        )).fetchall()
+        n = 0
+        for r in rows:
+            raw = str(r["id"])
+            await self.db.execute(
+                "DELETE FROM hf_edges WHERE (src_type='memory' AND src_id=?) OR (dst_type='memory' AND dst_id=?)",
+                (f"m{raw}", f"m{raw}"),
+            )
+            for tbl in ("hf_vectors", "hf_memory_src"):
+                try:
+                    await self.db.execute(f"DELETE FROM {tbl} WHERE memory_id=?", (raw,))
+                except Exception:                        # noqa: BLE001 老库可能没这张表
+                    pass
+            await self.db.execute("DELETE FROM hf_memories WHERE id=?", (raw,))
+            n += 1
+        await self.db.commit()
+        return n
+
+    # ---------------- 记忆捕获待处理队列（先落库，再总结） ----------------
+    # 旧链路是 `turns=list(buf); buf.clear(); _spawn(总结)`：模型超时/空响应/格式不对
+    # 就整批消失，只剩一行 log，还会白吃 300s 间隔。现在一律先写 pending，成功才删。
+    async def capture_enqueue(self, turns: list[dict[str, Any]], *, session_id: str = "",
+                              persona_id: str = "", user_id: str = "", user_name: str = "",
+                              delay: float = 0.0) -> int | None:
+        if not turns:
+            return None
+        try:
+            payload = json.dumps(list(turns), ensure_ascii=False)
+        except Exception:
+            return None
+        cur = await self.db.execute(
+            "INSERT INTO hf_capture_pending "
+            "(session_id, persona_id, user_id, user_name, payload, tries, next_try_at, created_at) "
+            "VALUES (?,?,?,?,?,0,?,?)",
+            (str(session_id or ""), str(persona_id or ""), str(user_id or ""), str(user_name or ""),
+             payload, now() + max(0.0, float(delay or 0)), now()),
+        )
+        await self.db.commit()
+        return int(cur.lastrowid or 0)
+
+    async def capture_take(self, limit: int = 3) -> list[dict[str, Any]]:
+        """取到期可跑的待处理批（按到期时间先进先出）。"""
+        rows = await (await self.db.execute(
+            "SELECT * FROM hf_capture_pending WHERE next_try_at <= ? ORDER BY next_try_at ASC, id ASC LIMIT ?",
+            (now(), max(1, int(limit))),
+        )).fetchall()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["turns"] = json.loads(d.get("payload") or "[]")
+            except Exception:
+                d["turns"] = []
+            out.append(d)
+        return out
+
+    async def capture_count(self) -> int:
+        row = await (await self.db.execute("SELECT COUNT(*) AS n FROM hf_capture_pending")).fetchone()
+        return int((row or {})["n"] or 0) if row else 0
+
+    async def capture_done(self, pid: int) -> None:
+        await self.db.execute("DELETE FROM hf_capture_pending WHERE id=?", (int(pid),))
+        await self.db.commit()
+
+    async def capture_fail(self, pid: int, err: str, max_tries: int = 5) -> int:
+        """失败退避：30s → 60 → 120 → 240 → 480，超上限留档不再重试（不静默丢数据）。"""
+        row = await (await self.db.execute("SELECT tries FROM hf_capture_pending WHERE id=?", (int(pid),))).fetchone()
+        tries = int((row or {"tries": 0})["tries"] or 0) + 1
+        if tries >= max_tries:
+            nxt = now() + 365 * 86400.0          # 不再自动重试，但语义上仍保留（面板可查）
+        else:
+            nxt = now() + min(3600.0, 30.0 * (2 ** (tries - 1)))
+        await self.db.execute(
+            "UPDATE hf_capture_pending SET tries=?, next_try_at=?, last_error=? WHERE id=?",
+            (tries, nxt, str(err or "")[:300], int(pid)),
+        )
+        await self.db.commit()
+        return tries
 
     async def purge_stale_memories(self, persona_id: str | None = None) -> int:
         """把「非 active」的记忆**软删**（status='deleted'）并级联清理，返回受影响条数。
@@ -794,7 +1270,7 @@ class Store:
             "gate_reply": await one("SELECT COUNT(*) FROM hf_gate_log WHERE decision='reply'"),
             "memory_by_type": {str(r["t"] or "未知"): int(r["c"]) for r in by_type},
             "memories": await one(f"SELECT COUNT(*) FROM hf_memories{mem_where}", mem_args),
-            "habits": await one("SELECT COUNT(*) FROM hf_habits"),
+            "habits": await one("SELECT COUNT(*) FROM hf_expr WHERE status!='archived'"),
             "favours": await one("SELECT COUNT(*) FROM hf_favours"),
             "entities": await one("SELECT COUNT(*) FROM hf_entities"),
             "edges": await one("SELECT COUNT(*) FROM hf_edges"),
@@ -807,12 +1283,26 @@ class Store:
         await self.db.commit()
         return int(cur.rowcount or 0)
 
-    async def purge_learning(self) -> dict[str, int]:
-        """清记忆/实体/关系/表达习惯；好感度保留（关系是长期资产，单独由面板决定）。"""
-        out: dict[str, int] = {}
-        for table in ("hf_edges", "hf_entities", "hf_habits", "hf_memories"):
-            cur = await self.db.execute(f"DELETE FROM {table}")
-            out[table.replace("hf_", "")] = int(cur.rowcount or 0)
+    async def purge_learning(self) -> dict[str, Any]:
+        """清记忆/实体/关系/表达（原语义；拍-14：先备份再动）。
+
+        好感保留（关系是长期资产，单独由面板决定）。返回值多一个 backup 字段
+        ——「备份没建成」要能让面板如实说出来，不能假装有备份。
+        """
+        backup = await self.backup_tables(LEARNING_BACKUP_TABLES, tag="learning")
+        out: dict[str, Any] = {"backup": backup}
+        if not backup:
+            # 备份失败就绝不动库：宁可这次清空失效，也不能不可恢复地删数据
+            out["error"] = "backup_failed"
+            out["aborted"] = True
+            logger.error("[StarHeart] 清空学习中止：备份失败，未删除任何表")
+            return out
+        for table in ("hf_edges", "hf_entities", "hf_memories", "hf_expr", "hf_habits"):
+            try:
+                cur = await self.db.execute(f"DELETE FROM {table}")
+                out[table.replace("hf_", "")] = int(cur.rowcount or 0)
+            except Exception as exc:                        # noqa: BLE001 单表缺/坏不挡其它表
+                logger.warning(f"[StarHeart] 清空学习数据跳过 {table}：{exc}")
         await self.db.commit()
         return out
 
@@ -1726,57 +2216,750 @@ class Store:
             return "COLD"
         return "HOSTILE"
 
-    # ---------------- 表达习惯 ----------------
-    async def list_habits(self) -> list[dict[str, Any]]:
-        rows = await (await self.db.execute("SELECT * FROM hf_habits ORDER BY enabled DESC, uses DESC")).fetchall()
-        out = []
+    # ---------------- 表达（S4：hf_expr 新表；hf_habits 只读保留、不再写） ----------------
+    async def list_habits(self, include_archived: bool = False) -> list[dict[str, Any]]:
+        """表达库全量（注入侧与面板共用）。
+
+        use_count / last_used / used_24h / injected_24h 全部**查询聚合**（拍-5：不设回写列，
+        真源 = hf_expr_use_log）→ 不会出现「回写列与流水漂移」。uses = use_count 的兼容别名。
+        """
+        cut = now() - EXPR_WINDOW_SECONDS
+        where = "" if include_archived else " WHERE e.status!='archived'"
+        rows = await (
+            await self.db.execute(
+                "SELECT e.*,"
+                " (SELECT COUNT(*) FROM hf_expr_use_log u WHERE u.expr_id=e.id AND u.emit_ok=1) AS use_count,"
+                " (SELECT MAX(u.used_at) FROM hf_expr_use_log u WHERE u.expr_id=e.id AND u.emit_ok=1) AS last_used,"
+                " (SELECT COUNT(*) FROM hf_expr_use_log u WHERE u.expr_id=e.id AND u.emit_ok=1 AND u.used_at>=?) AS used_24h,"
+                " (SELECT COUNT(*) FROM hf_expr_use_log u WHERE u.expr_id=e.id AND u.used_at>=?) AS injected_24h"
+                " FROM hf_expr e" + where + " ORDER BY e.enabled DESC, e.id DESC",
+                (cut, cut),
+            )
+        ).fetchall()
+        out: list[dict[str, Any]] = []
         for r in rows:
             d = dict(r)
-            try:
-                d["cues"] = json.loads(d.get("cues") or "[]")
-            except (TypeError, ValueError):
-                d["cues"] = []
+            d["cues"] = _jlist(d.get("cues"))
+            d["source_ids"] = _jobj_list(d.get("source_ids"))
+            d["evidence_snap"] = _jobj_list(d.get("evidence_snap"))
+            d["use_count"] = int(d.get("use_count") or 0)
+            d["uses"] = d["use_count"]                      # 兼容旧字段名（面板曾读 uses）
             out.append(d)
         return out
 
-    async def upsert_habit(self, habit: dict[str, Any]) -> int:
+    async def upsert_expr(self, expr: dict[str, Any]) -> int:
+        """写入/更新一条表达（面板「手加」与就地编辑走这里）。id 在 = 就地改，否则新增。"""
         ts = now()
-        hid = habit.get("id")
-        if hid:
+        eid = int(expr.get("id") or 0)
+        norm_key = str(expr.get("norm_key") or "").strip() or expr_norm_key(expr.get("scene", ""), expr.get("way", ""))
+        if eid:
             await self.db.execute(
-                "UPDATE hf_habits SET scene=?, way=?, cues=?, weight=?, scope=?, enabled=?, updated_at=? WHERE id=?",
+                "UPDATE hf_expr SET scene=?, way=?, cues=?, scope=?, enabled=?, norm_key=?,"
+                " checked_state=?, ai_reason=?, updated_at=? WHERE id=?",
                 (
-                    habit.get("scene", ""),
-                    habit.get("way", ""),
-                    json.dumps(habit.get("cues", []), ensure_ascii=False),
-                    float(habit.get("weight", 0.5)),
-                    habit.get("scope", "全局"),
-                    1 if habit.get("enabled", True) else 0,
+                    str(expr.get("scene") or "")[:40],
+                    str(expr.get("way") or "")[:120],
+                    json.dumps(expr.get("cues") or [], ensure_ascii=False),
+                    str(expr.get("scope") or "全局"),
+                    1 if expr.get("enabled", True) else 0,
+                    norm_key,
+                    str(expr.get("checked_state") or "ai_pending"),
+                    str(expr.get("ai_reason") or ""),
                     ts,
-                    hid,
+                    eid,
                 ),
             )
             await self.db.commit()
-            return int(hid)
+            return eid
         cur = await self.db.execute(
-            "INSERT INTO hf_habits(scene,way,cues,weight,uses,scope,enabled,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+            "INSERT INTO hf_expr(scene,way,cues,scope,enabled,status,norm_key,duplicate_of,checked_state,"
+            " ai_reason,source_ids,evidence_snap,cooldown_until,outcome_score,gate_override,created_at,updated_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
-                habit.get("scene", ""),
-                habit.get("way", ""),
-                json.dumps(habit.get("cues", []), ensure_ascii=False),
-                float(habit.get("weight", 0.5)),
-                int(habit.get("uses", 0)),
-                habit.get("scope", "全局"),
-                1 if habit.get("enabled", True) else 0,
+                str(expr.get("scene") or "")[:40],
+                str(expr.get("way") or "")[:120],
+                json.dumps(expr.get("cues") or [], ensure_ascii=False),
+                str(expr.get("scope") or "全局"),
+                1 if expr.get("enabled", True) else 0,
+                str(expr.get("status") or "active"),
+                norm_key,
+                expr.get("duplicate_of"),
+                str(expr.get("checked_state") or "ai_pending"),
+                str(expr.get("ai_reason") or ""),
+                json.dumps(expr.get("source_ids") or [], ensure_ascii=False),
+                json.dumps(expr.get("evidence_snap") or [], ensure_ascii=False),
+                expr.get("cooldown_until"),
+                expr.get("outcome_score"),
+                str(expr.get("gate_override") or ""),
+                ts,
                 ts,
             ),
         )
         await self.db.commit()
         return int(cur.lastrowid or 0)
 
-    async def delete_habit(self, hid: int) -> None:
-        await self.db.execute("DELETE FROM hf_habits WHERE id=?", (hid,))
+    async def find_expr(self, scope: str, norm_key: str) -> dict[str, Any] | None:
+        """按 (scope, norm_key) 找一条（提取合并用：命中就合并，不新增行）。"""
+        row = await (
+            await self.db.execute(
+                "SELECT * FROM hf_expr WHERE scope=? AND norm_key=? ORDER BY id DESC LIMIT 1",
+                (str(scope or ""), str(norm_key or "")),
+            )
+        ).fetchone()
+        return dict(row) if row else None
+
+    async def merge_expr(self, expr: dict[str, Any]) -> tuple[int, bool]:
+        """提取路径的写入（S4-2）。返回 (id, 是否新增行)。
+
+        命中同 (scope, norm_key) 时只更新说法并**累加**出处/证据：
+        checked_state / enabled / status 一律保持原值 —— 学习回写绝不回退审核态（上游 G2 教训）。
+        """
+        norm_key = str(expr.get("norm_key") or "").strip() or expr_norm_key(expr.get("scene", ""), expr.get("way", ""))
+        eid = int(expr.get("id") or 0)
+        row: dict[str, Any] | None = None
+        if eid:
+            hit = await (await self.db.execute("SELECT * FROM hf_expr WHERE id=?", (eid,))).fetchone()
+            row = dict(hit) if hit else None
+        if row is None:
+            row = await self.find_expr(str(expr.get("scope") or "全局"), norm_key)
+        if row is None:
+            return await self.upsert_expr({**expr, "norm_key": norm_key}), True
+        cues = _jlist(row.get("cues"))
+        for c in [str(x) for x in (expr.get("cues") or []) if str(x or "").strip()]:
+            if c not in cues:
+                cues.append(c)
+        src = _jobj_list(row.get("source_ids"))
+        seen = {(str(x.get("corpus_id") or ""), str(x.get("text") or "")) for x in src}
+        for x in (expr.get("source_ids") or []):
+            k = (str(x.get("corpus_id") or ""), str(x.get("text") or ""))
+            if k not in seen:
+                src.append(x)
+                seen.add(k)
+        ev = _jobj_list(row.get("evidence_snap"))
+        seen_ev = {(str(x.get("text") or ""), str(x.get("corpus_id") or "")) for x in ev}
+        for x in (expr.get("evidence_snap") or []):
+            k = (str(x.get("text") or ""), str(x.get("corpus_id") or ""))
+            if k not in seen_ev:
+                ev.append(x)
+                seen_ev.add(k)
+        await self.db.execute(
+            "UPDATE hf_expr SET scene=?, way=?, cues=?, source_ids=?, evidence_snap=?, updated_at=? WHERE id=?",
+            (
+                str(expr.get("scene") or row.get("scene") or "")[:40],
+                str(expr.get("way") or row.get("way") or "")[:120],
+                json.dumps(cues[:20], ensure_ascii=False),
+                json.dumps(src[:20], ensure_ascii=False),
+                json.dumps(ev[:20], ensure_ascii=False),
+                now(),
+                int(row["id"]),
+            ),
+        )
         await self.db.commit()
+        return int(row["id"]), False
+
+    # ---------------- 审核状态机 + 「不再学」名单（S4-2） ----------------
+    async def set_expr_review(self, ids: list[int], action: str, reason: str = "", actor: str = "panel") -> dict[str, Any]:
+        """approve → user_ok（并启用）；reject → user_reject（停用）+ 写「不再学」名单。
+
+        驳回是软语义（可恢复）：行保留，移出名单 + status 回 active 就回来了。
+        """
+        picked: list[int] = []
+        for x in ids or []:
+            try:
+                v = int(x)
+            except (TypeError, ValueError):
+                continue
+            if v > 0:
+                picked.append(v)
+        if not picked:
+            return {"changed": 0, "banned": 0, "ids": []}
+        marks = ",".join("?" for _ in picked)
+        rows = await (await self.db.execute(f"SELECT * FROM hf_expr WHERE id IN ({marks})", picked)).fetchall()
+        stamp = now()
+        banned = 0
+        for r in rows:
+            row = dict(r)
+            if str(action) == "approve":
+                await self.db.execute(
+                    "UPDATE hf_expr SET checked_state='user_ok', enabled=1, ai_reason=?, updated_at=? WHERE id=?",
+                    (str(reason or row.get("ai_reason") or ""), stamp, int(row["id"])),
+                )
+            else:
+                await self.db.execute(
+                    "UPDATE hf_expr SET checked_state='user_reject', enabled=0, ai_reason=?, updated_at=? WHERE id=?",
+                    (str(reason or ""), stamp, int(row["id"])),
+                )
+                banned += await self.add_ban(
+                    key=f"{row.get('scene') or ''}|{row.get('way') or ''}",
+                    norm_key=str(row.get("norm_key") or ""),
+                    reason=str(reason or "驳回"),
+                    actor=actor,
+                    note="review:reject",
+                )
+        await self.db.commit()
+        return {"changed": len(rows), "banned": banned, "ids": [int(dict(r)["id"]) for r in rows]}
+
+    async def add_ban(self, *, key: str, norm_key: str, reason: str = "", actor: str = "panel", note: str = "") -> int:
+        """写「不再学」名单（同 norm_key 覆盖：最新理由/时间赢）。返回 1/0。"""
+        nk = str(norm_key or "").strip() or expr_norm_key(key, key)
+        if not nk:
+            return 0
+        await self.db.execute(
+            "INSERT OR REPLACE INTO hf_expr_banned(key,norm_key,reason,ts,actor,note) VALUES(?,?,?,?,?,?)",
+            (str(key or "")[:120], nk, str(reason or "")[:200], now(), str(actor or "panel"), str(note or "")[:200]),
+        )
+        await self.db.commit()
+        return 1
+
+    async def list_bans(self, limit: int = 200) -> list[dict[str, Any]]:
+        rows = await (
+            await self.db.execute(
+                "SELECT * FROM hf_expr_banned ORDER BY ts DESC LIMIT ?", (max(1, min(int(limit), 500)),)
+            )
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    async def banned_keys(self) -> set[str]:
+        """名单键集合（提取路径先过它 → 「删了还会再学」的洞在此封死）。"""
+        try:
+            rows = await (await self.db.execute("SELECT norm_key FROM hf_expr_banned")).fetchall()
+        except Exception as exc:                            # noqa: BLE001
+            logger.warning(f"[StarHeart] 「不再学」名单读取跳过：{exc}")
+            return set()
+        return {str(r["norm_key"] or "") for r in rows if str(r["norm_key"] or "")}
+
+    async def remove_ban(self, norm_key: str) -> dict[str, Any]:
+        """移出名单（v8「可移出」）：同键可再学；被软删的同键行一并恢复。"""
+        nk = str(norm_key or "").strip()
+        if not nk:
+            return {"removed": 0, "restored": 0}
+        cur = await self.db.execute("DELETE FROM hf_expr_banned WHERE norm_key=?", (nk,))
+        back = await self.db.execute(
+            "UPDATE hf_expr SET status='active', enabled=1, updated_at=? WHERE norm_key=? AND status='archived'",
+            (now(), nk),
+        )
+        await self.db.commit()
+        return {"removed": int(cur.rowcount or 0), "restored": int(back.rowcount or 0)}
+
+    async def archive_expr(self, hid: int, actor: str = "panel") -> dict[str, Any]:
+        """「删除」的真语义（S4-2 + 拍-14）：软删（status='archived' + 停用）+ 写「不再学」名单。
+
+        真删归数据治理（「只清表达」）。行还在 → 移出名单即恢复。
+        """
+        row = await (await self.db.execute("SELECT * FROM hf_expr WHERE id=?", (int(hid),))).fetchone()
+        if not row:
+            return {"archived": 0, "banned": 0}
+        d = dict(row)
+        await self.db.execute(
+            "UPDATE hf_expr SET status='archived', enabled=0, updated_at=? WHERE id=?", (now(), int(hid))
+        )
+        await self.db.commit()
+        n = await self.add_ban(
+            key=f"{d.get('scene') or ''}|{d.get('way') or ''}",
+            norm_key=str(d.get("norm_key") or ""),
+            reason="手动删除",
+            actor=actor,
+            note="delete",
+        )
+        return {"archived": 1, "banned": n}
+
+    async def expr_review_queue(self, limit: int = 200) -> dict[str, Any]:
+        """待审行 + 四种计数（GET expr/review）：审核队列的数据源。"""
+        rows = await (
+            await self.db.execute(
+                "SELECT checked_state, COUNT(*) AS n FROM hf_expr WHERE status!='archived' GROUP BY checked_state"
+            )
+        ).fetchall()
+        counts = {str(r["checked_state"] or ""): int(r["n"] or 0) for r in rows}
+        pend = await (
+            await self.db.execute(
+                "SELECT id, scene, way, scope, checked_state, ai_reason, created_at, updated_at FROM hf_expr"
+                " WHERE status!='archived' AND checked_state='ai_pending' ORDER BY id DESC LIMIT ?",
+                (max(1, min(int(limit), 500)),),
+            )
+        ).fetchall()
+        ban = await (await self.db.execute("SELECT COUNT(*) AS n FROM hf_expr_banned")).fetchone()
+        return {
+            "items": [dict(r) for r in pend],
+            "counts": {
+                "pending": counts.get("ai_pending", 0),
+                "ok": counts.get("user_ok", 0),
+                "rejected": counts.get("user_reject", 0),
+                "banned": int(ban["n"] or 0) if ban else 0,
+            },
+        }
+
+    # ---------------- 学习诊断（S4-4） ----------------
+    async def log_expr_run(self, rec: dict[str, Any]) -> None:
+        """每次提取运行落一行；写失败只 WARNING（绝不挡提取）。"""
+        try:
+            await self.db.execute(
+                "INSERT INTO hf_expr_run_log(ts,scanned,saved,skipped_reason,model,ok,persona_id) VALUES(?,?,?,?,?,?,?)",
+                (
+                    float(rec.get("ts") or now()),
+                    int(rec.get("scanned") or 0),
+                    int(rec.get("saved") or 0),
+                    str(rec.get("skipped_reason") or ""),
+                    str(rec.get("model") or ""),
+                    1 if rec.get("ok", True) else 0,
+                    str(rec.get("persona_id") or ""),
+                ),
+            )
+            await self.db.commit()
+        except Exception as exc:                            # noqa: BLE001
+            logger.warning(f"[StarHeart] 学习诊断写入跳过：{exc}")
+
+    async def expr_runs(self, limit: int = 20) -> list[dict[str, Any]]:
+        rows = await (
+            await self.db.execute(
+                "SELECT * FROM hf_expr_run_log ORDER BY ts DESC LIMIT ?", (max(1, min(int(limit), 200)),)
+            )
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ---------------- 出站对账（S4-3：use_count = 出站子串命中） ----------------
+    async def reconcile_expr_use(
+        self, session_id: str, text: str, *, sent_ok: bool | None = True, window: float = 1800.0
+    ) -> dict[str, int]:
+        """把本会话**待对账**的注入行按「出站子串命中」判掉。
+
+        命中（出站原文里出现这条的 way 或 scene）→ emit_ok=1；没命中 → 0；发送失败（sent_ok=False）→
+        全判 0（没发出去不算用过）；sent_ok=None = first_seg（发出但拿不到回执）照样参与判定
+        （拍-12：NULL ≠ 没发出，排除它 = 系统性低估）。只注入、不产出站的行保持 NULL 且**不计数**。
+        """
+        body = str(text or "")
+        if sent_ok is not False and not body.strip():
+            # 没有出站原文可判（表情包 / 语音这类段）→ 留 NULL 不瞎判（NULL = 未对账、不计入 use_count）
+            return {"reconciled": 0, "hit": 0, "miss": 0}
+        rows = await (
+            await self.db.execute(
+                "SELECT u.id AS uid, u.expr_id AS eid, e.scene AS scene, e.way AS way"
+                " FROM hf_expr_use_log u LEFT JOIN hf_expr e ON e.id=u.expr_id"
+                " WHERE u.session_id=? AND u.emit_ok IS NULL AND u.used_at>=?",
+                (str(session_id or ""), now() - max(60.0, float(window))),
+            )
+        ).fetchall()
+        hit = miss = 0
+        for r in rows:
+            ok = bool(sent_ok is not False and body)
+            if ok:
+                way = str(r["way"] or "")
+                scene = str(r["scene"] or "")
+                ok = bool((way and way in body) or (scene and scene in body))
+            try:
+                await self.db.execute(
+                    "UPDATE hf_expr_use_log SET emit_ok=? WHERE id=?", (1 if ok else 0, int(r["uid"]))
+                )
+            except Exception as exc:                        # noqa: BLE001
+                logger.warning(f"[StarHeart] 表达出站对账写回跳过：{exc}")
+            hit += 1 if ok else 0
+            miss += 0 if ok else 1
+        if rows:
+            await self.db.commit()
+        return {"reconciled": len(rows), "hit": hit, "miss": miss}
+
+    # ---------------- 语料出处（E3） ----------------
+    async def referenced_corpus_ids(self) -> set[int]:
+        """被**有效表达**引用的语料 id 集合（拍-15：prune 用查询排除，不给 hf_corpus 加列）。"""
+        out: set[int] = set()
+        try:
+            rows = await (
+                await self.db.execute("SELECT source_ids, evidence_snap FROM hf_expr WHERE status!='archived'")
+            ).fetchall()
+        except Exception as exc:                            # noqa: BLE001
+            logger.warning(f"[StarHeart] 出处引用读取跳过：{exc}")
+            return out
+        for r in rows:
+            for item in _jobj_list(r["source_ids"]) + _jobj_list(r["evidence_snap"]):
+                try:
+                    cid = int(item.get("corpus_id") or 0)
+                except (TypeError, ValueError):
+                    cid = 0
+                if cid:
+                    out.add(cid)
+        return out
+
+    async def corpus_ref_map(self, ids: list[int]) -> dict[int, dict[str, Any]]:
+        """语料 id → {message_id, ext_id, session_id}（出处对树用）。"""
+        picked = [int(x) for x in ids if int(x or 0) > 0]
+        if not picked:
+            return {}
+        marks = ",".join("?" for _ in picked)
+        rows = await (
+            await self.db.execute(f"SELECT * FROM hf_corpus_ref WHERE corpus_id IN ({marks})", picked)
+        ).fetchall()
+        return {int(r["corpus_id"]): dict(r) for r in rows}
+
+    async def corpus_rows_by_ids(self, ids: list[int]) -> dict[int, dict[str, Any]]:
+        """语料 id → 语料行（出处回查：还在不在、原话是否逐字相等）。"""
+        picked = [int(x) for x in ids if int(x or 0) > 0]
+        if not picked:
+            return {}
+        marks = ",".join("?" for _ in picked)
+        rows = await (
+            await self.db.execute(f"SELECT * FROM hf_corpus WHERE id IN ({marks})", picked)
+        ).fetchall()
+        return {int(r["id"]): dict(r) for r in rows}
+
+    async def corpus_unused_count(self) -> int:
+        """还没学过的群友/好友语料条数（诊断块「可学 X 条未学」）。"""
+        row = await (
+            await self.db.execute("SELECT COUNT(*) AS n FROM hf_corpus WHERE is_bot=0 AND used=0")
+        ).fetchone()
+        return int(row["n"] or 0) if row else 0
+
+    # ---------------- S5 黑话（hf_jargon + 命中日志） ----------------
+    async def jargon_upsert(self, rec: dict[str, Any]) -> tuple[int, bool]:
+        """写一条黑话，返回 (id, 是否新建)。(term, scope) 逻辑唯一 —— 应用层判重（拍-18 冻结口径）。
+
+        推断路径与手工路径共用；denied 的行也占位（= 不再推断），所以判重**不看 status**。
+        """
+        term = str(rec.get("term") or "").strip()[:JARGON_TERM_MAX_CHARS]
+        if not term:
+            return 0, False
+        scope = str(rec.get("scope") or "全局").strip() or "全局"
+        stamp = now()
+        ev = rec.get("evidence_json", rec.get("evidence"))
+        if isinstance(ev, (list, dict)):
+            ev = json.dumps(ev, ensure_ascii=False)
+        ev = str(ev or "[]")
+        row = await (
+            await self.db.execute("SELECT id FROM hf_jargon WHERE term=? AND scope=? LIMIT 1", (term, scope))
+        ).fetchone()
+        if row:
+            jid = int(row["id"])
+            sets = ["evidence_json=?", "updated_at=?"]
+            args: list[Any] = [ev, stamp]
+            if str(rec.get("meaning") or "").strip():
+                sets.insert(0, "meaning=?")
+                args.insert(0, str(rec["meaning"])[:JARGON_MEANING_MAX_CHARS])
+            if rec.get("status"):
+                sets.insert(0, "status=?")
+                args.insert(0, str(rec["status"]))
+            await self.db.execute(f"UPDATE hf_jargon SET {', '.join(sets)} WHERE id=?", args + [jid])
+            await self.db.commit()
+            return jid, False
+        cur = await self.db.execute(
+            "INSERT INTO hf_jargon(term,meaning,evidence_json,status,scope,enabled,hit_count,last_hit_at,created_at,updated_at)"
+            " VALUES(?,?,?,?,?,?,0,NULL,?,?)",
+            (
+                term,
+                str(rec.get("meaning") or "")[:JARGON_MEANING_MAX_CHARS],
+                ev,
+                str(rec.get("status") or "pending"),
+                scope,
+                1 if rec.get("enabled", 1) else 0,
+                stamp,
+                stamp,
+            ),
+        )
+        await self.db.commit()
+        return int(cur.lastrowid or 0), True
+
+    async def jargon_match_pool(self, scopes: list[str]) -> list[dict[str, Any]]:
+        """当前会话可用的黑话候选池 —— scope 过滤**下推 SQL**（拍-17），走 (scope, term) 索引。
+
+        只收 enabled 且非 denied 的行（denied = 已判定不是黑话：不再注入、不再重推断）。
+        """
+        picked = [str(s).strip() for s in (scopes or []) if str(s or "").strip()]
+        if not picked:
+            return []
+        marks = ",".join("?" for _ in picked)
+        rows = await (
+            await self.db.execute(
+                "SELECT id,term,meaning,status,scope,hit_count FROM hf_jargon"
+                " WHERE enabled=1 AND status IN ('pending','confirmed')"
+                f" AND scope IN ({marks})",
+                picked,
+            )
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    async def jargon_log_hits(self, rows: list[dict[str, Any]]) -> int:
+        """命中日志（验证物①）：每命中一词写一行 + 该词 hit_count/last_hit_at 递增。
+
+        失败只 WARNING（记账不许影响注入）；返回写入行数。点一下 message = 每词一行（同轮多词多行）。
+        """
+        if not rows:
+            return 0
+        n = 0
+        try:
+            bump: dict[int, list[float]] = {}
+            for r in rows:
+                try:
+                    tid = int(r.get("term_id") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if tid <= 0:
+                    continue
+                ts = float(r.get("ts") or now())
+                await self.db.execute(
+                    "INSERT INTO hf_jargon_hit(term_id,session_id,msg,ts,injected) VALUES(?,?,?,?,?)",
+                    (
+                        tid,
+                        str(r.get("session_id") or ""),
+                        str(r.get("msg") or "")[:JARGON_HIT_MSG_MAX_CHARS],
+                        ts,
+                        1 if r.get("injected") else 0,
+                    ),
+                )
+                n += 1
+                agg = bump.setdefault(tid, [0.0, ts])
+                agg[0] += 1
+                agg[1] = max(agg[1], ts)
+            for tid, (cnt, last) in bump.items():
+                await self.db.execute(
+                    "UPDATE hf_jargon SET hit_count=hit_count+?, last_hit_at=? WHERE id=?",
+                    (int(cnt), float(last), tid),
+                )
+            await self.db.commit()
+        except Exception as exc:                            # noqa: BLE001 记账失败不算错
+            logger.warning(f"[StarHeart] 黑话命中记账跳过：{exc}")
+        return n
+
+    async def jargon_list(self, *, status: str = "", q: str = "", scope: str = "") -> list[dict[str, Any]]:
+        """黑话清单（面板块②数据源）：过滤全参数化；evidence_json 解析成 evidence 列表。"""
+        where: list[str] = []
+        args: list[Any] = []
+        if str(status or "").strip():
+            where.append("status=?")
+            args.append(str(status).strip())
+        if str(scope or "").strip():
+            where.append("scope=?")
+            args.append(str(scope).strip())
+        if str(q or "").strip():
+            where.append("(term LIKE ? OR meaning LIKE ?)")
+            like = f"%{str(q).strip()}%"
+            args += [like, like]
+        clause = ("WHERE " + " AND ".join(where)) if where else ""
+        rows = await (
+            await self.db.execute(
+                f"SELECT * FROM hf_jargon {clause} ORDER BY hit_count DESC, id DESC", args
+            )
+        ).fetchall()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            d = dict(r)
+            d["evidence"] = _jobj_list(r["evidence_json"])
+            out.append(d)
+        return out
+
+    async def jargon_hit_stats(self) -> dict[int, dict[str, Any]]:
+        """每个词的命中聚合：总次数 / 涉及会话数 / 最近一次（面板「出现 / 最近命中」）。"""
+        rows = await (
+            await self.db.execute(
+                "SELECT term_id, COUNT(*) AS n, COUNT(DISTINCT session_id) AS sess, MAX(ts) AS last_ts"
+                " FROM hf_jargon_hit GROUP BY term_id"
+            )
+        ).fetchall()
+        return {
+            int(r["term_id"]): {"hits": int(r["n"] or 0), "sessions": int(r["sess"] or 0),
+                                "last_ts": float(r["last_ts"] or 0)}
+            for r in rows
+        }
+
+    async def jargon_expr_map(self) -> dict[str, list[dict[str, Any]]]:
+        """「未进入回复库」检查：黑话词出现在表达库 way/scene 的行（instr 精确子串，无通配语义）。
+
+        口径 = round1-C1 §4 的**唯一正向检查**：黑话词不得出现在 hf_expr 里（只做理解、不做表达）。
+        """
+        rows = await (
+            await self.db.execute(
+                "SELECT j.id AS term_id, j.term AS term, e.id AS expr_id, e.scene AS scene, e.way AS way"
+                " FROM hf_jargon j JOIN hf_expr e"
+                " ON (instr(e.way, j.term) > 0 OR instr(e.scene, j.term) > 0)"
+                " WHERE e.status != 'archived'"
+            )
+        ).fetchall()
+        out: dict[str, list[dict[str, Any]]] = {}
+        for r in rows:
+            out.setdefault(str(r["term"]), []).append(
+                {"term_id": int(r["term_id"]), "term": str(r["term"]),
+                 "expr_id": int(r["expr_id"]), "scene": str(r["scene"] or ""), "way": str(r["way"] or "")}
+            )
+        return out
+
+    async def jargon_hits_list(self, term_id: int, limit: int = 20) -> list[dict[str, Any]]:
+        """命中日志（看原话）：按时间倒序。term_id 参数化；越界收敛。"""
+        rows = await (
+            await self.db.execute(
+                "SELECT * FROM hf_jargon_hit WHERE term_id=? ORDER BY ts DESC LIMIT ?",
+                (int(term_id), max(1, min(int(limit), 200))),
+            )
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    async def jargon_get(self, jid: int) -> dict[str, Any] | None:
+        row = await (await self.db.execute("SELECT * FROM hf_jargon WHERE id=?", (int(jid),))).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        d["evidence"] = _jobj_list(row["evidence_json"])
+        return d
+
+    async def jargon_set_status(self, jid: int, status: str, *, enabled: int | None = None) -> int:
+        """人工闸门（洞③）：pending → confirmed / denied。denied 同时置 enabled=0（归档语义）。"""
+        sets = ["status=?", "updated_at=?"]
+        args: list[Any] = [str(status), now()]
+        if enabled is not None:
+            sets.append("enabled=?")
+            args.append(int(enabled))
+        cur = await self.db.execute(f"UPDATE hf_jargon SET {', '.join(sets)} WHERE id=?", args + [int(jid)])
+        await self.db.commit()
+        return int(cur.rowcount or 0)
+
+    async def jargon_update(self, jid: int, *, term: str | None = None, meaning: str | None = None,
+                            enabled: int | None = None) -> int:
+        """改词条 / 改释义 / 停用-启用（都是人工动作）。term 改了要防它撞上现存 (term, scope) 唯一键。"""
+        sets: list[str] = []
+        args: list[Any] = []
+        if term is not None:
+            t = str(term).strip()[:JARGON_TERM_MAX_CHARS]
+            if not t:
+                return 0
+            sets.append("term=?")
+            args.append(t)
+        if meaning is not None:
+            sets.append("meaning=?")
+            args.append(str(meaning)[:JARGON_MEANING_MAX_CHARS])
+        if enabled is not None:
+            sets.append("enabled=?")
+            args.append(1 if enabled else 0)
+        if not sets:
+            return 0
+        sets.append("updated_at=?")
+        args.append(now())
+        cur = await self.db.execute(f"UPDATE hf_jargon SET {', '.join(sets)} WHERE id=?", args + [int(jid)])
+        await self.db.commit()
+        return int(cur.rowcount or 0)
+
+    async def jargon_delete(self, jid: int) -> dict[str, int]:
+        """真删一条黑话（行 + 它的命中日志）。「否定」不等于删除：否定是归档（status=denied）。"""
+        target = int(jid)
+        cur = await self.db.execute("DELETE FROM hf_jargon WHERE id=?", (target,))
+        hits = await self.db.execute("DELETE FROM hf_jargon_hit WHERE term_id=?", (target,))
+        await self.db.commit()
+        return {"deleted": int(cur.rowcount or 0), "hits_removed": int(hits.rowcount or 0)}
+
+    async def jargon_existing_terms(self) -> set[str]:
+        """所有已登记词条（任何状态，含 denied —— 否定 = 不再推断）。返回小写集合。"""
+        rows = await (await self.db.execute("SELECT DISTINCT term FROM hf_jargon")).fetchall()
+        return {str(r["term"]).strip().lower() for r in rows if str(r["term"]).strip()}
+
+    async def person_names_all(self) -> list[str]:
+        """已知人名/昵称/群名（h 洞② 人名过滤的接线数据源；表不存在就空列表，不放大错误）。"""
+        out: list[str] = []
+        try:
+            await self._ensure_person_tables()
+            rows = await (
+                await self.db.execute("SELECT DISTINCT name FROM hf_person_names WHERE name != ''")
+            ).fetchall()
+            out = [str(r["name"]).strip() for r in rows if str(r["name"]).strip()]
+        except Exception as exc:                            # noqa: BLE001 读不到名单不挡候选挖掘
+            logger.debug(f"[StarHeart] 人名表读取跳过：{exc}")
+        return out
+
+    # ---------------- 备份（拍-14：落 backups/，保留最近 5 份） ----------------
+    async def backup_tables(self, tables: tuple[str, ...], *, tag: str = "backup", keep: int = BACKUP_KEEP) -> str:
+        """整表导出成 JSON 落到 <数据目录>/backups/。返回文件名；失败返回 ""（调用方必须如实回报）。
+
+        表名来自本文件的常量元组（白名单），无外部输入面。危险操作**先备份再动**：
+        返回空串 = 没备份成功 —— 调用方要把这句话原样告诉用户（不假装有备份）。
+        """
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+        name = f"hf_{tag}-{stamp}.json"
+        out_dir = Path(self.db_path).parent / "backups"
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            payload: dict[str, Any] = {"ts": now(), "tag": tag, "db": Path(self.db_path).name, "tables": {}}
+            for table in tables:
+                rows = await (await self.db.execute(f"SELECT * FROM {table}")).fetchall()
+                payload["tables"][table] = [dict(r) for r in rows]
+            (out_dir / name).write_text(json.dumps(payload, ensure_ascii=False, default=_json_default), encoding="utf-8")
+        except Exception as exc:                            # noqa: BLE001
+            logger.warning(f"[StarHeart] 备份失败（{tag}）：{exc}")
+            return ""
+        try:
+            olds = sorted(out_dir.glob(f"hf_{tag}-*.json"))
+            for old in olds[: -max(1, int(keep))]:
+                old.unlink(missing_ok=True)
+        except Exception as exc:                            # noqa: BLE001
+            logger.warning(f"[StarHeart] 备份清理跳过（{tag}）：{exc}")
+        return name
+
+    async def purge_expressions(self, actor: str = "panel") -> dict[str, Any]:
+        """「只清表达」（S4-5 E2 动作一 / 拍-14）：先备份 → 软删 + 全部进「不再学」名单。
+
+        记忆 / 关系 / 好感一律不动。软删 = status='archived'（行还在，可恢复）。
+        """
+        backup = await self.backup_tables(EXPR_BACKUP_TABLES, tag="expressions")
+        if not backup:
+            logger.error("[StarHeart] 清空表达中止：备份失败，未改动任何数据")
+            return {"soft_deleted": 0, "banned": 0, "backup": "", "error": "backup_failed"}
+        stamp = now()
+        rows = await (
+            await self.db.execute("SELECT id, scene, way, norm_key FROM hf_expr WHERE status!='archived'")
+        ).fetchall()
+        banned = 0
+        for r in rows:
+            banned += await self.add_ban(
+                key=f"{r['scene'] or ''}|{r['way'] or ''}",
+                norm_key=str(r["norm_key"] or ""),
+                reason="清空表达",
+                actor=actor,
+                note="purge:expressions",
+            )
+        cur = await self.db.execute(
+            "UPDATE hf_expr SET status='archived', enabled=0, updated_at=? WHERE status!='archived'", (stamp,)
+        )
+        await self.db.commit()
+        return {"soft_deleted": int(cur.rowcount or 0), "banned": banned, "backup": backup}
+
+    async def backfill_expr_from_habits(self) -> int:
+        """旧表 hf_habits → hf_expr 一次性回填（幂等：同 (scope, norm_key) 已存在就跳过）。
+
+        拍-2 / 存量口径：真机存量 = 0 → 天然 no-op；旧表**只读保留、不删**（回退零损失）。
+        weight 是死字段（拍-11），不迁入。跑两遍行数不变（S4-1 验收 2）。
+        """
+        try:
+            src = await (await self.db.execute("SELECT * FROM hf_habits")).fetchall()
+        except Exception as exc:                            # noqa: BLE001
+            logger.warning(f"[StarHeart] 表达回填读取旧表跳过：{exc}")
+            return 0
+        n = 0
+        for r in src:
+            d = dict(r)
+            scene, way = str(d.get("scene") or ""), str(d.get("way") or "")
+            if not scene or not way:
+                continue
+            scope = str(d.get("scope") or "全局")
+            norm_key = expr_norm_key(scene, way)
+            hit = await (
+                await self.db.execute(
+                    "SELECT id FROM hf_expr WHERE scope=? AND norm_key=? LIMIT 1", (scope, norm_key)
+                )
+            ).fetchone()
+            if hit:
+                continue
+            stamp = float(d.get("updated_at") or now())
+            await self.db.execute(
+                "INSERT INTO hf_expr(scene,way,cues,scope,enabled,status,norm_key,checked_state,"
+                " source_ids,evidence_snap,cooldown_until,outcome_score,gate_override,created_at,updated_at)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    scene[:40], way[:120],
+                    json.dumps(_jlist(d.get("cues")), ensure_ascii=False),
+                    scope,
+                    1 if d.get("enabled", 1) else 0,
+                    "active", norm_key, "user_ok", "[]", "[]", None, None, "", stamp, stamp,
+                ),
+            )
+            n += 1
+        if n:
+            await self.db.commit()
+            logger.info(f"[StarHeart] 表达回填：hf_habits → hf_expr 迁入 {n} 条（旧表保留、不写不动）")
+        return n
+
 
     # ---------------- 门控流水 ----------------
     async def log_gate(self, rec: dict[str, Any]) -> None:
@@ -1815,6 +2998,173 @@ class Store:
     async def count_gate(self) -> int:
         row = await (await self.db.execute("SELECT COUNT(*) AS n FROM hf_gate_log")).fetchone()
         return int(row["n"] if row else 0)
+
+    # ---------------- 流水记账（只记不拦；写失败由调用方兜底，不允许影响主流程） ----------------
+    async def log_sent(self, rec: dict[str, Any]) -> str:
+        """出站流水：自赋 msg_id（对账锚点），只存长度与哈希、不存原文。
+
+        emit_ok 三态：1=确认发出 / 0=确认失败 / None=未确认（无发送回执）。返回本次 msg_id。
+        """
+        text = str(rec.get("text") or "")
+        msg_id = str(rec.get("msg_id") or uuid.uuid4().hex[:16])
+        emit_raw = rec.get("emit_ok", 0)
+        await self.db.execute(
+            "INSERT INTO hf_sent_log(ts,msg_id,session_id,kind,seg_index,seg_total,length_chars,"
+            "content_hash,delay_ms,emit_ok,plan_id,local_id,trigger,seed,exempt,confidence,platform_id) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                rec.get("ts") or now(),
+                msg_id,
+                rec.get("session_id", ""),
+                rec.get("kind", "reply"),
+                int(rec.get("seg_index", 0) or 0),
+                max(1, int(rec.get("seg_total", 1) or 1)),
+                int(rec.get("length_chars") if rec.get("length_chars") is not None else _len_nows(text)),
+                rec.get("content_hash") or _hash16(text),
+                int(rec.get("delay_ms", 0) or 0),
+                None if emit_raw is None else int(emit_raw or 0),
+                rec.get("plan_id", ""),
+                rec.get("local_id") or msg_id,
+                rec.get("trigger", ""),
+                rec.get("seed", ""),
+                int(rec.get("exempt", 0) or 0),
+                rec.get("confidence") or "low",
+                rec.get("platform_id", ""),
+            ),
+        )
+        await self.db.commit()
+        return msg_id
+
+    async def log_decision(self, rec: dict[str, Any]) -> None:
+        """门控决策流水（只记不拦）：因子快照 + reason + 消息文本（截断 ≤500 字 + hash）。"""
+        text = str(rec.get("text") or "")
+        await self.db.execute(
+            "INSERT INTO hf_decision_log(ts,event_id,session_id,user_id,eligible,decision,score,"
+            "factors_json,reason,config_ver,gate_shadow,msg_text,text_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                rec.get("ts") or now(),
+                rec.get("event_id", ""),
+                rec.get("session_id", ""),
+                rec.get("user_id", ""),
+                int(rec.get("eligible", 1) or 0),
+                rec.get("decision", ""),
+                float(rec.get("score", 0) or 0),
+                json.dumps(rec.get("factors") or {}, ensure_ascii=False),
+                rec.get("reason", ""),
+                rec.get("config_ver", ""),
+                int(rec.get("gate_shadow", 0) or 0),
+                _clip(text, 500),
+                _hash16(text),
+            ),
+        )
+        await self.db.commit()
+
+    async def set_decision_verdict(self, did: int, verdict: str, actor: str = "panel") -> bool:
+        """门控行内改判：人工判定写回决策流水（verdict 取值由 service 层白名单校验）。
+
+        幂等：同一行重复写同一个判定只更新时间戳；verdict 为空串 = 撤销改判。
+        """
+        stamp = now() if str(verdict or "") else 0.0
+        cur = await self.db.execute(
+            "UPDATE hf_decision_log SET user_verdict=?, verdict_at=?, verdict_actor=? WHERE id=?",
+            (str(verdict or ""), stamp, str(actor or "panel"), int(did)),
+        )
+        await self.db.commit()
+        return bool(cur.rowcount)
+
+    async def list_decisions(self, limit: int = 30, offset: int = 0) -> list[dict[str, Any]]:
+        """决策流水（门控页「逐条改判」数据源）：含消息文本（截断列）与人工改判状态。"""
+        rows = await (
+            await self.db.execute(
+                "SELECT id,ts,event_id,session_id,user_id,eligible,decision,score,factors_json,reason,"
+                "config_ver,gate_shadow,msg_text,text_hash,user_verdict,verdict_at,verdict_actor"
+                " FROM hf_decision_log ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?",
+                (max(1, int(limit or 30)), max(0, int(offset or 0))),
+            )
+        ).fetchall()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            d = dict(r)
+            raw = d.pop("factors_json", "{}")
+            try:
+                d["factors"] = json.loads(raw or "{}")
+            except (TypeError, ValueError):
+                d["factors"] = {}
+            d["gate_shadow"] = int(d.get("gate_shadow") or 0)
+            d["user_verdict"] = str(d.get("user_verdict") or "")
+            out.append(d)
+        return out
+
+    async def get_decision(self, did: int) -> dict[str, Any] | None:
+        """单条决策记录（改判后回读状态用）。"""
+        row = await (
+            await self.db.execute(
+                "SELECT id,decision,score,user_verdict,verdict_at,verdict_actor FROM hf_decision_log WHERE id=?",
+                (int(did),),
+            )
+        ).fetchone()
+        return dict(row) if row else None
+
+    async def count_decisions(self) -> int:
+        row = await (await self.db.execute("SELECT COUNT(*) AS n FROM hf_decision_log")).fetchone()
+        return int((row["n"] if row else 0) or 0)
+
+    async def log_expr_use(self, rec: dict[str, Any]) -> None:
+        """表达使用流水：注入即记一笔（emit_ok=NULL 待出站对账，NULL ≠ 没发出）。
+
+        同时盖冷却戳（拍-10：冷却按时间）—— use_count 不回写（拍-5：只做查询聚合）。
+        """
+        used_at = float(rec.get("used_at") or now())
+        eid = int(rec.get("expr_id") or 0)
+        await self.db.execute(
+            "INSERT INTO hf_expr_use_log(expr_id,used_at,emit_ok,outcome_score,seed,session_id) VALUES(?,?,?,?,?,?)",
+            (
+                eid,
+                used_at,
+                rec.get("emit_ok"),
+                rec.get("outcome_score"),
+                rec.get("seed", ""),
+                rec.get("session_id", ""),
+            ),
+        )
+        await self.db.commit()
+        try:
+            await self.db.execute(
+                "UPDATE hf_expr SET cooldown_until=? WHERE id=?", (used_at + EXPR_COOLDOWN_SECONDS, eid)
+            )
+            await self.db.commit()
+        except Exception as exc:                            # noqa: BLE001 冷却戳写失败不该挡记账
+            logger.warning(f"[StarHeart] 表达冷却戳写入跳过：{exc}")
+
+    async def purge_flow_logs(self) -> dict[str, int]:
+        """按 FLOW_RETENTION_DAYS 清理四张流水表；发送计划只清终态行（未完成行留给恢复扫描）。
+
+        逐表独立 try/except + 提交：单表缺/坏只记 WARNING，不挡其他表当日清理。
+        表名/列名来自本函数的常量元组（白名单），无外部输入面。
+        """
+        cut_now = now()
+        out: dict[str, int] = {}
+        for table, col in (("hf_sent_log", "ts"), ("hf_decision_log", "ts"), ("hf_expr_use_log", "used_at")):
+            try:
+                days = int(FLOW_RETENTION_DAYS.get(table) or 30)
+                cur = await self.db.execute(f"DELETE FROM {table} WHERE {col} < ?", (cut_now - days * 86400,))
+                n = int(cur.rowcount or 0)
+                await self.db.commit()
+                out[table] = n
+            except Exception as exc:                        # noqa: BLE001 单表失败不挡其他表
+                logger.warning(f"[StarHeart] 流水保留期清理跳过 {table}：{exc}")
+        try:
+            days = int(FLOW_RETENTION_DAYS.get("hf_send_plan") or 30)
+            cur = await self.db.execute(
+                "DELETE FROM hf_send_plan WHERE updated_at < ? AND state IN ('sent','failed','expired')",
+                (cut_now - days * 86400,),
+            )
+            n = int(cur.rowcount or 0)
+            await self.db.commit()
+            out["hf_send_plan"] = n
+        except Exception as exc:                            # noqa: BLE001
+            logger.warning(f"[StarHeart] 流水保留期清理跳过 hf_send_plan：{exc}")
+        return out
 
     # ---------------- token ----------------
     async def log_tokens(self, rec: dict[str, Any]) -> None:
@@ -1882,6 +3232,66 @@ class Store:
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
             (key, json.dumps(value, ensure_ascii=False), now()),
         )
+        await self.db.commit()
+
+    # ---------------- 配置快照（参数护栏：保存前自动存 / 手动命名存 / 一键回滚） ----------------
+    async def save_config_snapshot(self, name: str, config: dict[str, Any], *, auto: bool = False,
+                                   actor: str = "panel", note: str = "") -> dict[str, Any]:
+        """存一份配置快照：内容是 hf_config 里真正存着的键值（回滚即原样写回）。"""
+        payload = json.dumps(config or {}, ensure_ascii=False)
+        stamp = now()
+        cur = await self.db.execute(
+            "INSERT INTO hf_config_snapshot(name,ts,n_keys,auto,actor,note,config_json) VALUES(?,?,?,?,?,?,?)",
+            (str(name or "")[:60], stamp, len(config or {}), 1 if auto else 0,
+             str(actor or "panel")[:32], str(note or "")[:200], payload),
+        )
+        await self.db.commit()
+        return {"id": int(cur.lastrowid or 0), "name": str(name or "")[:60], "ts": stamp,
+                "n_keys": len(config or {}), "auto": bool(auto)}
+
+    async def list_config_snapshots(self, limit: int = 25) -> list[dict[str, Any]]:
+        rows = await (
+            await self.db.execute(
+                "SELECT id,name,ts,n_keys,auto,actor,note FROM hf_config_snapshot ORDER BY ts DESC, id DESC LIMIT ?",
+                (max(1, int(limit or 25)),),
+            )
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    async def count_config_snapshots(self) -> int:
+        row = await (await self.db.execute("SELECT COUNT(*) AS n FROM hf_config_snapshot")).fetchone()
+        return int((row["n"] if row else 0) or 0)
+
+    async def get_config_snapshot(self, sid: int) -> dict[str, Any] | None:
+        row = await (
+            await self.db.execute("SELECT * FROM hf_config_snapshot WHERE id=?", (int(sid),))
+        ).fetchone()
+        return dict(row) if row else None
+
+    async def prune_config_snapshots(self, keep: int = CONFIG_SNAPSHOT_KEEP) -> int:
+        """超出保留份数就从最老的开始删，自动快照先删（手动命名的尽量留到最后）。"""
+        # 超出保留份数时先删**自动快照**（从最老的开始），自动快照全删光了才动手动命名的 ——
+        # 手动命名的那几份是人特意留的存档点，不能被之后随手保存刷出来的自动快照挤掉。
+        keep = max(1, int(keep or CONFIG_SNAPSHOT_KEEP))
+        rows = await (
+            await self.db.execute("SELECT id,auto FROM hf_config_snapshot ORDER BY ts DESC, id DESC")
+        ).fetchall()
+        over = len(rows) - keep
+        if over <= 0:
+            return 0
+        autos_old_first = [r for r in reversed(rows) if int(r["auto"] or 0)]
+        victims = autos_old_first[:over]
+        if len(victims) < over:                                   # 自动快照不够删，才从最老的手动快照补
+            manuals_old_first = [r for r in reversed(rows) if not int(r["auto"] or 0)]
+            victims += manuals_old_first[: over - len(victims)]
+        for r in victims:
+            await self.db.execute("DELETE FROM hf_config_snapshot WHERE id=?", (int(r["id"]),))
+        await self.db.commit()
+        return len(victims)
+
+    async def delete_config_key(self, key: str) -> None:
+        """删掉一个配置键（回滚用：快照里没有、现在却存在的键 = 快照之后新加的）。"""
+        await self.db.execute("DELETE FROM hf_config WHERE key=?", (str(key),))
         await self.db.commit()
 
     # ---------------- 审计 ----------------
@@ -1982,7 +3392,9 @@ class Store:
         await self.db.commit()
 
     async def memories_without_embedding(self, limit: int = 200, persona_id: str = "") -> list[dict[str, Any]]:
-        sql = "SELECT id, summary, content FROM hf_memories WHERE status='active' AND embedding IS NULL"
+        """还没建向量的可召回记忆（含 archived —— 归档记忆不进向量库就永远不可能被提起）。"""
+        sql = ("SELECT id, summary, content FROM hf_memories "
+               "WHERE status NOT IN ('deleted','forgotten') AND embedding IS NULL")
         args: list[Any] = []
         if persona_id == "__none__":
             sql += " AND (persona_id IS NULL OR persona_id = '')"
@@ -1994,8 +3406,15 @@ class Store:
         rows = await (await self.db.execute(sql, args)).fetchall()
         return [dict(r) for r in rows]
 
-    async def all_active_embeddings(self, persona_id: str = "") -> list[tuple[str, bytes]]:
-        sql = "SELECT id, embedding FROM hf_memories WHERE status='active' AND embedding IS NOT NULL"
+    async def all_active_embeddings(self, persona_id: str = "", include_archived: bool = True) -> list[tuple[str, bytes]]:
+        """可召回记忆的向量（deleted / forgotten 才是终点，archived 也在内）。
+
+        名字沿用旧的，避免改散调用点；语义已改：存档记忆必须能参与召回，否则
+        「归档被提及自动拉回」永远走不到 —— 先有召回才可能复活，而复活又是召回的前提。
+        """
+        sql = "SELECT id, embedding FROM hf_memories WHERE status NOT IN ('deleted','forgotten') AND embedding IS NOT NULL"
+        if not include_archived:
+            sql += " AND status!='archived'"
         args: list[Any] = []
         if persona_id == "__none__":
             sql += " AND (persona_id IS NULL OR persona_id = '')"
@@ -2026,8 +3445,23 @@ class Store:
                 int(rec.get("used") or 0),
             ),
         )
+        cid = int(cur.lastrowid or 0)
         await self.db.commit()
-        return int(cur.lastrowid or 0)
+        # 语料出处侧车（E3）：把这条消息的原生 message_id / ext_id 记下来 ——
+        # 表达学到这条原话时，出处就能对回「哪条消息」，而不是只剩 60 字快照。
+        mid = str(rec.get("message_id") or "")
+        ext = str(rec.get("ext_id") or "")
+        if cid and (mid or ext):
+            try:
+                await self.db.execute(
+                    "INSERT OR REPLACE INTO hf_corpus_ref(corpus_id,message_id,ext_id,session_id,ts)"
+                    " VALUES(?,?,?,?,?)",
+                    (cid, mid or ext, ext or mid, str(rec.get("session_id") or ""), float(rec.get("ts") or now())),
+                )
+                await self.db.commit()
+            except Exception as exc:                        # noqa: BLE001 侧车失败不该挡语料落库
+                logger.warning(f"[StarHeart] 语料出处侧车写入跳过：{exc}")
+        return cid
 
     async def corpus_stats(self) -> dict[str, Any]:
         row = await (
@@ -2090,16 +3524,28 @@ class Store:
         return int(cur.rowcount or 0)
 
     async def prune_corpus(self, keep: int = 5000) -> int:
-        row = await (
-            await self.db.execute("SELECT COUNT(*) AS n FROM hf_corpus")
-        ).fetchone()
-        total = int(row["n"] or 0)
-        if total <= keep:
+        """超出 keep 时删最旧；**被有效表达引用的行免删**（E3 + 拍-15：查询排除，不加列）。
+
+        不这么写就会出现：刚学到的表达，出处原话在下一轮提取后被 prune 物理删掉 →
+        「出处可回查 ≥95%」永远做不到。
+        """
+        row = await (await self.db.execute("SELECT COUNT(*) AS n FROM hf_corpus")).fetchone()
+        if int(row["n"] or 0) <= keep:
             return 0
-        cur = await self.db.execute(
-            "DELETE FROM hf_corpus WHERE id IN (SELECT id FROM hf_corpus ORDER BY ts DESC LIMIT -1 OFFSET ?)",
-            (max(0, keep),),
-        )
+        refs = await self.referenced_corpus_ids()
+        if refs:
+            ids = sorted(refs)
+            marks = ",".join("?" for _ in ids)
+            cur = await self.db.execute(
+                "DELETE FROM hf_corpus WHERE id IN ("
+                f" SELECT id FROM hf_corpus WHERE id NOT IN ({marks}) ORDER BY ts DESC LIMIT -1 OFFSET ?)",
+                ids + [max(0, keep)],
+            )
+        else:
+            cur = await self.db.execute(
+                "DELETE FROM hf_corpus WHERE id IN (SELECT id FROM hf_corpus ORDER BY ts DESC LIMIT -1 OFFSET ?)",
+                (max(0, keep),),
+            )
         await self.db.commit()
         return int(cur.rowcount or 0)
 
@@ -2129,12 +3575,17 @@ class Store:
             out.append(item)
         return out
 
-    async def memories_by_source_ref(self, ref: str) -> list[dict[str, Any]]:
+    async def memories_by_source_ref(self, ref: str, session_id: str = "") -> list[dict[str, Any]]:
+        """按 source_ref 精确匹配（不再 LIKE '%mid%'：message_id 是短数字，会命中无关会话）。"""
+        ref = str(ref or "").strip()
         if not ref:
             return []
-        rows = await (await self.db.execute(
-            "SELECT * FROM hf_memories WHERE source_ref LIKE ? AND status='active'", (f"%{ref}%",)
-        )).fetchall()
+        sql = "SELECT * FROM hf_memories WHERE source_ref = ? AND status='active'"
+        args: list[Any] = [ref]
+        if session_id:
+            sql += " AND session_id = ?"
+            args.append(str(session_id))
+        rows = await (await self.db.execute(sql, args)).fetchall()
         return [self._mem_row(r) for r in rows]
 
     async def attach_recall_react(self, message_id: str, react: dict[str, Any]) -> bool:
@@ -2163,11 +3614,19 @@ class Store:
             return False
 
     async def mark_memories_stale(self, ids: list[Any], factor: float = 0.3) -> int:
+        """撤回降权：只改强度 + 留痕，**不动 status**（P1-6）。
+
+        旧实现直接写 status='stale' —— 一次撤回 = 永久离开 active，
+        而召回当时只查 active，等于「撤回一次就再也想不起来」。
+        现在只降权；状态由生命周期统一裁决，命中还能被 touch_memory 拉回。
+        """
         n = 0
         for mid in ids:
             raw = str(mid).lstrip("m")
             cur = await self.db.execute(
-                "UPDATE hf_memories SET status='stale', strength=MAX(0.0, strength*?), updated_at=? WHERE id=?",
+                "UPDATE hf_memories SET strength=MAX(0.0, strength*?), "
+                "forget_stage=CASE WHEN forget_stage='' THEN 'recall' ELSE forget_stage END, "
+                "updated_at=? WHERE id=?",
                 (float(factor), now(), raw),
             )
             n += int(cur.rowcount or 0)
@@ -2177,13 +3636,17 @@ class Store:
     # ---------------- 主动消息 ----------------
     async def log_proactive(self, entry: dict[str, Any]) -> int:
         cur = await self.db.execute(
-            "INSERT INTO hf_proactive_log (ts, session_id, user_id, zone, idle_min, score, status, reason, guard, text) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO hf_proactive_log (ts, session_id, user_id, zone, idle_min, score, status, reason, guard, text,"
+            " prompt_source, memory_ids) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 float(entry.get("ts") or now()), str(entry.get("session_id") or ""), str(entry.get("user_id") or ""),
                 str(entry.get("zone") or ""), float(entry.get("idle_min") or 0), float(entry.get("score") or 0),
                 str(entry.get("status") or "candidate"), str(entry.get("reason") or ""),
                 json.dumps(entry.get("guard") or {}, ensure_ascii=False), str(entry.get("text") or ""),
+                str(entry.get("prompt_source") or ""),
+                entry.get("memory_ids") if isinstance(entry.get("memory_ids"), str)
+                else ",".join(str(x) for x in (entry.get("memory_ids") or [])),
             ),
         )
         await self.db.commit()
@@ -2208,6 +3671,26 @@ class Store:
             out.append(item)
         return out
 
+    async def recent_sent_proactive(
+        self, session_id: str, since: float, limit: int = 3
+    ) -> list[dict[str, Any]]:
+        """最近真发出去的主动消息（给 inject_context 的「你最近主动发过」知会块用）。
+
+        主动消息不再写回 AstrBot 历史后，主模型要靠这个块知道自己说过什么；
+        只取 status='sent' 的真发送，跳过/候选/失败都不算。
+        """
+        try:
+            lim = max(1, min(20, int(limit or 3)))
+        except (TypeError, ValueError):
+            lim = 3
+        rows = await (await self.db.execute(
+            "SELECT ts, text, memory_ids FROM hf_proactive_log "
+            "WHERE session_id=? AND status='sent' AND ts>=? AND text!='' "
+            "ORDER BY ts DESC LIMIT ?",
+            (str(session_id or ""), float(since or 0), lim),
+        )).fetchall()
+        return [dict(r) for r in rows]
+
     async def proactive_baseline(self, day_start: float | None = None) -> dict[str, Any]:
         """每个会话的最后活动时间、今日已发主动条数、上次主动时间——护栏判据的真源。
 
@@ -2227,10 +3710,51 @@ class Store:
                 "last_user_ts": float(row["last_ts"] or 0), "msgs": int(row["msgs"] or 0),
                 "sent_today": 0, "last_proactive_ts": 0.0,
             }
+
+        def _merge(sid: str, uid: str, ts: float, msgs: int = 0) -> None:
+            sid = str(sid or "")
+            if not sid:
+                return
+            item = sessions.get(sid)
+            if item is None:
+                item = {"session_id": sid, "user_id": str(uid or ""), "last_user_ts": 0.0,
+                        "msgs": 0, "sent_today": 0, "last_proactive_ts": 0.0}
+                sessions[sid] = item
+            if ts > float(item.get("last_user_ts") or 0):
+                item["last_user_ts"] = float(ts or 0)
+            if msgs > int(item.get("msgs") or 0):
+                item["msgs"] = int(msgs)
+            if uid and not item.get("user_id"):
+                item["user_id"] = str(uid)
+
+        # 候选集不能只依赖门控流水：关掉门控 / 只发图片的会话也必须能进主动候选。
+        # hf_messages 是每个可见会话都留档的真源；hf_corpus 补早期/导入会话。
+        try:
+            mrows = await (await self.db.execute(
+                "SELECT session_id, sender_id, MAX(ts) AS last_ts, COUNT(*) AS msgs "
+                "FROM hf_messages WHERE session_id != '' AND is_bot=0 GROUP BY session_id"
+            )).fetchall()
+            for row in mrows:
+                _merge(str(row["session_id"]), str(row["sender_id"] or ""),
+                       float(row["last_ts"] or 0), int(row["msgs"] or 0))
+        except Exception as exc:                            # noqa: BLE001 旧库缺表不影响
+            logger.debug(f"[StarHeart] proactive_baseline 读 hf_messages 跳过：{exc}")
+        try:
+            crows = await (await self.db.execute(
+                "SELECT session_id, user_id, MAX(ts) AS last_ts, COUNT(*) AS msgs "
+                "FROM hf_corpus WHERE session_id != '' AND is_bot=0 GROUP BY session_id"
+            )).fetchall()
+            for row in crows:
+                _merge(str(row["session_id"]), str(row["user_id"] or ""),
+                       float(row["last_ts"] or 0), int(row["msgs"] or 0))
+        except Exception as exc:                            # noqa: BLE001
+            logger.debug(f"[StarHeart] proactive_baseline 读 hf_corpus 跳过：{exc}")
         if day_start is None:
             day_start = now() - 86400.0
         prows = await (await self.db.execute(
-            "SELECT session_id, ts, status, guard FROM hf_proactive_log ORDER BY ts DESC"
+            "SELECT session_id, ts, status, guard FROM hf_proactive_log "
+            "WHERE ts >= ? ORDER BY ts DESC",
+            (day_start - 7 * 86400,),
         )).fetchall()
         for row in prows:
             sid = str(row["session_id"])
@@ -2252,7 +3776,8 @@ class Store:
             if ts >= day_start:
                 item["sent_today"] += 1
         row = await (await self.db.execute(
-            "SELECT COUNT(*) FROM hf_proactive_log WHERE status='candidate'"
+            "SELECT COUNT(*) FROM hf_proactive_log WHERE status='candidate' AND ts >= ?",
+            (day_start - 7 * 86400,),
         )).fetchone()
         return {"sessions": list(sessions.values()), "candidates": int(row[0] or 0) if row else 0}
 
@@ -2363,7 +3888,11 @@ class Store:
         await self.db.commit()
 
     async def upsert_person_names_bulk(self, rows: list[dict[str, Any]]) -> int:
-        """批量落昵称（一次 commit）：群成员一次能拿上千条，逐条写会把 SQLite 写锁占死。"""
+        """批量落昵称（一次 commit）：群成员一次能拿上千条，逐条写会把 SQLite 写锁占死。
+
+        返回「真正发生变更的行数」——姓名没变的行直接跳过（不动 seen_count、不刷 updated_at），
+        调用方据此决定要不要记日志：联系人刷新是周期性动作，没变化时不该每 2 分钟刷一条日志。
+        """
         if not rows:
             return 0
         await self._ensure_person_tables()
@@ -2377,12 +3906,17 @@ class Store:
                          str(r.get("platform") or ""), str(r.get("group_id") or ""), t))
         if not data:
             return 0
-        await self.db.executemany(
+        cur = await self.db.executemany(
             "INSERT INTO hf_person_names (kind, ident, name, source, platform, group_id, seen_count, updated_at) "
             "VALUES (?,?,?,?,?,?,1,?) ON CONFLICT(kind, ident, source, platform, group_id) DO UPDATE SET "
-            "name=excluded.name, seen_count=hf_person_names.seen_count+1, updated_at=excluded.updated_at", data)
+            "name=excluded.name, seen_count=hf_person_names.seen_count+1, updated_at=excluded.updated_at "
+            "WHERE hf_person_names.name IS NOT excluded.name",
+            data)
         await self.db.commit()
-        return len(data)
+        try:
+            return int(cur.rowcount or 0)
+        except Exception:                                   # noqa: BLE001 拿不到行数不算错
+            return len(data)
 
     async def remember_platform(self, pid: str, kind: str = "onebot") -> None:
         """记住「见过的 OneBot 平台实例 id」：实例短暂掉线时不该把它的会话判成别的平台。"""
@@ -2864,12 +4398,19 @@ class Store:
         """删掉一份画像（垃圾画像清理 / 用户要求重来）。默认只删人物画像。"""
         return await self.profile_delete(pid, subject_kind, persona_id)
 
-    async def archive_memories(self, ids: list[Any], factor: float = 0.3, why: str = "") -> int:
+    async def archive_memories(self, ids: list[Any], factor: float | None = None, why: str = "") -> int:
         """把记忆归档（可被「复活历史记忆」找回、被提及也会自动拉回）—— 比物理删除稳。
 
-        签名兼容两类调用方：撤回路径传 factor（归档即降权），生命周期路径传 why="idle"。
+        factor=None 时按 why 决定：生命周期归档（why="idle"）**不降权**，只翻状态；
+        撤回路径（why 为空/其它）仍按 0.3 降权。
+
+        为什么 idle 不再降权：旧默认 0.3 是「自动失忆链」的第一环 ——
+        0.5 × 0.3 = 0.15 < forget_min_strength(0.35)，归档即等于判死，30 天后必然被遗忘。
+        归档应当是「降低排序权重」，不是「加速死亡」。
         （历史教训：这里曾有两份同名定义互相覆盖，factor 版被 why 版盖掉 → 降权静默失效。）
         """
+        if factor is None:
+            factor = 1.0 if why == "idle" else 0.3
         n = 0
         for mid in ids or []:
             raw = str(mid).lstrip("m")
@@ -3365,18 +4906,27 @@ class Store:
         }
 
     async def habit_log(self, limit: int = 100) -> dict[str, Any]:
-        rows = await (await self.db.execute(
-            "SELECT * FROM hf_habits ORDER BY uses DESC, updated_at DESC LIMIT ?", (limit,)
-        )).fetchall()
-        events = await (await self.db.execute(
-            "SELECT * FROM hf_audit WHERE action LIKE 'habit%' ORDER BY ts DESC LIMIT 40"
-        )).fetchall()
-        return {"items": [dict(r) for r in rows], "events": [dict(e) for e in events]}
+        """学习轨迹（面板）：表达条目 + 学习/审核事件 + 最近的运行诊断。"""
+        rows = await (
+            await self.db.execute(
+                "SELECT * FROM hf_expr WHERE status!='archived' ORDER BY updated_at DESC LIMIT ?", (limit,)
+            )
+        ).fetchall()
+        events = await (
+            await self.db.execute(
+                "SELECT * FROM hf_audit WHERE action LIKE 'habit%' OR action LIKE 'expr%' ORDER BY ts DESC LIMIT 40"
+            )
+        ).fetchall()
+        return {
+            "items": [dict(r) for r in rows],
+            "events": [dict(e) for e in events],
+            "runs": await self.expr_runs(20),
+        }
 
     async def stats(self, persona_id: str = "") -> dict[str, Any]:
         counts = await self.memory_counts(persona_id=persona_id)
         fav = await (await self.db.execute("SELECT COUNT(*) FROM hf_favours")).fetchone()
-        habit = await (await self.db.execute("SELECT COUNT(*) FROM hf_habits")).fetchone()
+        habit = await (await self.db.execute("SELECT COUNT(*) FROM hf_expr WHERE status!='archived'")).fetchone()
         gate = await (await self.db.execute("SELECT COUNT(*) FROM hf_gate_log")).fetchone()
         edges = await (await self.db.execute("SELECT COUNT(*) FROM hf_edges WHERE status='active'")).fetchone()
         ents = await (await self.db.execute("SELECT COUNT(*) FROM hf_entities")).fetchone()
@@ -3765,9 +5315,9 @@ class Store:
         stale = await (
             await self._db.execute(
                 """SELECT id, summary, strength, poignancy, recalls, status,
-                          COALESCE(NULLIF(last_used_at,0), occurred_at, created_at) AS last_touch
+                          MAX(COALESCE(last_used_at,0), COALESCE(occurred_at,0), created_at) AS last_touch
                    FROM hf_memories
-                   WHERE status='active' AND COALESCE(NULLIF(last_used_at,0), occurred_at, created_at) < ?
+                   WHERE status='active' AND MAX(COALESCE(last_used_at,0), COALESCE(occurred_at,0), created_at) < ?
                    ORDER BY last_touch ASC LIMIT 400""",
                 (arch_cut,),
             )
@@ -3775,9 +5325,9 @@ class Store:
         old = await (
             await self._db.execute(
                 """SELECT id, summary, strength, poignancy, recalls, status,
-                          COALESCE(NULLIF(last_used_at,0), occurred_at, created_at) AS last_touch
+                          MAX(COALESCE(last_used_at,0), COALESCE(occurred_at,0), created_at) AS last_touch
                    FROM hf_memories
-                   WHERE status='archived' AND COALESCE(NULLIF(last_used_at,0), occurred_at, created_at) < ?
+                   WHERE status='archived' AND MAX(COALESCE(last_used_at,0), COALESCE(occurred_at,0), created_at) < ?
                    ORDER BY last_touch ASC LIMIT 400""",
                 (forget_cut,),
             )
@@ -3827,7 +5377,7 @@ class Store:
         rows = await (
             await self._db.execute(
                 """SELECT status, COUNT(*) AS n,
-                          SUM(CASE WHEN COALESCE(NULLIF(last_used_at,0), occurred_at, created_at) < ? THEN 1 ELSE 0 END) AS idle_arch
+                          SUM(CASE WHEN MAX(COALESCE(last_used_at,0), COALESCE(occurred_at,0), created_at) < ? THEN 1 ELSE 0 END) AS idle_arch
                    FROM hf_memories GROUP BY status""",
                 (now() - 30 * 86400,),
             )

@@ -6,17 +6,17 @@
  * memory↔memory 的关系链（实体/时序/语义）。
  */
 
-import * as C from "./charts.js?v=1.0.1";
-import { GRAPH_PALETTE } from "./graph.js?v=1.0.1";
+import * as C from "./charts.js?v=1.0.2";
+import { GRAPH_PALETTE } from "./graph.js?v=1.0.2";
 import {
   createGraph3D, webglAvailable, LAYOUT_DEFS, LAYOUT_HOTKEYS, CAM_DEFS, PALETTE_DEFS, TIER_DEFS,
   PARA_DEFS, LEVEL_DEFS, ATOM_LABEL as ATOM_LABEL_3D,
-} from "./graph3d.js?v=1.0.1";
+} from "./graph3d.js?v=1.0.2";
 import {
   $, api, apiPost, apiPostSafe, apiSafe, esc, fmtNum, fmtPct, fmt1, fmtTime, timeAgo, toast, openDrawer, closeDrawer,
   confirmModal, formModal, pageHead, tabBar, card, kpiCard, kpis, secTitle, mount, emptyBlock, skelBlock, jsStr, STATE,
   segmentHtml, syncSeg, countUp, goPage, refreshCurrent,
-} from "./store.js?v=1.0.1";
+} from "./store.js?v=1.0.2";
 
 export const ATOM_LABEL = {
   factual: "事实", episodic: "经历", relational: "关系", preference: "偏好",
@@ -751,8 +751,11 @@ async function memDetailHtml(m, edges, sid) {
     <div class="row" style="gap:6px;margin-top:10px;flex-wrap:wrap">
       <button class="btn xs" onclick="hfMemEdit(${jsStr(rawId)})">改</button>
       <button class="btn xs" onclick="hfMemBoost(${jsStr(mid)})">↑ 加权</button>
+      <button class="btn xs" onclick="hfMemDemote(${jsStr(mid)})">↓ 降权</button>
       <button class="btn xs" onclick="hfGraphOpen(${jsStr(mid)})">在图谱里看</button>
-      <button class="btn xs dg" onclick="hfMemDelete(${jsStr(rawId)})">删除</button>
+      ${String(M.status || m.status || "") === "deleted" || String(M.status || m.status || "") === "forgotten"
+        ? `<button class="btn xs" onclick="hfMemRestore(${jsStr(rawId)})">从回收站恢复</button>`
+        : `<button class="btn xs dg" onclick="hfMemDelete(${jsStr(rawId)})">删除</button>`}
       <button class="btn xs" data-det-btn onclick="hfCardDet(${jsStr(sid || "g")}, ${jsStr(mid)})">收起详细</button>
     </div>`;
 }
@@ -775,13 +778,20 @@ export async function hfMemEdit(mid) {
   });
 }
 
-/** 删除记忆（带确认，说明后果） */
+/** 删除记忆（软删：进回收站，可恢复；关系链与原文都保留） */
 export function hfMemDelete(mid) {
-  confirmModal("删除这条记忆", "删掉后模型不会再参考它，关系链也会一起消失。", async () => {
+  confirmModal("移入回收站", "模型不会再参考它；原始内容与关系链会保留，可在这里恢复（不会再点一次就永久消失）。", async () => {
     const res = await apiPostSafe("memory/delete", { id: String(mid).replace(/^m/, "") });
-    toast(res.ok ? "已删除" : "删除失败：" + (res.error || ""), res.ok ? "ok" : "err");
+    toast(res.ok ? "已移入回收站（可恢复）" : "删除失败：" + (res.error || ""), res.ok ? "ok" : "err");
     if (res.ok) hfRerenderHook();
   });
+}
+
+/** 从回收站恢复一条记忆（对应后端 memory/restore） */
+export async function hfMemRestore(mid) {
+  const res = await apiPostSafe("memory/restore", { id: String(mid).replace(/^m/, "") });
+  toast(res.ok ? "已恢复" : "恢复失败：" + (res.error || ""), res.ok ? "ok" : "err");
+  if (res.ok) hfRerenderHook();
 }
 
 /** 实体/话题节点的详情 */
@@ -1464,6 +1474,20 @@ export async function hfMemBoost(id) {
   if (ok) hfRerenderHook();
 }
 
+/** ↓ 降权：把强度压到低位（「被制止的话术」「误记的内容」一键退场；救回用 ↑ 加权）
+ *  2026-10-15 加：记忆 #882 这类「别重复发」的旧话术被主动开口当指令演绎，需要个一键降权阀 */
+export async function hfMemDemote(id) {
+  const raw = String(id).replace(/^m/, "");
+  const full = await apiSafe("memory", { id: raw }, null);
+  const cur = (full && (full.memory || full)) || {};
+  const before = Number(cur.strength || 0.5);
+  const after = Math.max(0.03, Math.round(before * 0.15 * 100) / 100);
+  const res = await apiPostSafe("memory/update", { id: raw, fields: { strength: after } });
+  const ok = res && res.ok !== false;
+  toast(ok ? "已降权：" + fmt1(before) + " → " + fmt1(after) + "（救回用 ↑ 加权）" : "降权失败：" + ((res && res.error) || ""), ok ? "ok" : "err");
+  if (ok) hfRerenderHook();
+}
+
 /** 老入口：打开某条记忆的详细（等价 hfMemDetail，保留兼容） */
 export async function hfMemOpen(id, sid) {
   return hfCardDet(sid || (String(id).startsWith("m") ? "g" : "p"), String(id));
@@ -1572,19 +1596,6 @@ export function __personEngine3d() {
 }
 
 /** 配置域保存（views-system.js 旧入口仍在用） */
-export async function hfSaveDomain(root) {
-  const box = (root && root.closest) ? root.closest(".card") : null;
-  const patch = {};
-  (box || document).querySelectorAll("[data-conf]").forEach((el) => {
-    const k = el.getAttribute("data-conf");
-    if (!k) return;
-    patch[k] = el.type === "checkbox" ? !!el.checked : el.value;
-  });
-  const res = await apiPostSafe("config/save", { patch });
-  const ok = res && res.ok !== false;
-  toast(ok ? "已保存" : "保存失败：" + ((res && res.error) || ""), ok ? "ok" : "err");
-}
-
 export async function renderGraph() {
   const gp = { limit: 3200 };
   if (G_SCOPE === "all") gp.persona_id = "";
@@ -1856,7 +1867,7 @@ function renderGraphDetail(host, node) {
    ================================================================== */
 let memFilter = { src: "", q: "", sort: "strength" };
 
-const STATUS_LABEL = { active: "活跃", stale: "待复活", decayed: "已衰减", archived: "已归档" };
+const STATUS_LABEL = { active: "活跃", stale: "待复活", decayed: "已衰减", archived: "已归档", deleted: "已删除（回收站）", forgotten: "已遗忘" };
 
 /** 会话 id 的可读形式：testbot:FriendMessage:100000000 → 私聊 · 100000000（完整 id 放 title，不再被列宽裁掉） */
 function sessLabel(sid) {
@@ -1876,11 +1887,13 @@ let MB_GENS = [];
 
 /** 记忆库 = 记忆管理表（和「记忆图谱」是两张不同的东西：一个是管理，一个是关系网络）。 */
 export async function renderMemoryList() {
-  const [res, sess, cov, vg] = await Promise.all([
+  const [res, sess, cov, vg, lc] = await Promise.all([
     apiSafe("memory/search", { q: MB.q, session_id: MB.session_id, persona_id: MB.persona_id, status: MB.status, atom_type: MB.atom_type, source: MB.source, sort: MB.sort, limit: MB.limit, offset: MB.offset }, { items: [], total: 0 }),
     apiSafe("memory/sessions", {}, { items: [], msg: {} }),
     apiSafe("embed/coverage", {}, {}),
     apiSafe("vector/gens", {}, { items: [] }),
+    // 记忆生命周期（接口早就有，之前前端 0 调用）：活跃 / 已归档 / 已遗忘
+    apiSafe("memory/lifecycle", {}, {}),
   ]);
   MB_DATA = { items: res.items || [], total: res.total || 0 };
   MB_SESS = sess;
@@ -1896,6 +1909,46 @@ export async function renderMemoryList() {
   const opt = (v, label, cur) => `<option value="${esc(v)}"${cur === v ? " selected" : ""}>${esc(label)}</option>`;
   const pages = Math.max(1, Math.ceil(MB_DATA.total / MB.limit));
   const page = Math.floor(MB.offset / MB.limit) + 1;
+
+  // 记忆生命周期卡：三个数全部来自 /page/memory/lifecycle 的 counts（按 status 分组）。
+  // 分组里缺某个状态键 = 库里就是 0 条（GROUP BY 语义）—— 如实显示 0；
+  // 只有 counts 整块没返回、或接口报错，才显示「— / 暂不可用」，绝不拿 0 顶替未知。
+  const countsOk = !!(lc && !lc.__err && lc.counts && typeof lc.counts === "object");
+  const lifeNum = (k) => {
+    const c = countsOk ? lc.counts[k] : null;
+    if (c && c.total != null) return fmtNum(c.total);
+    if (c) return "—";                    // 有键却没给数：不猜
+    return countsOk ? "0" : "—";          // 缺键 = 该状态就是 0 条
+  };
+  const lifeNote = (() => {
+    if (!lc || lc.__err) return "";
+    const parts = [];
+    if (countsOk && !Object.keys(lc.counts).length) parts.push("当前库里还没有记忆 —— 三个状态都是 0 条");
+    if (lc.enabled === false) parts.push("自动遗忘当前<b>关闭</b>（不会自动归档 / 遗忘）");
+    else if (lc.enabled === true) parts.push("自动遗忘在跑");
+    const a = Number(lc.archive_after_days);
+    const f = Number(lc.forget_after_days);
+    if (Number.isFinite(a) && Number.isFinite(f)) {
+      parts.push(`超过 <b>${fmtNum(a)}</b> 天没被用到的记忆转「归档」，归档再闲置 <b>${fmtNum(f)}</b> 天且强度低的才会「遗忘」；两种状态被提及都会自动拉回`);
+    }
+    return parts.join(" · ");
+  })();
+  const lifeCard = lc && lc.__err
+    ? card(`<div class="mut" style="font-size:12px;line-height:1.8">记忆生命周期接口读取失败：<b>${esc(lc.__err)}</b><br>
+        这是展示问题，不影响记忆数据本身；点顶栏「⟳」可重试。</div>`,
+        { title: "记忆生命周期", sub: "活跃 / 已归档 / 已遗忘（自动归档与遗忘的现状）" })
+    : countsOk
+      ? card(
+          `<div class="row wrap" style="gap:9px">${[
+            ["活跃", lifeNum("active"), "参与召回"],
+            ["已归档", lifeNum("archived"), "不参与召回 · 被提及会拉回"],
+            ["已遗忘", lifeNum("forgotten"), "软删 · 库里仍可查"],
+          ].map(([l, v, d]) => `<div class="kpi-mini" style="min-width:150px;flex:1"><div class="v">${v}</div>
+            <div class="l">${esc(l)} · ${esc(d)}</div></div>`).join("")}</div>
+          ${lifeNote ? `<div class="mut" style="font-size:11px;margin-top:9px;line-height:1.8">${lifeNote}</div>` : ""}`,
+          { title: "记忆生命周期", sub: "自动归档 / 遗忘的现状（阈值与开关在「记忆设置」里改）" })
+      : card(`<div class="mut" style="font-size:12px;line-height:1.8">生命周期计数暂不可用：接口没有返回 <span class="mono">counts</span>（这里不显示 0 顶替）。</div>`,
+          { title: "记忆生命周期", sub: "活跃 / 已归档 / 已遗忘（自动归档与遗忘的现状）" });
 
   const html = `
   <style>
@@ -1926,6 +1979,7 @@ export async function renderMemoryList() {
     `<button class="btn p" onclick="hfRecallToggle()">${MB.recall ? "收起召回测试" : "召回测试"}</button>`,
     "❑"
   )}
+  ${lifeCard}
   ${kpis(
     kpiCard("mbAll", fmtNum(MB_DATA.total), "当前筛选命中", `<span class="mut">共 ${fmtNum(st.active || 0)} 活跃 / ${fmtNum(cov.total || 0)} 条</span>`)
     + kpiCard("mbVec", `${fmtNum(cov.embedded || 0)}<span class="mut" style="font-size:12px">/${fmtNum(cov.total || 0)}</span>`, "已生成向量",
@@ -2008,7 +2062,7 @@ export async function renderMemoryList() {
         ${(MB_SESS.personas || []).map((x) => `<option value="${esc(x.persona_id)}"${MB.persona_id === x.persona_id ? " selected" : ""}>${esc(String(x.persona_id || "（未标人格）"))}（${fmtNum(x.memories)}）</option>`).join("")}
       </select>
       <select class="ipt" style="width:110px" onchange="hfMemSet('status', this.value)">
-        ${opt("", "全部状态", MB.status)}${opt("active", "活跃", MB.status)}${opt("stale", "待复活", MB.status)}${opt("decayed", "已衰减", MB.status)}${opt("archived", "已归档", MB.status)}
+        ${opt("", "全部状态", MB.status)}${opt("active", "活跃", MB.status)}${opt("stale", "待复活", MB.status)}${opt("decayed", "已衰减", MB.status)}${opt("archived", "已归档", MB.status)}${opt("deleted", "回收站", MB.status)}${opt("forgotten", "已遗忘", MB.status)}
       </select>
       <select class="ipt" style="width:110px" onchange="hfMemSet('atom_type', this.value)">
         ${opt("", "全部类型", MB.atom_type)}${opt("factual", "事实", MB.atom_type)}${opt("episodic", "事件", MB.atom_type)}${opt("preference", "偏好", MB.atom_type)}${opt("planned", "计划", MB.atom_type)}${opt("relational", "关系", MB.atom_type)}
@@ -2045,7 +2099,9 @@ export async function renderMemoryList() {
               <td><span class="chip gy">${esc(ATOM_LABEL[m.atom_type] || m.atom_type || "—")}</span></td>
               <td><span class="mb-bar"><i style="width:${Math.max(3, Math.min(100, Math.round((m.strength || 0) * 100)))}%"></i></span>
                   <span class="mut" style="font-size:10.5px;margin-left:5px">${fmt1(m.strength)}</span></td>
-              <td><span class="tag ${m.status === "active" ? "ok" : m.status === "archived" ? "dg" : "gy"}">${esc(STATUS_LABEL[m.status] || m.status || "—")}</span></td>
+              <td><span class="tag ${m.status === "active" ? "ok" : (m.status === "archived" || m.status === "deleted") ? "dg" : "gy"}">${esc(STATUS_LABEL[m.status] || m.status || "—")}</span>
+                  ${m.status === "deleted" ? `<button class="btn xs" style="margin-left:4px" onclick="event.stopPropagation();hfMemRestore(${jsStr(String(m.id).replace(/^m/, ""))})">恢复</button>` : ""}
+                  ${m.status === "forgotten" ? `<button class="btn xs" style="margin-left:4px" onclick="event.stopPropagation();hfMemRestore(${jsStr(String(m.id).replace(/^m/, ""))})">恢复</button>` : ""}</td>
               <td>${m.has_vec ? '<span class="tag ok">有</span>' : '<span class="tag gy">无</span>'}</td>
               <td>${m.persona_id ? `<span class="chip" style="font-size:10.5px">${esc(String(m.persona_id))}</span>` : `<span class="mut" style="font-size:11px">未标</span>`}</td>
               <td class="mut" style="font-size:11px">${esc(fmtTime(m.occurred_at || m.created_at))}</td>
@@ -2845,7 +2901,19 @@ async function mountPersonsGraph(host, ctx) {
 
 export async function renderMemoryConf() {
   const dom = await apiSafe("config/domains", {}, { domains: {}, values: {} });
+  if (dom && dom.__err) {
+    return {
+      html: pageHead(
+        "记忆设置读取失败",
+        `配置接口现在拿不到：${esc(String(dom.__err))}`,
+        `<button class="btn p" onclick="hfRefresh()">重试</button>`,
+        "⚠"
+      ) + card(`<div class="fnote">⚠ 为避免把空值/关闭状态写回，本次不渲染表单。请重试。</div>`,
+               { title: "读取失败" }),
+    };
+  }
   const values = dom.values || {};
+  const G = (dom.guards && dom.guards.keys) || {};
   const half = Number(values.memory_decay_half_life_days) || 21;
   const rows = [
     ["memory_summary_prompt", "总结自定义提示词", "空=用内置；支持 {transcript} 占位；请保留输出格式行（摘要|类型|强度|情绪浓度）", "area"],
@@ -2863,12 +2931,14 @@ export async function renderMemoryConf() {
     ["memory_evict_below", "淘汰阈值", "强度低于此值的记忆会被标记 stale", "num", 0.01, 0.5, 0.01],
   ];
   const html = `
-  ${pageHead("记忆设置", "这些是写进数据库的真实配置，改完点保存即生效", `<button class="btn p" onclick="hfSaveDomain('memory',this)">保存</button>
-    <button class="btn" onclick="hfMemMaintain(this)">立即衰减 / 淘汰</button>`, "⚙")}
+  ${pageHead("记忆设置", "这些是写进数据库的真实配置，改完点保存即生效", `<button class="btn p" onclick="hfSaveDomain('memory',this)">保存</button>`, "⚙")}
   <div class="grid g32 sec">
     ${card(
       rows
         .map(([key, name, desc, type, min, max, step]) => {
+          const g = G[key] || {};
+          if (g.min != null) min = g.min;
+          if (g.max != null) max = g.max;
           const v = values[key];
           return `<div class="prow" data-key="${key}"><div><div class="pn">${esc(name)}</div><div class="pd">${esc(desc)} · <span class="mono">${key}</span></div></div>
         <div class="pc">${
@@ -2903,13 +2973,12 @@ export async function renderMemoryConf() {
       ${card(`<div id="mcCurve"></div>`, { title: "衰减曲线（模型）", sub: `按当前半衰期 ${half} 天：第 30 天剩 ${(Math.pow(0.5, 30 / half) * 100).toFixed(1)}%，第 60 天剩 ${(Math.pow(0.5, 60 / half) * 100).toFixed(1)}%` })}
       ${card(`<div id="mcTypes"></div>`, { title: "类型分布", sub: "当前人格视角下的记忆构成" })}
       ${card(
-        `<div class="mut" style="font-size:11.5px;line-height:1.7">维护操作会直接改库：<br>
+        `<div class="mut" style="font-size:11.5px;line-height:1.7">破坏性维护（<b>衰减 / 淘汰</b> · <b>清理冻结记忆</b>）已经收进「设置 → 数据治理」集中的一处，本页不再重复放置入口。<br>
         · 衰减：按半衰期降低所有记忆强度<br>
         · 淘汰：把低于阈值的记忆标成 stale（不在图谱与召回里出现）<br>
         · 清理冻结：删掉没有任何关系链且已 stale 的记忆</div>
         <div class="row" style="gap:6px;margin-top:10px;flex-wrap:wrap">
-          <button class="btn s" onclick="hfPurgeStale()">清理冻结记忆</button>
-          <button class="btn s dg" onclick="goPage('settings','main')">去危险区</button>
+          <button class="btn s" onclick="goPage('settings','main')">去数据治理 →</button>
         </div>`,
         { title: "维护" }
       )}

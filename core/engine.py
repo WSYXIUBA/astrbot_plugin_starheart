@@ -7,6 +7,7 @@ base 由内容特征与相关性组成，state/relation 是乘性系数，penalt
 
 from __future__ import annotations
 
+import difflib
 import re
 import time
 from typing import Any
@@ -20,6 +21,18 @@ MENTION_WEIGHT = 35
 SHORT_REPLY_PENALTY = -25
 PRESENCE_PENALTY = -8
 PRESSURE_BONUS = 12
+
+# 记忆衰减的类型系数（乘在 half_life 上）：>1 掉得慢，<1 掉得快。
+# 关系/偏好/承诺是长期陪伴的骨架，不能和一次性的琐事用同一条半衰期。
+_DECAY_TYPE_MULT = {
+    "relational": 1.8,
+    "preference": 1.6,
+    "planned": 1.5,
+    "opinion": 1.2,
+    "routine": 1.1,
+    "factual": 1.0,
+    "episodic": 0.8,
+}
 
 QUESTION_PAT = re.compile(r"[?？]|(吗|呢|怎么|为什么|如何|是不是|能不能|可不可以)\s*$")
 REQUEST_PAT = re.compile(r"(帮我|麻烦|请|来个|写个|看下|查一下|推荐|教我)")
@@ -132,12 +145,12 @@ def extract_favour_tag(text: str) -> tuple[str, float | None]:
 
 
 TONE_LINES = {
-    "DEVOTED": "对这个人可以撒娇、可以主动、可以占话题，被冷落会直接说。",
-    "CLOSE": "可以是亲昵的、可以主动接话、可以开玩笑、可以用昵称、深夜也回。",
-    "FAMILIAR": "可以自然参与，有梗就接，但不主动私聊、不用昵称。",
-    "NEUTRAL": "被点名才答，礼貌但不必热络。",
-    "COLD": "回答尽量短，不主动追问，不给多余建议。",
-    "HOSTILE": "字数极简，被点名才开口，不主动接话，不带情绪起伏。",
+    "DEVOTED": "最亲的那一档：可以主动找他说话，可以撒娇，也可以直接说想他，被冷落会直说。",
+    "CLOSE": "聊得挺来：可以主动接话、开玩笑、叫昵称，深夜也回。",
+    "FAMILIAR": "算熟人：随口聊就行，有梗就接，不当外人也不端着。",
+    "NEUTRAL": "普通网友：随口聊，不用刻意热络，也不用装客气。",
+    "COLD": "不太熟：话少点，不追问，不给建议。",
+    "HOSTILE": "不待见：能一个字就一个字，不接话。",
 }
 
 
@@ -176,11 +189,12 @@ def ago_label(ts: float | Any, now: float | None = None) -> str:
 
 
 def build_memory_context(memories: list[dict[str, Any]], budget_chars: int = 900, *,
-                         now: float | None = None) -> str:
+                         now: float | None = None, extra_note: str = "") -> str:
     """把召回结果拼成给模型的自然语言片段（不含任何分数）。
 
     每条记忆带一个「大约多久以前」的方括号标记：模型本来对记忆完全没有时间感，
     分不清「这是三天前的事还是刚才的事」—— 时间锚是它能接住「上次」「前几天」这类话的前提。
+    extra_note：附加在块尾的一句提醒（主动开口链路用它标注「都是旧事/注意主语」等）。
     """
     if not memories:
         return ""
@@ -190,50 +204,184 @@ def build_memory_context(memories: list[dict[str, Any]], budget_chars: int = 900
         summary = (mem.get("summary") or "").strip()
         if not summary:
             continue
-        when = ago_label(mem.get("occurred_at"), now)
-        line = f"- [{when}] {summary}" if when else f"- {summary}"
+        when = ago_label(mem.get("occurred_at") or mem.get("created_at"), now)
+        line = f"- [{when}] {summary}" if when else f"- [时间未知] {summary}"
         if used + len(line) > budget_chars:
-            break
+            # 超预算：跳过这条继续装下一条（旧实现 break —— 第一条超长就把整块变成空，
+            # 等于「有记忆但一条都不给模型看」）。第一条就超长时截断也要给出一条。
+            if lines:
+                continue
+            line = line[:max(20, int(budget_chars))]
         lines.append(line)
         used += len(line)
     if not lines:
         return ""
+    tail = f"\n{extra_note}" if extra_note else ""
     return (
         "（你记得这些事（方括号里是「大约多久以前」，是我记忆里的粗略时间 —— "
         "它是参考不是证据，不要拿它去质疑对方「刚才在哪说过什么」）：\n"
         + "\n".join(lines)
+        + tail
         + "\n）"
     )
 
 
+def _norm_for_similarity(text: str) -> str:
+    """相似度比对前的归一化：小写、去空白/标点/emoji，只留文字与数字。"""
+    t = str(text or "").lower()
+    t = re.sub(r"[\s\u3000]+", "", t)
+    t = re.sub(r"[^\w\u4e00-\u9fff]+", "", t)
+    return t
+
+
+def text_similarity(a: str, b: str) -> float:
+    """两条短文本的相似度（0~1）：取 字符包含度 / 二元组包含度 / difflib 比值 的最大值。
+
+    为什么不是简单相等：重播往往只改几个字（「周五会我找人替了」→
+    「周五会找人替了 省得再挨骂」），必须能抓住「同一件事换个说法再说一遍」。
+    包含度用 min() 作分母，专治「一长一短」的改写；任一侧太短（<4 字）不比对，避免误伤。
+    """
+    na, nb = _norm_for_similarity(a), _norm_for_similarity(b)
+    if not na or not nb:
+        return 0.0
+    if na == nb:
+        return 1.0            # 一字不差就是复读，短句也认（先于长度护栏）
+    if len(na) < 4 or len(nb) < 4:
+        return 0.0            # 近似判断太短的文本没意义，防误伤
+    # 长度差太大时只可能是「短句被长句包含」，不是同一件事的改写；
+    # 用 min 作分母会把「TA养了只猫」和「TA养了只猫叫花花」判成 1.0，进而吞掉新信息。
+    len_ratio = min(len(na), len(nb)) / max(len(na), len(nb))
+    sa, sb = set(na), set(nb)
+    char_contain = len(sa & sb) / max(1, max(len(sa), len(sb)))
+    ba = {na[i:i + 2] for i in range(len(na) - 1)}
+    bb = {nb[i:i + 2] for i in range(len(nb) - 1)}
+    bigram_contain = (len(ba & bb) / max(1, max(len(ba), len(bb)))) if (ba and bb) else 0.0
+    ratio = difflib.SequenceMatcher(None, na, nb).ratio()
+    score = max(char_contain, bigram_contain, ratio)
+    if len_ratio < 0.75:
+        score = min(score, 0.6)   # 只允许「整句包含」在调用方单独处理，不在这里判成复读
+    return round(score, 4)
+
+
+def cosine_vec(a: list[float] | None, b: list[float] | None) -> float:
+    """两个稠密向量的余弦相似度（0~1）；维度不一致/空向量一律 0。
+
+    主动消息的语义防复读用：字符相似度抓不住「同一个梗换个说法」
+    （同一件事换一种说法时，字符相似度往往只有 0.3~0.4），
+    向量能抓住，但必须失败即回退，不能让嵌入服务拖住开口。
+    """
+    import math
+
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(float(x) * float(y) for x, y in zip(a, b))
+    na = math.sqrt(sum(float(x) * float(x) for x in a))
+    nb = math.sqrt(sum(float(y) * float(y) for y in b))
+    if na <= 0 or nb <= 0:
+        return 0.0
+    return max(0.0, min(1.0, dot / (na * nb)))
+
+
 def tokenize(text: str) -> list[str]:
-    """轻量分词：中英混合按字符/词切，够用于关键词召回。"""
-    words = re.findall(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]{2,}", (text or "").lower())
-    return [w for w in words if len(w) >= 2][:32]
+    """轻量分词：英文按词，中文按 2-gram（长句不再被当成一个整 token）。"""
+    raw = re.findall(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]+", (text or "").lower())
+    out: list[str] = []
+    for w in raw:
+        if re.fullmatch(r"[A-Za-z0-9_]+", w):
+            if len(w) >= 2:
+                out.append(w)
+        elif len(w) <= 2:
+            out.append(w)
+        else:
+            out.extend(w[i:i + 2] for i in range(len(w) - 1))
+    # 去重保序，限制数量，避免超长文本把 SQL/Python 拖慢
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for w in out:
+        if w not in seen:
+            seen.add(w)
+            deduped.append(w)
+    return deduped[:64]
+
+
+# 可召回状态：只把「删除 / 遗忘」当终点，其余一律可召回 —— 状态只做排序乘子，不做过滤器。
+# 旧实现把 stale / archived 挡在召回外，于是「没被召回 → 归档 → 更不可能被召回 → 遗忘」
+# 变成一条自毁链。乘子让旧记忆变淡，但仍有机会被一句话提起。
+RECALL_STATUSES = ("active", "decayed", "stale", "archived")
+STATUS_WEIGHT = {"active": 1.0, "decayed": 0.85, "stale": 0.7, "archived": 0.4}
+
+
+def status_weight(status: str) -> float:
+    """状态乘子（未知状态按 0.5，宁可弱一点也不丢掉）。"""
+    return STATUS_WEIGHT.get(str(status or "").lower(), 0.5)
 
 
 async def retrieve_memories(
     store, query: str, *, top_k: int = 5, session_id: str = "", persona_id: str = "",
-    include_archived: bool = False
+    include_archived: bool = True, subject_id: str = "",
 ) -> list[dict[str, Any]]:
-    """关键词 × 强度 的本地召回（不上向量，先保证零依赖可用）。
+    """关键词 × 强度 × 状态 的本地召回（不上向量，先保证零依赖可用）。
 
-    include_archived=True 时把归档记忆也纳入候选 —— 这是「归档被提及就自动拉回」的实现基础
-    （召回命中后会走 touch_memory 把它恢复成 active）。默认不开，避免归档噪音主导召回。
+    状态不做过滤器（archived 也进候选，只乘 0.4）；命中后由调用方 touch_memory 拉回。
+    返回的每条带 `_hit_kind`（keyword / fallback）与 `_recall_score`：兜底（最近 N 条）
+    不算「被提及」，调用方不能再给它加固 —— 旧实现两者共用出口，最新几条会永久霸榜。
     """
     tokens = tokenize(query)
-    if not tokens:
-        return []
-    sql = ("SELECT * FROM hf_memories WHERE status IN ('active','archived')" if include_archived
-           else "SELECT * FROM hf_memories WHERE status='active'")
-    args: list[Any] = []
-    if persona_id == "__none__":
-        sql += " AND (persona_id IS NULL OR persona_id = '')"
-    elif persona_id:
-        sql += " AND persona_id=?"
-        args.append(persona_id)
-    sql += " ORDER BY strength DESC LIMIT 400"
-    rows = await (await store.db.execute(sql, args)).fetchall()
+    base = "SELECT * FROM hf_memories WHERE status NOT IN ('deleted','forgotten')"
+    if not include_archived:
+        base += " AND status!='archived'"
+
+    def _persona_sql(untagged: bool = False) -> tuple[str, list[Any]]:
+        if untagged:
+            return " AND (persona_id IS NULL OR persona_id = '')", []
+        if persona_id == "__none__":
+            return " AND (persona_id IS NULL OR persona_id = '')", []
+        if persona_id:
+            return " AND persona_id=?", [persona_id]
+        return "", []
+
+    async def _fetch(limit: int, *, untagged: bool = False, sess: str = "") -> list[Any]:
+        sql, args = base, []
+        p_sql, p_args = _persona_sql(untagged)
+        sql += p_sql
+        args.extend(p_args)
+        if sess:
+            sql += " AND session_id=?"
+            args.append(sess)
+        sql += " ORDER BY strength DESC LIMIT ?"
+        args.append(max(1, int(limit)))
+        return await (await store.db.execute(sql, args)).fetchall()
+
+    async def _latest(limit: int, *, untagged: bool = False, sess: str = "") -> list[Any]:
+        sql, args = base, []
+        p_sql, p_args = _persona_sql(untagged)
+        sql += p_sql
+        args.extend(p_args)
+        if sess:
+            sql += " AND session_id=?"
+            args.append(sess)
+        sql += " ORDER BY COALESCE(NULLIF(occurred_at,0), created_at) DESC LIMIT ?"
+        args.append(max(1, int(limit)))
+        return await (await store.db.execute(sql, args)).fetchall()
+
+    # 1) 本会话 200 条 + 全库 200 条（并集，去重）
+    rows_all: list[Any] = []
+    if session_id:
+        rows_all.extend(await _fetch(200, sess=session_id))
+    rows_all.extend(await _fetch(200))
+    seen_ids: set[str] = set()
+    rows: list[Any] = []
+    for r in rows_all:
+        rid = str(dict(r).get("id") or "")
+        if rid and rid not in seen_ids:
+            seen_ids.add(rid)
+            rows.append(r)
+    # 2) 人格过滤后一条都没有 → 只退回「未打人格标签」的记忆，绝不拿别的人格
+    if not rows and persona_id not in ("", "__none__"):
+        rows = await _fetch(200, untagged=True)
+        if session_id:
+            rows = list(rows) + list(await _fetch(200, untagged=True, sess=session_id))
+
     scored: list[tuple[float, dict[str, Any]]] = []
     for row in rows:
         mem = store._mem_row(row)
@@ -241,21 +389,53 @@ async def retrieve_memories(
         hits = sum(1 for tk in tokens if tk in haystack)
         if hits == 0:
             continue
-        score = hits * 1.0 + float(mem.get("strength") or 0) * 1.5
+        # 归一到 0~1：长问句不该靠「命中词数多」天然压过短问句
+        cover = hits / max(1, len(tokens))
+        score = (cover * 0.7 + float(mem.get("strength") or 0) * 0.3) * status_weight(mem.get("status"))
         if session_id and mem.get("session_id") == session_id:
-            score += 0.6
+            score *= 1.15
+        # 同一人格下的「别人的私聊」：降权但不排除（旧实现完全没有这维度，A 的记忆会注入给 B）
+        if subject_id and str(mem.get("subject_id") or ""):
+            score *= 1.10 if str(mem.get("subject_id")) == str(subject_id) else 0.6
         scored.append((score, mem))
     scored.sort(key=lambda x: x[0], reverse=True)
-    picked = [m for _s, m in scored[: max(1, top_k)]]
-    for mem in picked:
-        await store.db.execute("UPDATE hf_memories SET recalls=recalls+1 WHERE id=?", (str(mem["id"]).lstrip("m"),))
-    if picked:
-        await store.db.commit()
+    picked: list[dict[str, Any]] = []
+    for s, m in scored[: max(1, top_k)]:
+        m["_hit_kind"] = "keyword"
+        m["_recall_score"] = round(float(s), 4)
+        picked.append(m)
+    if not picked:
+        # 3) 关键词 0 命中（含纯标点/emoji）时的兜底：先本会话最近，再全库最近；不要一上来就跨会话
+        for sess in ([session_id] if session_id else []) + [""]:
+            try:
+                rows2 = await _latest(top_k, sess=sess)
+            except Exception:
+                rows2 = []
+            if rows2:
+                picked = [store._mem_row(r) for r in rows2]
+                break
+        if not picked and persona_id not in ("", "__none__"):
+            try:
+                rows2 = await _latest(top_k, untagged=True, sess=session_id)
+            except Exception:
+                rows2 = []
+            picked = [store._mem_row(r) for r in rows2]
+        for m in picked:
+            m["_hit_kind"] = "fallback"     # 兜底 ≠ 被提及：调用方不得加固（见 P0-5）
+            m["_recall_score"] = 0.0
+    # 计数交给调用方 touch_memory（真实命中才算一次），这里不再重复 +1
     return picked
 
 
-def decay_strength(strength: float, age_days: float, half_life_days: float = 21.0) -> float:
-    """指数衰减：strength × 0.5^(age/half_life)。"""
+def decay_strength(strength: float, age_days: float, half_life_days: float = 21.0,
+                  atom_type: str = "") -> float:
+    """指数衰减：strength × 0.5^(age/half_life)；半衰期按记忆类型分化。
+
+    关系/偏好/承诺类（称呼、雷点、答应过的事）掉得最慢 —— 这些正是长期陪伴最该留住的，
+    用一条 21 天公式把所有类型一起杀掉是旧实现最大的语义错误。
+    """
+    mult = _DECAY_TYPE_MULT.get(str(atom_type or "").lower(), 1.0)
+    half_life_days = float(half_life_days) * mult
     if half_life_days <= 0:
         return strength
     return round(max(0.0, strength * (0.5 ** (age_days / half_life_days))), 4)
@@ -319,10 +499,12 @@ _CJK_PAT = re.compile(r"[\u4e00-\u9fff]{2,}")
 _SKIP_PAT = re.compile(r"(https?://|www\.|/|\d{5,}|@|\w+\.\w{2,})", re.I)
 
 
-def apply_typo(text: str, mode: str = "off") -> str:
+def apply_typo(text: str, mode: str = "off", rate: float | None = None) -> str:
     """按档位给中文文本注入轻微错字（相邻字交换）。
 
     代码块原样保留；一行里含 URL/命令/长数字的不动；没有中文的整条不动。
+    rate =「错字率」（output_typo_rate）：整条消息进入错字流程的概率（0–1）；
+    传了它就由它当数值闸（rate=0 等于完全不动），不传则沿用各档内置概率。
     """
     if not text:
         return text
@@ -334,7 +516,17 @@ def apply_typo(text: str, mode: str = "off") -> str:
         return text
     import random
 
-    if mode == "light" and random.random() < 0.5:
+    if rate is not None:
+        try:
+            _rate = float(rate)
+        except (TypeError, ValueError):
+            _rate = None
+        if _rate is not None:
+            if _rate <= 0:
+                return text
+            if random.random() >= min(_rate, 1.0):
+                return text
+    elif mode == "light" and random.random() < 0.5:
         return text  # light 档一半概率整条不犯错，更像真人状态波动
     max_swaps = {"light": 1, "medium": 2, "wild": 3}[mode]
     swaps = 0
@@ -416,3 +608,47 @@ def split_message(text: str, *, max_seg: int = 6, min_len: int = 12) -> list[str
         merged = segs[: max_seg - 1] + ["\n".join(segs[max_seg - 1:])]
         segs = merged
     return segs
+
+
+def split_for_send(text: str, *, max_line: int = 12, max_seg: int = 6) -> tuple[list[str], str]:
+    """发送层切段（主动通道用）：不依赖 AstrBot 的 result 管线，纯文本判定。
+
+    主动消息走 `context.send_message()`，没有 event/result，`on_decorating_result`
+    钩子永远收不到它 —— 所以「空行 = 分一条」的协议必须在这里自己兑现。
+
+    三条协议，优先级从上到下（与回复路径同口径）：
+      ① 空行协议：bot 自己写的空行，每段发什么、发多长全由它决定；
+      ② 一行一条：整段没有空行、但每行都很短（1/2/3… 一条一个数字）时按单换行切；
+      ③ 语义切分：前两条都不成立、且长度与断点够时才按标点边界兜底切。
+
+    返回 (段列表, 依据)；不拆时返回 ([原文], "")，调用方照旧整条发。
+    错字/收尾（apply_typo / tidy_output）由调用方逐段处理 —— 本函数只做切分，
+    保证「先切后收拾」，不会因为 tidy_output 压掉空行而让协议失效。
+    """
+    raw = str(text or "")
+    if not raw.strip():
+        return [raw], ""
+    # 代码块：整段交给 split_message —— 它先摘代码块再切正文，保证代码块不被空行切碎、绝不丢字
+    if _CODE_BLOCK_PAT.search(raw):
+        segs = split_message(raw)
+        if len(segs) <= 1:
+            return [raw], ""
+        body, _code = strip_code_blocks(raw)
+        body_blocks = [b.strip() for b in re.split(r"\n\s*\n", body) if b.strip()]
+        return segs, ("空行协议" if len(body_blocks) >= 2 else "代码块")
+    blocks = [b.strip() for b in re.split(r"\n\s*\n", raw) if b.strip()]
+    if len(blocks) >= 2:
+        # 无人值守通道的防洪：超过 max_seg 段就把余下的并进最后一条（合并用空行，不丢字）
+        if len(blocks) > max_seg:
+            blocks = blocks[: max_seg - 1] + ["\n\n".join(blocks[max_seg - 1:])]
+        return blocks, "空行协议"
+    lines = [ln.strip() for ln in raw.split("\n") if ln.strip()]
+    if len(lines) >= 2 and max(len(ln) for ln in lines) <= max_line and "\n\n" not in raw:
+        if len(lines) > max_seg:
+            lines = lines[: max_seg - 1] + ["\n".join(lines[max_seg - 1:])]
+        return lines, "一行一条"
+    if should_split(raw):
+        segs = split_message(raw)
+        if len(segs) > 1:
+            return segs, "语义切分"
+    return [raw], ""

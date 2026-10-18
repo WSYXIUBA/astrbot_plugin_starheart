@@ -343,7 +343,7 @@ tbody tr:last-child td{border-bottom:none}
 @keyframes toastin{from{opacity:0;transform:translateY(14px) scale(.96)}to{opacity:1;transform:none}}
 .toast.out{opacity:0;transform:translateY(8px);transition:all .25s}
 
-/* 参数行 / 危险区 */
+/* 参数行 / 数据治理（危险操作） */
 .prow{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:9px 0;border-bottom:1px solid var(--bd)}
 .prow:last-child{border-bottom:none}
 .prow .pn{font-size:12.5px;font-weight:600}
@@ -352,6 +352,14 @@ tbody tr:last-child td{border-bottom:none}
 .prow .pc input[type=number]{width:84px}
 .prow .pc textarea{width:300px;min-height:70px;font-size:11.5px}
 .prow.modified .pn::after{content:"●";color:var(--warning);font-size:8px;margin-left:5px;vertical-align:2px}
+.prow.guard-bad{background:rgba(224,85,85,.07);border-left:3px solid var(--error,#e05555);padding-left:8px}
+@media(max-width:720px){
+  .prow{flex-direction:column;align-items:stretch;gap:8px}
+  .prow .pc{justify-content:flex-end;flex-wrap:wrap}
+  .prow .pc input[type=number]{width:100%;min-width:0}
+  .prow .pc textarea{width:100%;min-width:0}
+  .prow .pc select{max-width:100%;min-width:0}
+}
 .danger-zone{border:1.5px solid rgba(244,67,54,.3);border-radius:var(--r-md);padding:12px 14px;margin-top:8px}
 .danger-zone .prow{border-color:rgba(244,67,54,.15)}
 
@@ -404,7 +412,7 @@ tbody tr:last-child td{border-bottom:none}
     </style>
 
     <style>
-      /* 表达学习：条文里的"具体说法"与来源原话 */
+      /* 语言学习：条文里的"具体说法"与来源原话 */
       .hway { font-size: 13px; line-height: 1.75; margin-top: 6px; color: var(--tx); }
       .hcues { border-top: 1px dashed var(--bd); margin-top: 8px; }
       .cq { font-size: 11.5px; line-height: 1.7; padding: 4px 8px; margin: 3px 0; border-radius: 7px;
@@ -412,7 +420,7 @@ tbody tr:last-child td{border-bottom:none}
     </style>
 
     <style>
-      /* 表达学习：表达卡（色条长度 ∝ 使用次数）+ 出处 + 就地编辑 */
+      /* 语言学习：表达卡（色条长度 ∝ 使用次数）+ 出处 + 就地编辑 */
       .hbgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 10px; }
       .hbcard { position: relative; overflow: hidden; border: 1px solid var(--bd); border-radius: 12px;
                 padding: 11px 13px; background: var(--surface); }
@@ -529,10 +537,11 @@ h1,h2,h3,h4,.card .ct,.ph h1{font-family:Georgia,'Times New Roman','Songti SC','
 .rail-nav .nav.on .lb,.rail-nav .nav.on .ic{color:#1a1a1a !important}
 /* 子页签：细线 tab，选中=墨色字+金色下划线（不用色块） */
 .seg{background:transparent !important;border:0 !important;border-bottom:1px solid var(--hair) !important;
-  border-radius:0 !important;box-shadow:none !important;gap:2px !important;padding:0 !important;overflow:visible}
+  border-radius:0 !important;box-shadow:none !important;gap:2px !important;padding:0 !important;
+  overflow-x:auto !important;overflow-y:hidden !important;-webkit-overflow-scrolling:touch;max-width:100%}
 .seg .sg{background:transparent !important;border:0 !important;border-bottom:2px solid transparent !important;
   border-radius:0 !important;color:var(--tx2) !important;font-weight:500 !important;letter-spacing:.12em !important;
-  text-transform:uppercase;font-size:11.5px;padding:6px 12px !important;transition:color .3s var(--ez),border-color .3s var(--ez) !important}
+  text-transform:uppercase;font-size:11.5px;padding:6px 12px !important;white-space:nowrap;flex:0 0 auto;transition:color .3s var(--ez),border-color .3s var(--ez) !important}
 .seg .sg:hover:not(.on){color:var(--tx1) !important}
 .seg .sg.on{color:var(--tx1) !important;border-bottom-color:var(--gold) !important}
 .seg .ind{display:none !important}
@@ -599,8 +608,9 @@ a{color:var(--primary)}
       <button class="nav" data-nav="overview"><i class="ic">◉</i><span class="lb">总览</span></button>
       <div class="rail-sep"></div>
       <button class="nav" data-nav="memory"><i class="ic">◍</i><span class="lb">记忆系统</span></button>
-      <button class="nav" data-nav="expression"><i class="ic">✎</i><span class="lb">表达学习</span></button>
+      <button class="nav" data-nav="expression"><i class="ic">✎</i><span class="lb">语言学习</span></button>
       <button class="nav" data-nav="messages"><i class="ic">✉</i><span class="lb">消息事件</span></button>
+      <button class="nav" data-nav="metrics"><i class="ic">◔</i><span class="lb">拟人指标</span></button>
       <button class="nav" data-nav="persona"><i class="ic">☺</i><span class="lb">人格管理</span></button>
       <div class="rail-sep"></div>
       <button class="nav" data-nav="settings"><i class="ic">⚙</i><span class="lb">设置</span></button>
@@ -634,6 +644,6 @@ a{color:var(--primary)}
 <div class="modal-mask" id="modalMask"><div class="modal" id="modal"></div></div>
 <div class="toasts" id="toasts"></div>
 
-<script type="module" src="./app.js?v=1.0.1"></script>
+<script type="module" src="./app.js?v=1.0.2"></script>
 </body>
 </html>

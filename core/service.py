@@ -7,9 +7,12 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
+import os
 import random
 import re
+import shutil
 import time
 import unicodedata
 from collections.abc import Awaitable, Callable
@@ -22,15 +25,29 @@ from astrbot.api import logger
 
 from . import engine
 from .importer import SOURCE_NAME, LivingMemoryImporter
-from .storage import Store, session_platform
+from .storage import (  # noqa: F401
+    CONFIG_SNAPSHOT_KEEP, EXPR_COOLDOWN_SECONDS, EXPR_WINDOW_MAX_INJECT,
+    JARGON_CANDIDATE_BATCH, JARGON_CORPUS_SCAN, JARGON_MATCH_LIMIT, JARGON_MEANING_MAX_CHARS,
+    JARGON_STATUSES, JARGON_TERM_MAX_CHARS, JARGON_TRY_MAX_TOKENS,    Store, expr_norm_key,
+    session_kind, session_platform,
+)
+
+
+async def _maybe_await(value: Any) -> Any:
+    """统一兼容 system provider 的同步/异步返回。
+
+    坑（2026-10-15 真机实锤）：main 里 agent_prompt 提供方是**同步函数**，调用侧却直接
+    `await fn(...)` —— await 一个 dict 当场抛 TypeError，被兜底 except 吞掉后 got 恒为 {}，
+    于是「主动开口吃 AstrBot 完整提示词」这条路径**从未真正生效**（100% 静默降级成只吃人格，
+    所有开口的输入 token 恒 ~1043 就是佐证）。这里两种写法都接住，杜绝再次静默失败。
+    """
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
 
 _ATOM_TYPES = frozenset(
     {"episodic", "factual", "relational", "preference", "planned", "routine", "opinion"}
-)
-# 助手自身状态/意愿不是「关于用户的记忆」，总结结果里出现这些主语就丢弃
-_ASSISTANT_SUBJECT = re.compile(
-    r"^\s*(?:助手|机器人|bot|ai|我)\b|助手(?:对|的|希望|想|觉得|认为|承诺|答应)|"
-    r"(?:助手|bot|机器人)(?:偏好|喜欢|讨厌|希望|认为)"
 )
 
 def _salvage_fields(cand: str) -> dict[str, Any] | None:
@@ -235,15 +252,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "gate_threshold": 80,
     "gate_window_seconds": 20,
     "memory_inject_enabled": True,
-    "memory_inject_top_k": 5,
-    "memory_inject_budget_tokens": 600,
-    "memory_decay_half_life_days": 21,
-    "memory_evict_below": 0.08,
+    "memory_inject_top_k": 8,
+    "memory_inject_budget_tokens": 1200,   # 实为字符数（键名沿用旧版，改键名会丢老配置）
+    "memory_decay_half_life_days": 45,
+    "memory_evict_below": 0.05,
     "memory_persona_isolated": True,
     "session_context_enabled": True,
     "memory_capture_enabled": True,
-    "memory_capture_turns": 6,
-    "memory_capture_min_interval": 300,
+    "memory_capture_turns": 4,
+    "memory_capture_min_interval": 120,
     "memory_capture_max_per_run": 5,
     # 跨会话动作留痕：bot 借工具（含第三方工具类插件）在别的会话里发了什么，这里留台账 +
     # 在相关会话注入知会，并在记忆库留一条（避免「问它谁让你发的，它答不知道」）。
@@ -269,44 +286,75 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "favour_tag_required": True,         # 必须带好感标签才结算；关掉则无标签也按 +1
     "expression_enabled": True,
     "expression_min_uses": 3,            # 表达习惯至少生效过 N 次才算"已验证"（没达标的只在名额没用满时补位）
+    "expression_auto_min_corpus": 20,    # 未学语料攒够 N 条就自动提取一次（0 = 关自动，只留面板手动）
+    # 「先审后用」开关（拍-3；默认关 = 自动通过，学到就能用）
+    "expression_review_first": False,
+
+    # ---- S5 黑话（只做理解、不进回复；阈值/配额拍-16/19 —— 全部进参数中心可调，R4 登记先行） ----
+    "jargon_enabled": True,                # 黑话总开关（理解注入 + 命中记账）
+    "jargon_name_filter": True,            # 洞② 人名过滤：候选挖掘时滤掉昵称/群名（接 hf_person_names）
+    "jargon_candidate_min_sessions": 2,    # 机械候选门槛：跨 ≥N 会话（拍-16 默认 2）
+    "jargon_candidate_min_hits": 4,        # 机械候选门槛：出现 ≥N 次（拍-16 默认 4）
+    "jargon_infer_daily_batches": 1,       # 含义推断每日批数（拍-16 ≤1；0 = 关自动推断）
+    "jargon_try_daily_quota": 20,          # 试解读每日配额（拍-19 默认 20；0 = 不限）
+    # 运行时计数（面板不暴露；跨天自动归零，写入走 store.set_config）
+    "jargon_infer_day": "",
+    "jargon_infer_day_count": 0,
+    "jargon_try_day": "",
+    "jargon_try_day_count": 0,
+
+    # 单轮最多注入几条表达（勘误 A1：真·待新增键，0–10）
+    "output_expr_max_inject": 5,
     # 输出拟人（分段发送 + 打字延迟）：默认全关，开了才动行为
     # 下面这四个键以前没进 DEFAULT_CONFIG：原生页能改、但面板保存会被静默丢弃、新装也没有默认值。
     "output_enabled": True,              # 输出收拾总开关（压缩空行 / 剥离好感标记）
     "output_typo_mode": "off",            # 错字拟人档位：off / light / medium
+    # 错字率（错字机制的数值闸）：2026-10-16 勘误冻结为"真·待新增"键，范围 0–0.03
+    "output_typo_rate": 0.01,
     "output_split_messages": True,      # 长回复拆成多条发（按语义边界切，短句不拆）
-    "output_typing_delay": True,         # 补发的后续条目按"打字时长"延迟（首条立即发）
+    # 打字延迟：2026-10-16 裁决 —— 打字参数一律不动、**新装默认关**（库里已有值的一字不改）
+    "output_typing_delay": False,        # 补发的后续条目按"打字时长"延迟（首条立即发）
     "output_typing_per_char": 0.3,       # 每个字的打字秒数
     "output_typing_max": 6,            # 单条最多等这么多秒
     "sticker_slot": "off",                # 表情包目录（预留槽位：回复出现 [表情] 时随机发一张；off=关闭）
     "voice_slot": "off",                  # 语音槽位：TTS provider id 或 session=跟随会话；off=关闭
     "persona_active_id": "",
     "proactive_enabled": False,
-    "proactive_shadow": True,
+    "proactive_shadow": False,
     "proactive_idle_min": 120,
-    "proactive_daily_cap": 3,             # 每会话每天（自然日 0:00–23:59，按 AstrBot 时区）最多主动几条
+    "proactive_daily_cap": 3,             # 每个会话每天最多主动几条（多会话按会话数放大）
     "proactive_min_interval_min": 90,
-    "proactive_quiet_start": "23:30",
-    "proactive_quiet_end": "08:00",
-    "proactive_min_zone": "FAMILIAR",
+    "proactive_quiet_start": "01:30",
+    "proactive_quiet_end": "07:30",
+    "proactive_min_zone": "",             # 空 = 不按好感档位设门槛
     "proactive_last_only": False,
-    "proactive_style": "自然地开一句话题，短、不追问、不解释自己为什么开口",
-    # 主动名单跟可见性一样：每个范围一种模式（white=只对这些主动 / black=只对这些不主动）
-    "proactive_mode_group": "white",
-    "proactive_mode_private": "white",
+    "proactive_style": "用你平时说话的方式，想说什么就说什么",
+    # 主动名单：white=只对名单内主动 / black=只对名单内不主动 / off=不主动
+    "proactive_mode_group": "black",
+    "proactive_mode_private": "black",
     "proactive_auto_wl": "off",
     "proactive_wl_private": [],
     "proactive_bl_private": [],
     "proactive_wl_group": [],
     "proactive_bl_group": [],
     "proactive_use_persona": True,
-    "proactive_context_memories": 3,
-    "proactive_lists_enabled": True,      # 主动名单总开关（代码在 service 里读它，以前没有默认值 = 库里丢键就静默变行为）
+    "proactive_context_memories": 6,     # 主动开口参考几条（3 太少，总用最新几条）
+    "proactive_writeback": True,
+    "proactive_note_enabled": True,
+    "proactive_note_hours": 24,
+    "proactive_note_max": 3,
+    # 主动消息「第 2 层」提示词（本轮情境）：留空 = 用插件内置（PROACTIVE_LAYER2_TEMPLATE）。
+    # 面板「主动 → 参数」页底部可展开编辑；支持 {zone}/{tone}/{idle} 占位符。
+    "proactive_instruction": "",
+    # 主动开口复用 AstrBot 完整提示词的缓存时效（分钟）：超过就降级为只吃人格，
+    # 并在主动流水里标注 prompt_source=persona（防「静默降级」不可观测）。
+    "proactive_prompt_max_age_min": 720,
     # ---- 基础名单（可见性）：黑名单里的群/人 = 对 bot 完全不存在 ----
     # 这是「主动消息名单」的地基：主动只能在这个可见集合里再收窄，不会给它扩容。
     # 可见性名单只有两种：black（名单内对 bot 不存在）/ white（只有名单内可见）
-    # 默认 white + 空名单 = 一开始谁都不打扰，由你显式放行（面板会红字提醒）
-    "conn_mode_group": "white",
-    "conn_mode_private": "white",
+    # 默认 black + 空名单 = 全部可见；只有显式加入黑名单才隐藏。
+    "conn_mode_group": "black",
+    "conn_mode_private": "black",
     "conn_black_group": [],
     "conn_white_group": [],
     "conn_black_private": [],
@@ -349,10 +397,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "model_embedding": "",
     # 自动遗忘：久未被提及 → 归档；归档后再久未被提及且不重要 → 遗忘
     "forget_enabled": True,
-    "archive_after_days": 30,
-    "forget_after_days": 30,
-    "forget_min_strength": 0.35,
-    "forget_keep_poignancy": 8,
+    "archive_after_days": 90,
+    "forget_after_days": 180,
+    "forget_min_strength": 0.2,
+    "forget_keep_poignancy": 6,
     "forget_batch_per_tick": 20,
     "model_forget": "",            # 记忆遗忘评估：配了就让模型判断"哪条真该忘"（见 lifecycle_tick）
     "auto_import_external": True,
@@ -374,6 +422,372 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "burst_merge_group": False,      # 群聊也按人合并（默认只私聊合并）
 }
 
+# ---------------- 参数护栏（勘误冻结：15 键 min/max + 8 条「一次改坏」硬拦 + 关系 / 格式校验） ----------------
+# 这里是**保存路径的唯一校验源**：save_config() 先跑 validate_config_patch()，越界或踩到硬拦的
+# 整批拒绝落库（原子），把原因返回给面板；面板不再自己抄一份范围（两份数字必然会漂移）。
+# hard=True 的条目是「一次改坏」：改过去会让某个机制静默失效（打字节奏关掉 / 门控永久沉默 /
+# 撤回档案当场删光 / 记忆再也学不进去 …），所以除了范围还要给一句人话原因。
+PARAM_GUARDS: dict[str, dict[str, Any]] = {
+    "output_typing_per_char": {"label": "每字秒数", "min": 0.2, "max": 2.0, "hard": True,
+                               "why": "低于 0.2 秒等于关掉打字节奏（变成秒回）"},
+    "output_typing_max": {"label": "单条延迟上限(秒)", "min": 3, "max": 30, "hard": True,
+                          "why": "低于 3 秒等于关掉打字延迟（分段会立刻连发）"},
+    "gate_threshold": {"label": "触发阈值", "min": 1, "max": 100, "hard": True,
+                       "why": "高于 100 永远够不到 = 门控永久沉默"},
+    "gate_backoff_base": {"label": "退避起步(秒)", "min": 1, "max": 60, "hard": True,
+                          "why": "低于 1 秒等于退避失效（连发不再被拦）"},
+    "gate_backoff_max": {"label": "退避上限(秒)", "min": 15, "max": 600,
+                         "why": "上限要 ≥ 退避起步，否则起步值无处生效"},
+    "recall_keep_days": {"label": "撤回流水保留(天)", "min": 1, "max": 365, "hard": True,
+                         "why": "低于 1 天等于撤回档案当场删干净"},
+    "memory_capture_max_per_run": {"label": "单次总结上限(条)", "min": 1, "max": 20, "hard": True,
+                                   "why": "0 条等于记忆再也学不进去"},
+    "memory_capture_min_interval": {"label": "总结最小间隔(秒)", "min": 0, "max": 3600},
+    "forget_after_days": {"label": "遗忘周期(天)", "min": 1, "max": 365, "hard": True,
+                          "why": "低于 1 天等于归档就遗忘，记忆当场清空"},
+    "archive_after_days": {"label": "归档周期(天)", "min": 1, "max": 3650, "hard": True,
+                           "why": "低于 1 天等于一次 tick 归档全库（旧版无护栏，填 0/负数会当场扫空）"},
+    "forget_min_strength": {"label": "遗忘强度下限", "min": 0, "max": 1},
+    "forget_keep_poignancy": {"label": "情绪保护线", "min": 0, "max": 10},
+    "favour_daily_cap": {"label": "好感日上限", "min": 0, "max": 100},
+    "favour_daily_half_life_days": {"label": "好感半衰期(天)", "min": 0, "max": 60, "hard": True,
+                                    "why": "0 = 关闭衰减（合法）；负数会把好感算成指数增长"},
+    "output_expr_max_inject": {"label": "表达注入条数", "min": 0, "max": 10},
+    "output_typo_rate": {"label": "错字率", "min": 0, "max": 0.03},
+    # S5 黑话四洞之④：阈值/配额可调（拍-16/19）。R4 登记先行 —— 上页面之前先在护栏这里登记 min/max。
+    "jargon_candidate_min_sessions": {"label": "黑话候选·最少会话数", "min": 1, "max": 50},
+    "jargon_candidate_min_hits": {"label": "黑话候选·最少出现次数", "min": 1, "max": 500},
+    "jargon_infer_daily_batches": {"label": "黑话推断·每日批数", "min": 0, "max": 20,
+                                   "why": "0 = 关自动推断（候选仍照常记账；人工可随时改释义）"},
+    "jargon_try_daily_quota": {"label": "试解读·每日配额", "min": 0, "max": 500},
+    "proactive_quiet_start": {"label": "静默开始", "kind": "time",
+                              "why": "格式必须是 HH:MM（解析不出来 = 静默窗失效）"},
+    "proactive_quiet_end": {"label": "静默结束", "kind": "time",
+                            "why": "格式必须是 HH:MM（解析不出来 = 静默窗失效）"},
+    "proactive_note_hours": {"label": "主动知会回看(小时)", "min": 1, "max": 168},
+    "proactive_note_max": {"label": "主动知会最多几条", "min": 1, "max": 10},
+    # 自检补登记：这些数值键原先只有 schema 没有护栏，面板输入框没有上下界
+    "cross_session_ttl_min": {"label": "跨会话上下文(分钟)", "min": 0, "max": 1440},
+    "expression_auto_min_corpus": {"label": "自动提取语料阈值", "min": 0, "max": 200,
+                                   "why": "0 = 关闭自动提取（只留面板手动）"},
+    "expression_min_uses": {"label": "表达验证次数", "min": 1, "max": 50},
+    "gate_window_seconds": {"label": "门控统计窗口(秒)", "min": 5, "max": 600},
+    "memory_capture_turns": {"label": "每次总结轮数", "min": 1, "max": 50},
+    "memory_decay_half_life_days": {"label": "记忆半衰期(天)", "min": 1, "max": 3650},
+    "memory_evict_below": {"label": "记忆淘汰阈值", "min": 0, "max": 1},
+    "memory_inject_budget_tokens": {"label": "注入预算(tokens)", "min": 100, "max": 8000},
+    "memory_inject_top_k": {"label": "注入条数", "min": 1, "max": 50},
+    "proactive_context_memories": {"label": "主动参考记忆条数", "min": 0, "max": 20},
+    "proactive_daily_cap": {"label": "每日主动上限", "min": 0, "max": 50},
+    "proactive_idle_min": {"label": "主动静默时长(分钟)", "min": 0, "max": 1440},
+    "proactive_min_interval_min": {"label": "主动最小间隔(分钟)", "min": 1, "max": 1440},
+    "proactive_prompt_max_age_min": {"label": "提示词最长缓存(分钟)", "min": 1, "max": 1440},
+    "recall_weaken_factor": {"label": "撤回降权系数", "min": 0, "max": 1},
+}
+# 跨键关系校验：退避上限不得小于起步值（只带其中一个键时，另一个取库里的现值）。
+PARAM_GUARD_RELATIONS: tuple[dict[str, Any], ...] = (
+    {"keys": ("gate_backoff_max", "gate_backoff_base"), "hard": True},
+)
+# 门控改判的取值（行内两个按钮 + 撤销）→ 面板文案
+GATE_VERDICTS: dict[str, str] = {
+    "should_reply": "该回",
+    "correct": "判定正确",
+    "clear": "撤销改判",
+}
+
+# 学习诊断的跳过原因枚举（S4-4 / 拍-13：采用草案 7 值）。
+# size_capped = reserved：现行提取没有「批次超上限整批丢弃」这条，先占位（对齐 v8 示例行），
+# 一旦真加上限，写入侧直接用这个值，不必再改前端文案表。
+EXPR_SKIP_REASONS: tuple[str, ...] = (
+    "corpus_insufficient",   # 语料不足（还没攒到能学）
+    "all_duplicate",         # 这批全是学过的说法（合并了但没新增）
+    "model_error",           # 模型调用抛错
+    "model_unavailable",     # 模型通道不可用
+    "empty_parse",           # 模型输出解析出 0 条
+    "banned_filtered",       # 被「不再学」名单拦下
+    "size_capped",           # reserved：批次超上限整批丢弃（现行无此上限）
+)
+EXPR_SKIP_REASON_RESERVED: tuple[str, ...] = ("size_capped",)
+EXPR_SKIP_REASON_TEXT: dict[str, str] = {
+    "corpus_insufficient": "语料不够：群友/好友的原话还没攒够，先多聊几句",
+    "all_duplicate": "这批全是已经学过的说法，没有新东西可学",
+    "model_error": "模型调用失败（看「设置 · 模型分配」里的表达提取模型）",
+    "model_unavailable": "模型通道不可用：没有可用的表达提取模型",
+    "empty_parse": "模型没给出可用的表达（输出解析出 0 条）",
+    "banned_filtered": "学到的东西在「不再学」名单里，按你的选择跳过了",
+    "size_capped": "批次超过单次上限，整批丢弃（reserved，现行不会出现）",
+}
+
+
+def _skip_reason_enum() -> list[dict[str, Any]]:
+    """跳过原因枚举 → 面板（带人话与 reserved 标记）。"""
+    return [{"value": v, "reserved": v in EXPR_SKIP_REASON_RESERVED,
+             "text": EXPR_SKIP_REASON_TEXT.get(v, v)} for v in EXPR_SKIP_REASONS]
+
+
+# ---------------- S5 黑话：提示词与机械候选（拍-16/18/19） ----------------
+_ANN_NO = {"no", "否", "不是", "none", "n", "无", "普通词", "不是黑话"}
+
+# 含义推断（每日 ≤1 批，走「表达提取」离线槽位）：只产 pending，确认/否定全人工（洞③）。
+JARGON_INFER_PROMPT_HEAD = (
+    "你是「群内特殊用语」判别助手。下面是机器人从最近群聊里**机械统计**出的候选片段"
+    "（已按出现次数排序，括号里是出现次数与涉及会话数）。\n"
+    "请判断其中哪些是群友之间常用的特殊用语 / 黑话 / 梗，哪些只是普通词汇、语气词或人名。\n"
+    "硬性要求：\n"
+    "1. 每条候选输出一行，格式：候选词|简短释义（≤30 字）\n"
+    "2. 判断为「不是黑话」的写：候选词|no（普通词、语气词、人名、地名一律写 no）\n"
+    "3. 释义只写它在群里的实际含义；拿不准的一律写 no（宁缺勿滥）\n"
+    "4. 只输出上述行：不要解释、不要编号、不要 markdown、不要代码块\n\n【候选】\n"
+)
+
+# 试解读（拍-19：默认只手动触发；单次 ≤1 条短请求、输出 ≤200 tokens；硬约束 = 不进回复库）。
+JARGON_TRY_PROMPT = (
+    "你在帮主人核对「黑话理解」功能。下面是一句群聊里的话，以及机器人此前学到的词条释义。\n"
+    "请用一段人话说明「如果机器人在群里看到这句话，它会把这些词理解成什么」"
+    "——重点解释特殊用语的含义与语气。\n"
+    "硬性约束：\n"
+    "1. 只解读、不回复：不要写成对这句话的应答，也不要建议怎么回\n"
+    "2. 单次只输出一段解读，**上限 {cap} tokens**（约 150 字）；不要分点、不要 JSON、不要 markdown\n"
+    "3. 词条没覆盖到的部分，一句「其余是普通表达」带过\n\n"
+    "【这句话】\n{text}\n\n【学到的词条】\n{matched}\n"
+)
+
+
+def _jargon_scope_guess(session_ids: list[str], sample: dict[str, Any]) -> str:
+    """候选词条归属（拍-17 取值域）：只有单会话出处时才细化到群/人，跨会话一律全局。
+
+    单会话：群聊（session 形如 `平台:GroupMessage:群号`）→ '群·{gid}'；私聊 → '人·{uid}'。
+    """
+    uniq = sorted({str(s) for s in (session_ids or []) if str(s or "")})
+    if len(uniq) == 1:
+        sid = uniq[0]
+        if ":GroupMessage:" in sid:
+            return f"群·{sid.rsplit(':', 1)[-1]}"
+        uid = str((sample or {}).get("user_id") or "").strip()
+        return f"人·{uid}" if uid else "全局"
+    return "全局"
+
+
+_JARGON_NGRAM_MAX = 8   # 机械候选最长的连续子串（再长就是句子，不是词）
+
+
+def _mine_jargon_candidates(
+    rows: list[dict[str, Any]], *, min_sessions: int = 2, min_hits: int = 4,
+    exclude_terms: set[str] | None = None, name_terms: set[str] | None = None,
+    cap: int = JARGON_CANDIDATE_BATCH,
+) -> list[dict[str, Any]]:
+    """机械候选（拍-16 门槛 = 跨 ≥min_sessions 会话、出现 ≥min_hits 次）。
+
+    机制（不引分词器，纯机械、可解释）：
+      · 每条入站语料按「连续词字符」切段：ASCII 段整段算一个词；CJK 段取 2–8 字连续子串；
+      · 纯数字段跳过（防电话号 / QQ 号噪声），单字不入候选；
+      · **可延长片段剔除**：若某个候选总出现在一个更长的同样次数的片段里（例如整句被原样复读时
+        切出来的窗口），它就不是独立的词 —— 直接丢，少送噪声给模型；
+      · 同理：命中的短片段若与某个更长候选出现次数完全相同且被其包含 → 只留长的。
+    人名过滤（洞②）：过滤开时，与已知昵称 / 群名（hf_person_names）相同的候选直接丢弃。
+    """
+    word_re = re.compile(r"\w+")
+    excl = {str(x).strip().lower() for x in (exclude_terms or set()) if str(x).strip()}
+    names = {str(x).strip().lower() for x in (name_terms or set()) if str(x).strip()}
+    cnt: dict[str, int] = {}
+    sess: dict[str, set[str]] = {}
+    samples: dict[str, list[dict[str, Any]]] = {}
+    run_cnt: dict[str, int] = {}
+    all_runs: list[str] = []
+    for r in rows or []:
+        text = str(r.get("text") or "")
+        if not text:
+            continue
+        sid = str(r.get("session_id") or "")
+        snap = {"text": text, "ts": float(r.get("ts") or 0), "session_id": sid,
+                "user_id": str(r.get("user_id") or ""), "user_name": str(r.get("user_name") or "")}
+        for seg in word_re.findall(text):
+            if seg.isdigit():
+                continue                                  # 纯数字（号/编号/验证码）不当候选
+            if seg.isascii():
+                if 2 <= len(seg) <= 24:
+                    cnt[seg.lower()] = cnt.get(seg.lower(), 0) + 1
+                    sess.setdefault(seg.lower(), set()).add(sid)
+                    smp = samples.setdefault(seg.lower(), [])
+                    if len(smp) < 3:
+                        smp.append(snap)
+                continue
+            run = seg
+            if len(run) > _JARGON_NGRAM_MAX:
+                run_cnt[run] = run_cnt.get(run, 0) + 1
+                if len(all_runs) < 2000:
+                    all_runs.append(run)
+            for n in range(2, _JARGON_NGRAM_MAX + 1):
+                if n > len(run):
+                    break
+                for i in range(0, len(run) - n + 1):
+                    t = run[i:i + n]
+                    cnt[t] = cnt.get(t, 0) + 1
+                    sess.setdefault(t, set()).add(sid)
+                    smp = samples.setdefault(t, [])
+                    if len(smp) < 3:
+                        smp.append(snap)
+
+    def _is_extendable(t: str) -> bool:
+        """该片段是否总被一个「同样次数、更长」的片段包着（= 不是独立词）。样本内近似判定。"""
+        c_t = cnt.get(t, 0)
+        for snap in samples.get(t) or []:
+            body = str(snap.get("text") or "")
+            start = body.find(t)
+            while start >= 0:
+                for L in range(len(t) + 1, _JARGON_NGRAM_MAX + 1):
+                    for off in range(0, L - len(t) + 1):
+                        s2 = start - off
+                        if s2 < 0 or s2 + L > len(body):
+                            continue
+                        u = body[s2:s2 + L]
+                        if u != t and t in u and cnt.get(u, 0) == c_t:
+                            return True
+                start = body.find(t, start + 1)
+        # 整段被原样复读时（长于 n-gram 上限的句子）：该片段被更长整段包着的也要丢
+        for run in all_runs:
+            if len(run) > len(t) and t in run and run_cnt.get(run, 0) == c_t:
+                return True
+        return False
+
+    out: list[dict[str, Any]] = []
+    for term, n in cnt.items():
+        if n < max(1, int(min_hits)) or len(sess.get(term, ())) < max(1, int(min_sessions)):
+            continue
+        if len(term) < 2 or term.isdigit():
+            continue
+        low = term.lower()
+        if low in excl or low in names:                   # 洞②：人名/群名过滤（接上的能力）
+            continue
+        if _is_extendable(term):
+            continue
+        out.append({"term": term, "hits": n, "sessions": len(sess[term]),
+                    "session_ids": sorted(sess[term])[:10], "samples": samples[term]})
+    # 再去重：短片段是某个更长候选的子串、且两者次数完全相同 → 丢短的（留「整词」）
+    out.sort(key=lambda c: (-len(c["term"]), -c["hits"]))
+    kept: list[dict[str, Any]] = []
+    for c in out:
+        if any((c["term"] in k["term"]) and k["hits"] == c["hits"] and k["term"] != c["term"] for k in kept):
+            continue
+        kept.append(c)
+    kept.sort(key=lambda c: (-c["hits"], -c["sessions"], -len(c["term"]), c["term"]))
+    picked = kept[: max(1, int(cap))]
+    for c in picked:
+        c["scope"] = _jargon_scope_guess(c.get("session_ids") or [], (c.get("samples") or [{}])[0])
+    return picked
+
+
+def _as_bool(v: Any) -> bool:
+    """宽松布尔：面板来的 checkbox 是 bool，配置库里也可能存成 "true"/1 —— 只有明确的真才算真。"""
+    if isinstance(v, bool):
+        return v
+    return str(v if v is not None else "").strip().lower() in ("1", "true", "yes", "on")
+
+_HM_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
+
+
+def _hm_to_minutes(v: Any) -> int | None:
+    """HH:MM → 当天分钟数（H:MM 也认；与主动静默窗的解析口径一致）。认不出来给 None。"""
+    m = _HM_RE.match(str(v if v is not None else "").strip())
+    if not m:
+        return None
+    h, mi = int(m.group(1)), int(m.group(2))
+    return h * 60 + mi if 0 <= h < 24 and 0 <= mi < 60 else None
+
+
+def _as_number(v: Any) -> float | None:
+    """参数值 → float；bool / None / 非数字都不算（面板手滑清空输入框会送来空串）。"""
+    if isinstance(v, bool) or v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if f == f and f not in (float("inf"), float("-inf")) else None
+
+
+def _num_text(v: Any) -> str:
+    """给人看的数字：去掉多余的 .0。"""
+    f = _as_number(v)
+    if f is None:
+        return str(v)
+    return str(int(f)) if f == int(f) else str(f)
+
+
+def validate_config_patch(patch: dict[str, Any] | None, current: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """保存前护栏校验：返回违规清单（空列表 = 全部通过）。纯函数，不改任何状态。
+
+    current = 当前生效配置，用于跨键关系校验（本次没带的键按现值算）。
+    """
+    patch = patch or {}
+    cur = current or {}
+    out: list[dict[str, Any]] = []
+    for key in patch:
+        rule = PARAM_GUARDS.get(key)
+        if not rule:
+            continue
+        value = patch[key]
+        label = str(rule.get("label") or key)
+        if rule.get("kind") == "time":
+            if _hm_to_minutes(value) is None:
+                out.append({"key": key, "label": label, "value": value, "hard": False,
+                            "reason": f"{label}（{key}）只接受 HH:MM 格式，收到 {value!r}；{rule.get('why', '')}"})
+            continue
+        num = _as_number(value)
+        if num is None:
+            out.append({"key": key, "label": label, "value": value, "hard": bool(rule.get("hard")),
+                        "reason": f"{label}（{key}）需要一个数字，收到 {value!r}"})
+            continue
+        lo, hi = rule.get("min"), rule.get("max")
+        if (lo is not None and num < float(lo)) or (hi is not None and num > float(hi)):
+            why = str(rule.get("why") or "").strip()
+            out.append({
+                "key": key, "label": label, "value": value, "min": lo, "max": hi,
+                "hard": bool(rule.get("hard")),
+                "reason": f"{label}（{key}）的允许范围是 {_num_text(lo)}–{_num_text(hi)}，收到 {_num_text(num)}"
+                          + (f"；{why}" if why else ""),
+            })
+    # 跨键关系校验放在范围校验之后：同一个键已经因为范围/格式被拦过，就不再重复报一条
+    # （面板 toast 只给前几条，重复条目会把真正的原因挤掉）。
+    flagged = {str(v.get("key") or "") for v in out}
+    for rel in PARAM_GUARD_RELATIONS:
+        hi_key, lo_key = rel["keys"]
+        if hi_key not in patch and lo_key not in patch:
+            continue
+        if hi_key in flagged:
+            continue
+        hi_v = _as_number(patch.get(hi_key, cur.get(hi_key)))
+        lo_v = _as_number(patch.get(lo_key, cur.get(lo_key)))
+        if hi_v is None or lo_v is None or hi_v >= lo_v:
+            continue
+        out.append({
+            "key": hi_key, "label": str(PARAM_GUARDS[hi_key].get("label") or hi_key), "value": hi_v,
+            "min": lo_v, "max": PARAM_GUARDS[hi_key].get("max"), "hard": bool(rel.get("hard")),
+            "reason": f"{PARAM_GUARDS[hi_key]['label']}（{_num_text(hi_v)}）小于 {lo_key}（{_num_text(lo_v)}）："
+                      f"退避上限必须 ≥ 起步值，否则起步值无处生效",
+        })
+    return out
+
+
+def guard_reject_message(violations: list[dict[str, Any]]) -> str:
+    """违规清单 → 面板可见的一句话（写着哪几个键、为什么）。"""
+    if not violations:
+        return ""
+    parts = [str(v.get("reason") or v.get("key") or "") for v in violations[:4]]
+    if len(violations) > 4:
+        parts.append(f"等共 {len(violations)} 项")
+    return "参数被护栏拦下（本批一个字都没写入）：" + "；".join(parts)
+
+
+def guards_payload() -> dict[str, Any]:
+    """护栏清单（面板据此设输入框上下界、标「已拦下」）—— 后端是唯一真源。"""
+    return {
+        "keys": {k: dict(v) for k, v in PARAM_GUARDS.items()},
+        "relations": [{"keys": list(r["keys"]), "hard": bool(r.get("hard"))} for r in PARAM_GUARD_RELATIONS],
+        "hard_count": sum(1 for v in PARAM_GUARDS.values() if v.get("hard")),
+    }
+
+
 ZONE_TEXT = {
     "DEVOTED": "可以撒娇、可以主动、可以占话题",
     "CLOSE": "可以亲昵、可以未 @ 接话、能开玩笑、深夜也秒回",
@@ -388,14 +802,87 @@ PersonaProvider = Callable[..., Awaitable[Any]]
 
 
 # 各域面板只暴露引擎真正读取的配置键（避免出现假开关）
+CONFIG_REMOVED_KEYS = frozenset({
+    # 已删除的键：自检/补登记永远不要再把它们复活
+    "proactive_memory_cooldown_hours", "proactive_exclude_relational",
+    "proactive_memory_types", "proactive_min_chars", "proactive_retry_invalid",
+    "proactive_require_full_prompt", "proactive_dedup_enabled",
+    "proactive_dedup_hours", "proactive_dedup_threshold",
+    "proactive_dedup_semantic", "proactive_dedup_semantic_threshold",
+    "proactive_lists_enabled",
+})
+
+CONFIG_INTERNAL_KEYS = frozenset({
+    # 运行时状态：不面向用户，不进 schema / 面板
+    "config_version", "graph_ui", "import_layers", "proactive_plan",
+    "persona_last_evolve_at", "persona_last_save_at",
+    "jargon_infer_day", "jargon_infer_day_count",
+    "jargon_try_day", "jargon_try_day_count",
+})
+
+
+def _is_internal_config_key(key: str) -> bool:
+    """运行时状态键（不要求 schema / 面板 / 护栏登记）。"""
+    k = str(key or "")
+    if k in CONFIG_INTERNAL_KEYS:
+        return True
+    return bool(re.search(r"(?:_day|_day_count)$", k))
+
+
+# 只在 AstrBot 原生配置页暴露、刻意不放进面板「参数」页的键。
+# 新增键如果不在这个集合里，自检会按前缀自动补进面板域（防「加了键但面板看不见」）。
+CONFIG_NATIVE_ONLY_KEYS = frozenset({
+    "archive_after_days", "auto_import_external",
+    "burst_merge_enabled", "burst_merge_group", "burst_merge_window",
+    "evolve_auto", "evolve_min_hours", "evolve_min_memories",
+    "evolve_pending_ttl_hours", "evolve_require_confirm", "evolve_scope",
+    "forget_after_days", "forget_batch_per_tick", "forget_enabled",
+    "forget_keep_poignancy", "forget_min_strength",
+    "memory_persona_isolated",
+    "model_embedding", "model_expression_extract", "model_forget",
+    "model_memory_summary", "model_person_profile", "model_persona_evolve", "model_rerank",
+    "output_enabled", "output_typo_mode",
+    "profile_auto", "profile_batch_per_tick", "profile_min_memories", "profile_refresh_hours",
+    "sticker_slot",
+    "sys_prompt_expression_extract", "sys_prompt_forget", "sys_prompt_group_profile",
+    "sys_prompt_memory_summary", "sys_prompt_person_profile", "sys_prompt_persona_evolve",
+    "vision_enabled", "vision_max_images", "voice_slot",
+})
+
+# 新键按前缀自动归域（只用于自检补登记，不影响已有原生专属键）
+CONFIG_PANEL_PREFIXES = (
+    ("proactive_", "proactive"),
+    ("memory_", "memory"),
+    ("output_", "output"),
+    ("recall_", "recall"),
+    ("favour_", "favour"),
+    ("gate_", "gate"),
+    ("expression_", "expression"),
+    ("jargon_", "expression"),
+    ("persona_", "persona"),
+)
+
+
+def _domain_for_key(key: str) -> str:
+    for prefix, domain in CONFIG_PANEL_PREFIXES:
+        if str(key).startswith(prefix):
+            return domain
+    return ""
+
+
 CONFIG_DOMAINS: dict[str, list[str]] = {
-    "gate": ["gate_enabled", "gate_shadow", "gate_threshold", "gate_window_seconds"],
+    "gate": ["gate_enabled", "gate_shadow", "gate_threshold", "gate_window_seconds",
+             "gate_backoff_base", "gate_backoff_max"],
     "memory": ["memory_summary_prompt", "memory_inject_enabled", "memory_inject_top_k", "memory_inject_budget_tokens",
                "memory_decay_half_life_days", "memory_evict_below",
                "memory_capture_enabled", "memory_capture_turns",
                "memory_capture_min_interval", "memory_capture_max_per_run",
                "cross_session_enabled", "cross_session_ttl_min", "cross_session_memory"],
-    "expression": ["expression_enabled", "expression_min_uses"],
+    "expression": ["expression_enabled", "expression_min_uses", "expression_auto_min_corpus",
+                   "output_expr_max_inject", "expression_review_first",
+                   # S5 黑话（同一「语言学习」页的块② 与同域参数；阈值/配额拍-16/19 可调）
+                   "jargon_enabled", "jargon_name_filter", "jargon_candidate_min_sessions",
+                   "jargon_candidate_min_hits", "jargon_infer_daily_batches", "jargon_try_daily_quota"],
     "favour": ["favour_enabled", "favour_settle_mode", "favour_daily_cap", "favour_daily_half_life_days", "favour_tag_required"],
     "recall": ["recall_handling", "recall_weaken_factor", "recall_keep_days", "recall_withdraw_reply",
                "recall_interrupt_reply",
@@ -403,11 +890,15 @@ CONFIG_DOMAINS: dict[str, list[str]] = {
     "proactive": ["proactive_enabled", "proactive_shadow", "proactive_idle_min", "proactive_daily_cap",
                   "proactive_min_interval_min", "proactive_quiet_start", "proactive_quiet_end",
                   "proactive_min_zone", "proactive_last_only", "proactive_style",
+                  "proactive_instruction", "proactive_prompt_max_age_min",
                   "proactive_mode_group", "proactive_mode_private",
                   "proactive_auto_wl", "proactive_wl_private",
                   "proactive_bl_private", "proactive_wl_group", "proactive_bl_group",
-                  "proactive_use_persona", "proactive_context_memories"],
-    "output": ["output_split_messages", "output_typing_delay", "output_typing_per_char", "output_typing_max", ],
+                  "proactive_use_persona", "proactive_context_memories",
+                  "proactive_writeback", "proactive_note_enabled",
+                  "proactive_note_hours", "proactive_note_max"],
+    "output": ["output_split_messages", "output_typing_delay", "output_typing_per_char", "output_typing_max",
+               "output_typo_rate"],
     "persona": ["persona_active_id"],
     "contacts": ["conn_mode_group", "conn_black_group", "conn_white_group",
                  "track_platforms", "person_exclude_platforms",
@@ -416,6 +907,24 @@ CONFIG_DOMAINS: dict[str, list[str]] = {
     "master": ["master_switch", "session_context_enabled"],
 }
 ZONE_RANK = {"HOSTILE": 0, "COLD": 1, "NEUTRAL": 2, "FAMILIAR": 3, "CLOSE": 4, "DEVOTED": 5}
+
+# ---- 主动消息「第 2 层」提示词（本轮情境）----
+# 用户可以在面板「主动 → 参数」页底部展开自定义（配置键 proactive_instruction，留空 = 用这份内置）。
+# 支持占位符：{zone}=关系区间 / {tone}=语气线 / {idle}=距对方上次说话的分钟数。
+# 改动这里 = 改所有人开箱默认；用户自定义优先。
+PROACTIVE_LAYER2_TEMPLATE = chr(10).join([
+    "【本轮情境】你要主动给对方发一条消息，不是回复某条消息。",
+    "关系：{zone} · 语气：{tone} · 距对方上次说话：{idle}。",
+    "可以是一句问候、一件你刚想到的事、一个回忆、一个提问，也可以分成两三条发（空行分段）。",
+    "用你平时说话的方式；想写动作就写在括号里；不要解释你为什么突然开口，也不要提到“记忆”这两个字。",
+    "真的不想说，就只输出 [沉默]。",
+])
+# 主动开口注入记忆块时追加的提醒：防「旧事当新闻」「对方的事说成你的事」「偏好被当指令」。
+PROACTIVE_MEM_NOTE = (
+    "（这些是你的长期记忆，方括号里是大约多久以前。记忆里的「TA/对方」= 现在这个对话对象，"
+    "「我」= 你自己；按这个对应理解，别反过来。用不用、怎么用你看着办；"
+    "引用时用自己的话，不要整句照抄。）"
+)
 
 # ---------------- 原生白名单快照（名单/可见性统一来源） ----------------
 _NATIVE_SYS: dict[str, Any] = {"provider": None}
@@ -467,6 +976,72 @@ def contact_ids(contacts: Any) -> list[str]:
     return out
 
 
+# 原生白名单 id 匹配（裸号 / 完整会话 id 两种写法都认）
+def _native_id_match(ident: str, platform: str, kind: str, ids: list[str] | set[str]) -> bool:
+    """原生白名单匹配：既认裸号，也认 `平台:GroupMessage:号` / `平台:FriendMessage:号`。
+
+    用户按 AstrBot `/sid` 提示填的是完整会话 id，旧实现只拿裸号比，会把整个群误判成
+    「不在原生白名单里」——消息在入口就被丢掉，面板还看不到这个群。
+    """
+    ident = str(ident or "").strip()
+    if not ident:
+        return False
+    cands = {ident}
+    plat = str(platform or "").strip()
+    if plat:
+        mtype = "GroupMessage" if kind == "group" else "FriendMessage"
+        cands.add(f"{plat}:{mtype}:{ident}")
+    for raw in ids or []:
+        s = str(raw or "").strip()
+        if not s:
+            continue
+        if s in cands:
+            return True
+        # 完整会话 id 的尾段就是裸号；反向也认（名单里可能只存了裸号）
+        if ":" in s and s.rsplit(":", 1)[-1] == ident:
+            return True
+        if ":" in ident and ident.rsplit(":", 1)[-1] == s:
+            return True
+    return False
+
+
+# 名单归一化：旧库可能把列表存成逗号字符串
+def _as_id_list(value: Any) -> list[str]:
+    """把配置里的名单统一成 list[str]：兼容旧库把列表存成 '123,456' 字符串。"""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [x for x in re.split(r"[,，\s]+", value.strip()) if x]
+    if isinstance(value, (list, tuple, set)):
+        out: list[str] = []
+        for x in value:
+            s = str(x).strip()
+            if s and s not in out:
+                out.append(s)
+        return out
+    return [str(value).strip()] if str(value).strip() else []
+
+
+def _cfg_num(cfg: dict[str, Any], key: str, default: float, *, as_int: bool = False) -> float:
+    """读配置数字：空/非法值回退默认，不让一次脏配置把整条主动链路炸掉。"""
+    v = cfg.get(key)
+    if v is None or (isinstance(v, str) and not v.strip()):
+        return default
+    try:
+        return int(float(v)) if as_int else float(v)
+    except (TypeError, ValueError):
+        logger.warning(f"[StarHeart] 配置 {key}={v!r} 不是数字，按默认 {default} 处理")
+        return default
+
+
+def _cfg_int(cfg: dict[str, Any], key: str, default: int) -> int:
+    return int(_cfg_num(cfg, key, float(default), as_int=True))
+
+
+def _cfg_float(cfg: dict[str, Any], key: str, default: float) -> float:
+    return float(_cfg_num(cfg, key, float(default)))
+
+
 # 联系人结构体的键名：它们**不是**会话 id，任何写名单的路径都不该收
 CONTACT_SHAPE_KEYS = {
     "platforms", "groups", "friends", "admins", "bots", "errors",
@@ -510,11 +1085,12 @@ class StarHeartService:
         matched = 0
         action = "log_only"
         if ref:
-            hits = await self.store.memories_by_source_ref(ref)
+            hits = await self.store.memories_by_source_ref(ref, str(info.get("session_id") or ""))
             ids = [h["id"] for h in hits]
             if ids and mode == "weaken":
+                weaken_cfg = cfg.get("recall_weaken_factor")
                 matched = await self.store.mark_memories_stale(
-                    ids, float(cfg.get("recall_weaken_factor") or 0.3)
+                    ids, 0.3 if weaken_cfg is None else float(weaken_cfg)
                 )
                 action = "weaken_memories"
             elif ids and mode == "archive":      # 注意：上面已把旧值 delete 归一成 archive，
@@ -590,11 +1166,12 @@ class StarHeartService:
         控制台，而白名单是按 QQ 号/群号组织的（里面根本没有它的账户名，面板也选不出来）。
         ChatUI 进不进插件由平台级开关 person_exclude_platforms 决定（见 main._is_trackable_session）。
 
-        **判定来源 = AstrBot 原生白名单**（平台配置 → 白名单），插件只做筛选、不另存第二份。
+        判定来源：群聊只读尊重 AstrBot 原生白名单；私聊只看插件本地名单。
         原生语义：**未启用 / 名单为空 = 全部放行（等于不触发）**；启用且非空 = 仅名单内可见。
+        本地名单永远优先：黑名单内直接不可见；白名单为空 = 谁都不回（fail-closed）。
 
-        黑名单：名单内 → 不存在；
-        白名单：名单外 → 不存在（名单为空 = 谁都不存在，宁可让用户先明确授权）；
+        黑名单：名单内 → 不存在（不论当前是 black 还是 white 模式）；
+        白名单：名单外 → 不存在（名单为空 = 谁都不回，fail-closed）；
         off：全都存在。
         """
         if kind not in ("group", "private"):
@@ -603,45 +1180,50 @@ class StarHeartService:
             return True, ""
         if str(platform or "").strip().lower() == "webchat":
             return True, "webchat（ChatUI 控制台）不受名单约束"
+        mode = str(cfg.get(f"conn_mode_{kind}") or "black").lower()
+        if mode not in ("black", "white"):
+            mode = "black"
+        # 黑名单永远优先：切到 white 模式也不该把曾经拉黑的人放出来
+        black_ids = _as_id_list(cfg.get(cls._conn_keys(kind, "black")))
+        if ident in black_ids:
+            return False, "在可见性黑名单里"
+        ids = _as_id_list(cfg.get(cls._conn_keys(kind, mode)))
+        # 本地白名单为空 = 谁都不回：这条要压过原生白名单（用户在本插件里的显式选择）
+        if mode == "white" and not ids:
+            return False, "可见性白名单为空（谁都不回）"
         nat = _native_vis()
-        if nat is not None:
+        # 只有群聊用原生白名单：原生名单是「群号+QQ 号」一份平表，
+        # 私聊若也套它，只填了群号时会把所有私聊判成名单外。私聊一律走本地名单。
+        if nat is not None and kind == "group":
             if not nat["enable"] or not nat["ids"]:
                 return True, "原生白名单未启用/为空（全部放行）"
-            if str(ident) in set(nat["ids"]):
+            if _native_id_match(ident, platform, kind, nat["ids"]):
                 return True, "在原生白名单里"
             return False, "不在原生白名单里"
-        # ↓↓ 以下为桥不可用时的退回逻辑（与旧行为完全一致，不放大权限）
-        # 只有黑名单/白名单两种模式；历史值 "off" 归一成白名单（与面板一致，
-        # 否则界面显示白名单、后端却按「全部可见」放行，说的和做的不一样）
-        mode = str(cfg.get(f"conn_mode_{kind}") or "white").lower()
-        if mode not in ("black", "white"):
-            mode = "white"
-        ids = [str(x) for x in (cfg.get(cls._conn_keys(kind, mode)) or [])]
-        if not ident:
-            return True, ""
-        if mode == "black":
+        # 原生桥不可用：按本地名单退回
+        if mode == "white":
+            if not ids:
+                return False, "可见性白名单为空（谁都不回）"
             if ident in ids:
-                return False, "在可见性黑名单里"
-            return True, ""
-        if ident in ids:
-            return True, ""
-        return False, ("可见性白名单为空（谁都不回）" if not ids else "不在可见性白名单里")
+                return True, ""
+            return False, "不在可见性白名单里"
+        return True, ""
 
     async def contact_filter(self) -> dict[str, Any]:
         """基础名单现状：模式 + 两份名单 + 每个平台联系人的「可见/不可见」判定。"""
         cfg = await self.config()
         out: dict[str, Any] = {"modes": {}, "black": {}, "white": {}, "counts": {}, "hidden": {}}
         for kind in ("group", "private"):
-            mode = str(cfg.get(f"conn_mode_{kind}") or "white").lower()
+            mode = str(cfg.get(f"conn_mode_{kind}") or "black").lower()
             if mode not in ("black", "white"):
-                mode = "white"
-            black = [str(x) for x in (cfg.get(self._conn_keys(kind, "black")) or [])]
-            white = [str(x) for x in (cfg.get(self._conn_keys(kind, "white")) or [])]
+                mode = "black"
+            black = _as_id_list(cfg.get(self._conn_keys(kind, "black")))
+            white = _as_id_list(cfg.get(self._conn_keys(kind, "white")))
             out["modes"][kind] = mode
             out["black"][kind] = black
             out["white"][kind] = white
             out["counts"][kind] = {"black": len(black), "white": len(white)}
-            # 白名单为空 = 谁都看不到：面板要能一眼看见这个「静默」状态
+            # 白名单为空 = 谁都不回：面板要能一眼看见这个「静默」状态
             out.setdefault("silent", {})[kind] = bool(mode == "white" and not white)
         try:
             hidden = await self.store.hidden_contacts()
@@ -671,10 +1253,15 @@ class StarHeartService:
         return out
 
     async def set_contact_filter(self, kind: str, mode: str, ids: list[str]) -> dict[str, Any]:
-        """整表写入某一边的名单（面板就是「多选 → 确定」这一步）。"""
+        """整表写入某一边的名单（面板就是「多选 → 确定」这一步）。
+
+        只写插件本地：AstrBot 原生白名单是全局的（群号 + QQ 号共用一份，还会
+        影响其他插件与私聊），从面板替用户改它太容易把别的会话一起挡掉。
+        原生名单仍会被只读尊重（visible 里对群聊生效），但插件不再写它。
+        """
         if kind not in ("group", "private"):
             raise ValueError(f"unknown kind: {kind}")
-        mode = str(mode or "white").lower()
+        mode = str(mode or "black").lower()
         if mode not in ("black", "white"):
             raise ValueError(f"unknown mode: {mode}")
         clean: list[str] = []
@@ -691,60 +1278,15 @@ class StarHeartService:
         if _junk:
             logger.warning(
                 f"[StarHeart] 名单里混进了联系人结构体键名，已丢弃：{', '.join(_junk)}"
-                "（0.50.1 及更早版本黑名单写回的 bug；原生白名单里若残留，删掉即可）"
             )
+        if mode == "white" and not clean:
+            # fail-closed 之后「白名单+空」= 该类全局静默；这不该由一次误点写入。
+            raise ValueError("可见性白名单不能为空；想静音请用「不主动」或关掉总开关")
         await self.store.set_config(f"conn_mode_{kind}", mode)
-        # ★ 原生白名单是「群号 + 用户号」共用一份列表：保存前先取回本类（kind）的旧条目，
-        #   写回时只替换本类的、其他类原样保留 —— 否则保存私聊会把群聊名单整表冲掉。
-        _prev_cur: list[str] = []
-        for _m in ("white", "black"):
-            try:
-                _old = await self.store.get_config(self._conn_keys(kind, _m), []) or []
-                _prev_cur += [str(x) for x in _old]
-            except Exception:                                  # noqa: BLE001
-                pass
         await self.store.set_config(self._conn_keys(kind, mode), clean)
-        # ★ 名单统一写 AstrBot 原生那份（platform_settings.enable_id_white_list / id_whitelist）：
-        #   白名单卡 = 勾选者直接进白名单；黑名单卡 = 勾选者**不进**白名单、其余全部进（= 选中者被挡）。
-        #   插件只做筛选入口、不再自留第二份真相；写失败只记日志，本地兼容数据照旧保留。
-        fn = self.system.get("native_visibility_write")
-        if callable(fn):
-            try:
-                native_now = []
-                rfn = self.system.get("native_visibility_read")
-                if callable(rfn):
-                    native_now = [str(x) for x in ((rfn() or {}).get("ids") or [])]
-                if mode == "black":
-                    # 黑名单 = 从原生列表里「剔除」勾选者；没勾选的原样保留（不重建、更不清空）。
-                    # 例：之前「群聊白名单全选」存过一批，现在在黑名单卡勾它 → 就从名单里删掉。
-                    native_ids = list(native_now)
-                    for _x in _prev_cur:
-                        if _x not in native_ids:
-                            native_ids.append(_x)
-                    try:
-                        cfn = self.system.get("contacts")
-                        allc = await cfn() if callable(cfn) else {}
-                        # contacts() 是 dict，必须摊平（曾经直接迭代 dict → 9 个键名被写进原生白名单）
-                        for _id in contact_ids(allc):
-                            if _id and _id not in native_ids:
-                                native_ids.append(_id)
-                    except Exception as exc:                        # noqa: BLE001
-                        logger.warning(f"[StarHeart] 黑名单取联系人失败（不影响剔除，名单不会被清空）：{exc}")
-                    native_ids = [x for x in native_ids if x not in set(clean)]
-                else:
-                    # 白名单 = 勾选者进名单；只替换本类旧条目，其他类（另一种 kind）原样保留。
-                    native_ids = [x for x in native_now if x not in set(_prev_cur)]
-                    native_ids += [x for x in clean if x not in set(native_ids)]
-                logger.info(f"[StarHeart] 原生白名单写回：mode={mode} kind={kind} 本类旧={len(_prev_cur)} 勾选={len(clean)} 原生旧={len(native_now)} 合计={len(native_ids)}")
-                r = await fn(True, native_ids)
-                logger.info(f"[StarHeart] 名单已写原生白名单：mode={mode} kind={kind} 勾选={len(clean)} 原生={len(native_ids)} ok={bool((r or {}).get('ok'))}")
-            except Exception as exc:                                # noqa: BLE001
-                logger.warning(f"[StarHeart] 写原生白名单失败（本地记录已保留）：{exc}")
-        await self.store.audit(f"contacts.set_{kind}_{mode}", f"{len(clean)} 项")
-        # 原实现是一句 `self.store.invalidate_config() if hasattr(...) else None`：
-        # storage 里从来没有 invalidate_config 这个方法 → hasattr 恒假 → 死代码。
-        # 配置缓存失效有真实入口（set_config 内部自己刷新），这里不需要也别留假调用。
+        await self.store.audit(f"contacts.set_{kind}_{mode}", f"{len(clean)} 项（本地）")
         return await self.contact_filter()
+
 
     def _list_key(self, kind: str, mode: str) -> str:
         return f"proactive_{'wl' if mode == 'allow' else 'bl'}_{'group' if kind == 'group' else 'private'}"
@@ -767,19 +1309,31 @@ class StarHeartService:
 
     @staticmethod
     def proactive_mode(cfg: dict[str, Any], kind: str) -> str:
-        """主动名单模式：white（只对名单内主动，默认）/ black（只对名单内不主动）。"""
+        """主动名单模式：white（只对名单内主动）/ black（只对名单内不主动）/ off（不主动）。"""
         k = "group" if kind == "group" else "private"
-        mode = str(cfg.get(f"proactive_mode_{k}") or "").lower()
-        if mode in ("black", "white"):
+        mode = str(cfg.get(f"proactive_mode_{k}") or "black").lower()
+        if mode in ("black", "white", "off"):
             return mode
-        # 老配置迁移：以前是「全局白名单开关 + 两份名单」，
-        # 若当时关了白名单且填过拦截名单，语义等于「黑名单模式」，别让它一夜之间全禁。
-        if cfg.get("proactive_lists_enabled") is False and (cfg.get(f"proactive_bl_{k}") or []):
-            return "black"
-        return "white"
+        return "black"
 
-    async def _whitelist_sessions(self, cfg: dict[str, Any]) -> list[dict[str, Any]]:
-        """白名单里显式点过的会话（哪怕没聊过）也纳入候选——否则名单没意义。"""
+    @classmethod
+    def _proactive_rule_tables(cls, cfg: dict[str, Any]) -> dict[str, Any]:
+        """扫描用的轻量名单（纯配置，不打平台接口）。"""
+        return {
+            "modes": {k: cls.proactive_mode(cfg, k) for k in ("group", "private")},
+            "wl_private": _as_id_list(cfg.get("proactive_wl_private")),
+            "bl_private": _as_id_list(cfg.get("proactive_bl_private")),
+            "wl_group": _as_id_list(cfg.get("proactive_wl_group")),
+            "bl_group": _as_id_list(cfg.get("proactive_bl_group")),
+        }
+
+    async def _whitelist_sessions(self, cfg: dict[str, Any],
+                                  sessions: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+        """白名单里显式点过的会话（哪怕没聊过）也纳入候选——否则名单没意义。
+
+        sessions：baseline 里的真实会话，用来推断每个群/人属于哪个 OneBot 实例；
+        多实例时不能拿 bots[0] 的 platform 硬拼，否则会发到错误实例。
+        """
         if self.proactive_mode(cfg, "group") != "white" and self.proactive_mode(cfg, "private") != "white":
             return []
         platform = ""
@@ -793,17 +1347,26 @@ class StarHeartService:
         except Exception:
             platform = ""
         platform = platform or "aiocqhttp"
+        prefix_by_id: dict[str, str] = {}
+        for _s in sessions or []:
+            _sid = str(_s.get("session_id") or "")
+            if not _sid:
+                continue
+            _k, _ident = self.session_kind(_sid)
+            if _ident:
+                prefix_by_id.setdefault(f"{_k}:{_ident}", _sid.split(":", 1)[0])
         out: list[dict[str, Any]] = []
         for kind, key in (("group", "proactive_wl_group"), ("private", "proactive_wl_private")):
             if self.proactive_mode(cfg, kind) != "white":
                 continue
-            for ident in (cfg.get(key) or []):
+            for ident in _as_id_list(cfg.get(key)):
                 ident = str(ident).strip()
                 if not ident:
                     continue
                 mtype = "GroupMessage" if kind == "group" else "FriendMessage"
+                _plat = prefix_by_id.get(f"{kind}:{ident}") or platform
                 out.append({
-                    "session_id": f"{platform}:{mtype}:{ident}",
+                    "session_id": f"{_plat}:{mtype}:{ident}",
                     "user_id": "" if kind == "group" else ident,
                     "last_user_ts": 0.0, "msgs": 0, "sent_today": 0, "last_proactive_ts": 0.0,
                     "from_whitelist": True,
@@ -842,14 +1405,14 @@ class StarHeartService:
         cfg = await self.config()
         rules = {
             "modes": {k: self.proactive_mode(cfg, k) for k in ("group", "private")},
-            "base_modes": {k: (str(cfg.get(f"conn_mode_{k}") or "white") if str(cfg.get(f"conn_mode_{k}") or "white") in ("black", "white") else "white") for k in ("group", "private")},
-            "base_black": {k: [str(x) for x in (cfg.get(self._conn_keys(k, "black")) or [])] for k in ("group", "private")},
-            "base_white": {k: [str(x) for x in (cfg.get(self._conn_keys(k, "white")) or [])] for k in ("group", "private")},
+            "base_modes": {k: (str(cfg.get(f"conn_mode_{k}") or "black") if str(cfg.get(f"conn_mode_{k}") or "black") in ("black", "white") else "black") for k in ("group", "private")},
+            "base_black": {k: _as_id_list(cfg.get(self._conn_keys(k, "black"))) for k in ("group", "private")},
+            "base_white": {k: _as_id_list(cfg.get(self._conn_keys(k, "white"))) for k in ("group", "private")},
             "auto_wl": str(cfg.get("proactive_auto_wl") or "off"),
-            "wl_private": list(cfg.get("proactive_wl_private") or []),
-            "bl_private": list(cfg.get("proactive_bl_private") or []),
-            "wl_group": list(cfg.get("proactive_wl_group") or []),
-            "bl_group": list(cfg.get("proactive_bl_group") or []),
+            "wl_private": _as_id_list(cfg.get("proactive_wl_private")),
+            "bl_private": _as_id_list(cfg.get("proactive_bl_private")),
+            "wl_group": _as_id_list(cfg.get("proactive_wl_group")),
+            "bl_group": _as_id_list(cfg.get("proactive_bl_group")),
         }
         base = await self.store.proactive_baseline(self._day_start_ts(cfg))
         names = await self.contact_names()
@@ -881,8 +1444,10 @@ class StarHeartService:
                         break
                 if not ident:
                     continue
-                if _allow_ids and ident not in _allow_ids:
-                    continue                                     # 原生名单外：不显示（也就不会被勾到）
+                if _allow_ids and kind == "group" and not _native_id_match(
+                    ident, str(row.get("platform") or ""), kind, _allow_ids
+                ):
+                    continue                                     # 群聊原生名单外：不显示（私聊不走原生名单）
                 label = str(row.get("name") or row.get("nickname") or row.get("remark") or "").strip()
                 if label:
                     names.setdefault(f"{kind}:{ident}", label)
@@ -895,8 +1460,10 @@ class StarHeartService:
             if sid.split(":", 1)[0].strip().lower() == "webchat":
                 continue
             kind, ident = self.session_kind(sid)
-            if _allow_ids and ident and ident not in _allow_ids:
-                continue                                         # 原生名单外的会话不进候选（已失效）
+            if _allow_ids and kind == "group" and ident and not _native_id_match(
+                ident, sid.split(":", 1)[0], kind, _allow_ids
+            ):
+                continue                                         # 群聊原生名单外的会话不进候选（已失效）
             verdict, why = self._judge(kind, ident, rules, cfg, sid.split(":", 1)[0])
             judged.append({"session_id": item.get("session_id"), "kind": kind, "id": ident,
                            "name": names.get(f"{kind}:{ident}", ""),
@@ -959,15 +1526,17 @@ class StarHeartService:
         k = "group" if kind == "group" else "private"
         bl = [str(x) for x in (rules.get(f"bl_{k}") or [])]
         wl = [str(x) for x in (rules.get(f"wl_{k}") or [])]
-        mode = str((rules.get("modes") or {}).get(k) or "white").lower()
-        if mode not in ("black", "white"):
-            mode = "white"
+        mode = str((rules.get("modes") or {}).get(k) or "black").lower()
+        if mode not in ("black", "white", "off"):
+            mode = "black"
+        if mode == "off":
+            return "deny", "主动名单：off（不主动）"
         if mode == "black":
             if ident and ident in bl:
                 return "deny", "在主动黑名单里"
             return "allow", ""
         # 白名单模式：名单为空 = 谁都不主动（避免误扰）
-        # ⚠️ 「不在白名单里」这五个字是 auto_wl（自动加白）的判据字符串，改文案前先搜 _auto_wl_allows 的调用处
+        # ⚠️ 下面两句拒绝文案是 auto_wl（自动加白）的判据，改文案前先搜 proactive_scan 里的 why 条件
         if ident not in wl:
             return "deny", ("主动白名单为空（谁都不主动）" if not wl else "不在白名单里")
         return "allow", ""
@@ -976,8 +1545,8 @@ class StarHeartService:
         """面板「多选 + 保存」：一次写模式 + 该模式的名单（另一份名单留着，切回来不丢）。"""
         if kind not in ("group", "private"):
             raise ValueError(f"unknown kind: {kind}")
-        mode = str(mode or "white").lower()
-        if mode not in ("black", "white"):
+        mode = str(mode or "black").lower()
+        if mode not in ("black", "white", "off"):
             raise ValueError(f"unknown mode: {mode}")
         clean: list[str] = []
         for x in ids or []:
@@ -985,6 +1554,9 @@ class StarHeartService:
             if x and x not in clean:
                 clean.append(x)
         await self.store.set_config(f"proactive_mode_{kind}", mode)
+        if mode == "off":
+            await self.store.audit(f"proactive.set_{kind}_off", "不主动")
+            return await self.proactive_rules()
         key = "proactive_wl_" + kind if mode == "white" else "proactive_bl_" + kind
         await self.store.set_config(key, clean)
         await self.store.audit(f"proactive.set_{kind}_{mode}", f"{len(clean)} 项")
@@ -1189,22 +1761,32 @@ class StarHeartService:
         )).fetchone()
         return int(row[0] or 0) if row else 0
 
-    async def _plan_ensure(self, cfg: dict[str, Any], now_ts: float) -> dict[str, Any]:
-        """取/刷新今天的开口排布。触发重排：新的一天、每日上限变化。"""
+    async def _plan_ensure(self, cfg: dict[str, Any], now_ts: float, session_count: int = 1) -> dict[str, Any]:
+        """取/刷新今天的开口排布。只在「新的一天 / 每日上限变化」时重排。
+
+        注意：session_count 会随活跃会话数波动，不能每轮都拿它重算 cap —— 否则
+        时间条每分钟被重新洗牌，永远等不到 slots[0]，表现就是“主动消息不发”。
+        """
         day_start = self._day_start_ts(cfg, now_ts)
         date = self._day_str(cfg, now_ts)
-        cap = max(0, int(cfg.get("proactive_daily_cap") or 0))
+        daily_cap = max(0, _cfg_int(cfg, "proactive_daily_cap", 3))
+        cap = daily_cap * max(1, int(session_count))
         sent = await self._plan_sent_today(day_start)
-        need = max(0, cap - sent)
         plan = await self.store.get_config("proactive_plan", {}) or {}
         raw = plan.get("slots") or []
         slots = [float(x) for x in raw if isinstance(x, (int, float)) and float(x) > 0]
         changed = False
-        if str(plan.get("date") or "") != date or int(plan.get("cap") or -1) != cap:
-            # 新的一天 / 上限变了：按「当前使用之后的剩余量」重排剩余时间条
+        same_day = str(plan.get("date") or "") == date
+        cap_changed = int(plan.get("daily_cap") or -1) != daily_cap
+        if not same_day or cap_changed:
+            # 新的一天 / 用户改了每日上限：按「当前使用之后的剩余量」重排
+            need = max(0, cap - sent)
             slots = self._gen_slots(cfg, need, max(now_ts, day_start), day_start + 86400.0, day_start)
             changed = True
         else:
+            # 同一天：沿用当天已经定下的 cap，活跃会话数波动不重排
+            cap = int(plan.get("cap") or cap)
+            need = max(0, cap - sent)
             while len(slots) >= 2 and now_ts >= slots[1]:
                 slots.pop(0)  # 被更晚时间点追上的：按「错过」作废
                 changed = True
@@ -1212,7 +1794,7 @@ class StarHeartService:
                 slots = slots[:need]
                 changed = True
         if changed:
-            plan = {"date": date, "cap": cap, "slots": slots, "gen_ts": now_ts}
+            plan = {"date": date, "cap": cap, "daily_cap": daily_cap, "slots": slots, "gen_ts": now_ts}
             await self.store.set_config("proactive_plan", plan)
         return {"date": date, "cap": cap, "slots": slots}
 
@@ -1247,19 +1829,34 @@ class StarHeartService:
             "DELETE FROM hf_proactive_log WHERE status IN ('skipped','candidate') AND ts < ?", (cutoff,)
         )
         await self.store.db.commit()
-        baseline = await self.store.proactive_baseline(self._day_start_ts(cfg))
+        day_start = self._day_start_ts(cfg)
+        baseline = await self.store.proactive_baseline(day_start)
+        active_sessions = sum(
+            1 for x in (baseline.get("sessions") or [])
+            if float(x.get("last_user_ts") or 0) >= day_start
+        )
+        extras = await self._whitelist_sessions(cfg, baseline.get("sessions") or [])
+        # 只按「今天活跃 + 显式白名单」放大额度，且加硬上限，避免历史会话把 cap 撑到几百
+        session_count = min(50, max(1, active_sessions + len(extras)))
         favours = {str(f.get("user_id") or ""): f for f in await self.store.list_favours()}
         now_ts = time.time()
-        plan = await self._plan_ensure(cfg, now_ts)
+        plan = await self._plan_ensure(cfg, now_ts, session_count=session_count)
         due_ts: float | None = float(plan["slots"][0]) if plan.get("slots") else None
         hhmm = self._now_hhmm(cfg)
         quiet = self._quiet_now(cfg, hhmm)
-        min_rank = ZONE_RANK.get(str(cfg.get("proactive_min_zone") or "FAMILIAR"), 3)
+        min_rank = ZONE_RANK.get(str(cfg.get("proactive_min_zone") or "").strip().upper(), 0)
+        if not cfg.get("favour_enabled", True):
+            min_rank = 0
         sent = skipped = cands = 0
-        max_idle = float(cfg.get("proactive_idle_min") or 120)
-        sessions = baseline["sessions"]
+        max_idle = _cfg_float(cfg, "proactive_idle_min", 120.0)
+        # 只保留「真的有过用户发言」或「显式白名单」的会话：
+        # hf_proactive_log 里只有 failed/candidate、从没聊过的会话不该被主动打扰。
+        sessions = [
+            x for x in (baseline["sessions"] or [])
+            if float(x.get("last_user_ts") or 0) > 0 or x.get("from_whitelist")
+        ]
         known = {str(x.get("session_id") or "") for x in sessions}
-        for extra in await self._whitelist_sessions(cfg):
+        for extra in extras:
             if extra["session_id"] not in known:
                 sessions.append(extra)
                 known.add(extra["session_id"])
@@ -1269,22 +1866,34 @@ class StarHeartService:
             if history:
                 history = sorted(history, key=lambda x: x.get("last_user_ts") or 0, reverse=True)[:1]
             sessions = history + [x for x in sessions if x.get("from_whitelist")]
-        rules = await self.proactive_rules()
+        rules = self._proactive_rule_tables(cfg)
+        backoff_map = getattr(self, "_proactive_backoff", None)
+        if backoff_map is None:
+            backoff_map = self._proactive_backoff = {}
         auto_mode = str(cfg.get("proactive_auto_wl") or "off")
         for item in sessions:
-            idle_min = (now_ts - float(item.get("last_user_ts") or 0)) / 60.0
+            _loop_sid = str(item.get("session_id") or "")
+            if now_ts < float(backoff_map.get(_loop_sid) or 0):
+                skipped += 1
+                continue
+            _last_user = float(item.get("last_user_ts") or 0)
+            idle_min = ((now_ts - _last_user) / 60.0) if _last_user > 0 else -1.0
             _sid2 = str(item.get("session_id") or "")
             kind, ident = self.session_kind(_sid2)
             verdict, why = self._judge(kind, ident, rules, cfg, _sid2.split(":", 1)[0])
-            fav = favours.get(str(item.get("user_id") or "")) or {}
-            zone = str(fav.get("zone") or "NEUTRAL")
+            # 群聊不是一个人：不要用「最后一个发言者」的好感档决定整个群的语气/门槛
+            if kind == "group":
+                zone = "NEUTRAL"
+            else:
+                fav = favours.get(str(item.get("user_id") or "")) or {}
+                zone = str(fav.get("zone") or "NEUTRAL")
             # 自动白名单：互动过的会话（有过发言）自动放进白名单，省得手工加。
             # 老代码只认 auto_mode in ("both", kind)，而面板 select 给的是 off/close/familiar
             # → 选 close 或 familiar 全都等于没开（静默失效），真正有效的 both 又没有入口。
             # 现在按好感档位实现这两档，both/group/private 保留为旧配置兼容值。
             if (
                 verdict == "deny"
-                and why == "不在白名单里"
+                and why in ("不在白名单里", "主动白名单为空（谁都不主动）")
                 and int(item.get("msgs") or 0) >= 1
                 and self._auto_wl_allows(auto_mode, kind, zone)
             ):
@@ -1311,26 +1920,34 @@ class StarHeartService:
                 reason = "今日预定开口已排完"
             elif now_ts < due_ts:
                 reason = f"未到预定开口时间（下次 {self._ts_hhmm(cfg, due_ts)}）"
-            elif idle_min < max_idle:
+            elif idle_min >= 0 and idle_min < max_idle:
                 reason = f"距上次发言 {idle_min:.0f} 分钟 < {max_idle:.0f}"
             elif quiet:
                 reason = "静默时段"
-            elif int(item.get("sent_today") or 0) >= int(cfg.get("proactive_daily_cap") or 3):
+            elif int(item.get("sent_today") or 0) >= _cfg_int(cfg, "proactive_daily_cap", 3):
                 reason = "今日已达上限"
-            elif (now_ts - float(item.get("last_proactive_ts") or 0)) / 60.0 < float(cfg.get("proactive_min_interval_min") or 90):
+            elif (now_ts - float(item.get("last_proactive_ts") or 0)) / 60.0 < _cfg_float(cfg, "proactive_min_interval_min", 90.0):
                 reason = "距上次主动未到最小间隔"
             elif ZONE_RANK.get(zone, 2) < min_rank:
                 reason = f"关系区间 {zone} 低于 {cfg.get('proactive_min_zone')}"
             if reason:
                 skipped += 1
-                # 无论影子与否都记录 skip 原因：面板「被挡下的原因」要有据可查
-                await self.store.log_proactive({
-                    "session_id": item["session_id"], "user_id": item.get("user_id") or "",
-                    "zone": zone, "idle_min": idle_min, "score": 0.0,
-                    "status": "skipped", "reason": reason, "guard": guard,
-                })
+                # 同一会话同一原因 30 分钟内只留一条：扫描每分钟一次，不节流会把
+                # hf_proactive_log 写成每分钟 3 条的流水，真正有用的记录被淹掉。
+                _skip_log = getattr(self, "_proactive_skip_log", None)
+                if _skip_log is None:
+                    self._proactive_skip_log = {}
+                    _skip_log = self._proactive_skip_log
+                _skip_key = (str(item["session_id"]), re.sub(r"\d+", "#", reason))
+                if now_ts - float(_skip_log.get(_skip_key) or 0) >= 1800:
+                    _skip_log[_skip_key] = now_ts
+                    await self.store.log_proactive({
+                        "session_id": item["session_id"], "user_id": item.get("user_id") or "",
+                        "zone": zone, "idle_min": idle_min, "score": 0.0,
+                        "status": "skipped", "reason": reason, "guard": guard,
+                    })
                 continue
-            score = round(min(100.0, idle_min / max(1.0, max_idle) * 30 + ZONE_RANK.get(zone, 2) * 12), 1)
+            score = round(min(100.0, max(0.0, idle_min) / max(1.0, max_idle) * 30 + ZONE_RANK.get(zone, 2) * 12), 1)
             cands += 1
             if cfg.get("proactive_shadow") or not cfg.get("proactive_enabled"):
                 await self.store.log_proactive({
@@ -1339,76 +1956,193 @@ class StarHeartService:
                     "status": "candidate", "reason": "影子模式：够格但未发送", "guard": guard,
                 })
                 continue
+            # P0 修复（2026-10-15）：真正静默时长要塞回 item —— _build_proactive_prompt 读的是
+            # item["idle_min"]，旧实现没塞，提示词里「距对方上次说话约 X 分钟」恒为 0
+            # （实测 312/785 分钟都显示 0，模型据此把旧记忆当成「刚刚发生」）。
+            item["idle_min"] = idle_min
             text = await self._proactive_text(item, zone, cfg)
+            meta = getattr(self, "_last_prompt", {}) or {}
+            prompt_source = str(meta.get("prompt_source") or "")
+            memory_ids = [str(x) for x in (meta.get("memory_ids") or [])]
+            invalid_reason = str(meta.get("invalid_reason") or "")
+            if not text:
+                skipped += 1
+                why = invalid_reason or "模型未返回内容"
+                await self.store.log_proactive({
+                    "session_id": item["session_id"], "user_id": item.get("user_id") or "",
+                    "zone": zone, "idle_min": idle_min, "score": score, "status": "skipped",
+                    "reason": f"这次没开口：{why}", "guard": guard, "text": "",
+                    "prompt_source": prompt_source, "memory_ids": memory_ids,
+                })
+                logger.info(f"[StarHeart] 这次没开口（{why}）→ {item['session_id']}")
+                # 模型自己选择沉默 / 空正文：消耗这个时间点 + 5 分钟退避，避免每分钟重打模型
+                backoff_map[str(item["session_id"])] = now_ts + 300
+                plan = await self._plan_consume()
+                _left = [float(x) for x in (plan.get("slots") or []) if isinstance(x, (int, float))]
+                due_ts = _left[0] if _left else None
+                continue
             ok = False
             send = self.system.get("send_proactive")
             if text and callable(send):
-                ok = bool(await send(item["session_id"], text))
+                note = f"提示词:{prompt_source or '?'}" + (f" 记忆:{','.join(memory_ids)}" if memory_ids else "")
+                ok = bool(await send(item["session_id"], text, note=note))
             await self.store.log_proactive({
                 "session_id": item["session_id"], "user_id": item.get("user_id") or "",
                 "zone": zone, "idle_min": idle_min, "score": score,
                 "status": "sent" if ok else "failed", "reason": "" if ok else "发送失败",
-                "guard": guard, "text": text,
+                "guard": guard, "text": text, "prompt_source": prompt_source, "memory_ids": memory_ids,
             })
             sent += 1 if ok else 0
             if ok:
                 plan = await self._plan_consume()
                 _left = [float(x) for x in (plan.get("slots") or []) if isinstance(x, (int, float))]
                 due_ts = _left[0] if _left else None
+            else:
+                # 发送失败也要消耗时间点 + 短退避：否则同一会话每分钟重打一次模型
+                backoff_map[str(item["session_id"])] = now_ts + 900
+                plan = await self._plan_consume()
+                _left = [float(x) for x in (plan.get("slots") or []) if isinstance(x, (int, float))]
+                due_ts = _left[0] if _left else None
         return {"scanned": len(sessions), "candidates": cands, "sent": sent, "skipped": skipped, "quiet": quiet, "next_open": due_ts}
 
     async def _build_proactive_prompt(self, item: dict[str, Any], zone: str, cfg: dict[str, Any]) -> dict[str, Any]:
-        """拼出真正发给模型的东西：人格（可选）+ 情境 + 记忆。"""
-        kind, ident = self.session_kind(item.get("session_id") or "")
-        limit = max(0, int(cfg.get("proactive_context_memories") or 3))
-        memories: list[str] = []
+        """拼出真正发给模型的东西：人格（可选）+ 情境（第 2 层）+ 记忆。
+
+        记忆不做类型 / 关系 / 冷却过滤：本会话 active 记忆全在池子里，按「新近度 × 强度」
+        加权随机抽样。用过只降权，不封存；记忆为空也照常开口。
+        """
+        sid = str(item.get("session_id") or "")
+        kind, ident = self.session_kind(sid)
+        limit = max(0, _cfg_int(cfg, "proactive_context_memories", 3))
+        memories: list[dict[str, Any]] = []
+        recent_ids: set[str] = set()
+        pool_size = 0
         if limit:
-            rows = await (await self.store.db.execute(
-                "SELECT summary FROM hf_memories WHERE session_id=? AND status='active' ORDER BY updated_at DESC LIMIT ?",
-                (str(item.get("session_id") or ""), limit),
-            )).fetchall()
-            memories = [str(r["summary"]).strip() for r in rows if r["summary"]]
+            persona_id = ""
+            fn_p = self.system.get("active_persona")
+            if callable(fn_p):
+                try:
+                    persona_id = str(await fn_p(sid) or "")
+                except Exception:                                # noqa: BLE001 取不到人格就不过滤
+                    persona_id = ""
+            if not cfg.get("memory_persona_isolated", True):
+                persona_id = ""
+            # 最近主动用过的记忆只降权，不排除
+            try:
+                rows = await (await self.store.db.execute(
+                    "SELECT memory_ids FROM hf_proactive_log "
+                    "WHERE session_id=? AND status='sent' AND ts>=? AND memory_ids!='' "
+                    "ORDER BY ts DESC LIMIT 20",
+                    (sid, time.time() - 7 * 86400),
+                )).fetchall()
+                for r in rows:
+                    recent_ids.update(self._split_memory_ids(r["memory_ids"]))
+            except Exception as exc:                             # noqa: BLE001 查询失败按未用过处理
+                logger.debug(f"[StarHeart] 主动记忆近期使用查询失败：{exc}")
+            base_sql = (
+                "SELECT id, summary, occurred_at, created_at, atom_type, strength "
+                "FROM hf_memories WHERE session_id=? AND status='active' AND summary!=''"
+            )
+            order = " ORDER BY COALESCE(NULLIF(occurred_at,0), created_at) DESC LIMIT 80"
+
+            async def _fetch(persona_filter: bool) -> list[Any]:
+                where, args = base_sql, [sid]
+                if persona_filter and persona_id:
+                    where += " AND (persona_id=? OR persona_id IS NULL OR persona_id='')"
+                    args.append(persona_id)
+                return await (await self.store.db.execute(where + order, tuple(args))).fetchall()
+
+            rows = await _fetch(True)
+            if persona_id and not rows:
+                # 人格过滤后一条不剩 → 只退回「未打人格标签」的记忆，绝不拿别的人格记忆
+                rows = await (await self.store.db.execute(
+                    base_sql + " AND (persona_id IS NULL OR persona_id='')" + order, (sid,)
+                )).fetchall()
+            pool: list[dict[str, Any]] = []
+            for r in rows:
+                m = dict(r)
+                if str(m.get("summary") or "").strip():
+                    pool.append(m)
+            pool_size = len(pool)
+            now = time.time()
+
+            def _weight(m: dict[str, Any]) -> float:
+                ts = float(m.get("occurred_at") or m.get("created_at") or now)
+                age_days = max(0.0, (now - ts) / 86400.0)
+                recency = 0.5 ** (age_days / 30.0)       # 30 天半衰
+                strength = 0.5 + float(m.get("strength") or 0.5)
+                reuse = 0.35 if str(m.get("id")) in recent_ids else 1.0
+                return max(0.01, recency * strength * reuse)
+
+            # 加权不放回抽样：记忆越多越不容易连续撞同一组，但不封存任何一条
+            for _ in range(min(limit, len(pool))):
+                total = sum(_weight(m) for m in pool)
+                pick = random.uniform(0.0, total)
+                acc = 0.0
+                for i, m in enumerate(pool):
+                    acc += _weight(m)
+                    if pick <= acc:
+                        memories.append(pool.pop(i))
+                        break
+                else:
+                    memories.append(pool.pop())
         persona_text = ""
         agent_system = ""
         contexts: list[Any] = []
         if cfg.get("proactive_use_persona", True):
-            # 首选：AstrBot 那份**拼好的完整系统提示词**（人格 + 技能 + 安全 + 全局前缀），
-            # 也就是「对话回复」实际吃到的那一份 —— 主动开口本质是对话回复，必须同一份。
+            # 首选：AstrBot 那份拼好的完整系统提示词（人格 + 技能 + 安全 + 全局前缀）。
             fn_agent = self.system.get("agent_prompt")
             if callable(fn_agent):
                 try:
-                    got = await fn_agent(str(item.get("session_id") or "")) or {}
-                except Exception:
+                    max_age = _cfg_float(cfg, "proactive_prompt_max_age_min", 720.0) * 60.0
+                    got = await _maybe_await(fn_agent(sid, max_age=max_age)) or {}
+                except Exception:                                # noqa: BLE001 取不到就降级
                     got = {}
                 agent_system = str(got.get("system") or "")
                 contexts = list(got.get("contexts") or [])
             if not agent_system.strip():
-                # 该会话还没说过话（缓存为空/已过期）→ 退回只取人格，并在返回值里如实标明来源
+                # 该会话还没说过话 / 缓存超时 → 退回只取人格，但不再因此拒发
                 fn = self.system.get("persona_text")
                 if callable(fn):
                     try:
                         persona_text = str(await fn() or "")
-                    except Exception:
+                    except Exception:                            # noqa: BLE001
                         persona_text = ""
-        style = str(cfg.get("proactive_style") or "自然地开一句话题，短、不追问")
+        style = str(cfg.get("proactive_style") or "").strip()
         base_sys = agent_system.strip() or persona_text.strip()
         system = ((base_sys + "\n\n") if base_sys else "")
-        system += (
-            "【本轮情境】你正在主动给对方发消息，不是回复任何消息。\n"
-            f"关系区间：{zone} · 当前语气线：{engine.tone_line(zone)}\n"
-            f"距对方上次说话约 {round(float(item.get('idle_min') or 0))} 分钟。\n"
-            "本轮没有任何工具、技能或函数可调用：不要输出工具调用、不要输出 JSON/代码块/思考过程。\n"
-            "硬要求：只输出你要发送的那一句话；口语化、简短；不要解释、不要加引号、"
-            "不要用括号写动作、不要说“在吗”、不要提醒对方回复你。"
-        )
-        user = f"开口风格：{style}。" + (
-            f"可以参考这些记忆：{'；'.join(m[:40] for m in memories)}。" if memories else "（这个会话还没有可参考的记忆）"
-        )
+        # 第 2 层（本轮情境）：面板可自定义（proactive_instruction），留空 = 内置模板
+        tpl = str(cfg.get("proactive_instruction") or "").strip() or PROACTIVE_LAYER2_TEMPLATE
+        idle_raw = item.get("idle_min")
+        idle_min = round(float(idle_raw)) if idle_raw not in (None, "") else -1
+        idle_text = "未知（还没在这个会话说过话）" if idle_min < 0 else f"约 {idle_min} 分钟"
+        layer2 = (tpl.replace("{zone}", str(zone))
+                     .replace("{tone}", engine.tone_line(zone))
+                     .replace("{idle}", idle_text))
+        system += layer2
+        block = (engine.build_memory_context(memories, budget_chars=480, extra_note=PROACTIVE_MEM_NOTE)
+                 if memories else "")
+        head = f"（风格参考：{style}；不合适就忽略）" if style else ""
+        if block:
+            user = (head + "\n" + block).strip()
+        else:
+            user = (head + "\n这个会话还没有可参考的旧记忆，就按当前情境自然说一句。").strip()
         source = "astrbot" if agent_system.strip() else ("persona" if persona_text.strip() else "none")
         return {
-            "system": system, "user": user, "memories": memories, "contexts": contexts,
+            "system": system, "user": user, "memories": memories,
+            "memory_ids": [str(m.get("id")) for m in memories], "contexts": contexts,
             "persona_used": bool(base_sys), "prompt_source": source, "kind": kind,
+            "idle_min": idle_min, "layer2": layer2, "memory_pool": pool_size,
+            "memory_recent": len(recent_ids),
+            "layer2_custom": bool(str(cfg.get("proactive_instruction") or "").strip()),
         }
+
+    @staticmethod
+    def _split_memory_ids(raw: Any) -> list[str]:
+        """把 hf_proactive_log.memory_ids 的逗号串/列表统一成 id 列表。"""
+        if isinstance(raw, (list, tuple, set)):
+            return [str(x).strip() for x in raw if str(x).strip()]
+        return [x.strip() for x in str(raw or "").split(",") if x.strip()]
 
     async def _proactive_text(self, item: dict[str, Any], zone: str, cfg: dict[str, Any]) -> str:
         gen = self.system.get("llm_generate")
@@ -1416,41 +2150,70 @@ class StarHeartService:
             return ""
         built = await self._build_proactive_prompt(item, zone, cfg)
         self._last_prompt = built
-        out = await gen(built["user"], "proactive", built["system"], contexts=built.get("contexts"),
-                        umo=str(item.get("session_id") or ""))
-        return str(out or "").strip().strip('"')[:200]
+        try:
+            out = await gen(built["user"], "proactive", built["system"],
+                            contexts=built.get("contexts"), umo=str(item.get("session_id") or ""))
+        except Exception as exc:                             # noqa: BLE001
+            built["invalid_reason"] = "llm_error"
+            logger.warning(f"[StarHeart] 主动生成失败：{exc}")
+            return ""
+        text = str(out or "").strip().strip('"“”')
+        # 只去掉评分/表情标签，保留正文；短句、括号动作、昵称都照发
+        text = re.sub(r"\[(?:好感|表情)[^\]]*\]", "", text).strip()
+        if not text:
+            built["invalid_reason"] = "empty"
+            return ""
+        if text in ("[沉默]", "沉默", "……", "..."):
+            built["invalid_reason"] = "model_silent"
+            return ""
+        built["invalid_reason"] = ""
+        return text[:500]
 
-    async def proactive_preview(self, session_id: str, zone: str = "NEUTRAL") -> dict[str, Any]:
-        """只生成不发送：把「实际发给模型的东西」也一并返回，面板可展开看。"""
+    async def proactive_preview(self, session_id: str, zone: str = "") -> dict[str, Any]:
+        """只生成不发送：把「实际发给模型的东西」也一并返回，面板可展开看。
+
+        zone 留空 = 按会话真实关系档试写（旧前端写死 FAMILIAR，导致试看与真发口径不一致）。
+        """
         cfg = await self.config()
-        idle = 0.0
+        idle = -1.0
+        if not str(zone or "").strip():
+            zone = "NEUTRAL"
+            try:
+                fav = {str(f.get("user_id") or ""): f for f in await self.store.list_favours()}
+                _, id2 = self.session_kind(session_id)
+                zone = str((fav.get(id2) or {}).get("zone") or "NEUTRAL")
+            except Exception:
+                pass
         try:
             base = await self.store.proactive_baseline(self._day_start_ts(cfg))
             for item in base.get("sessions", []):
                 if item.get("session_id") == session_id:
-                    idle = (time.time() - float(item.get("last_user_ts") or 0)) / 60.0
+                    _last = float(item.get("last_user_ts") or 0)
+                    if _last > 0:
+                        idle = (time.time() - _last) / 60.0
         except Exception:
             pass
-        built = await self._build_proactive_prompt({"session_id": session_id, "idle_min": idle}, zone, cfg)
         gen = self.system.get("llm_generate")
         if not callable(gen):
-            return {"ok": False, "error": "模型通道不可用", "system_prompt": built["system"], "user_prompt": built["user"]}
+            return {"ok": False, "error": "模型通道不可用"}
         started = time.time()
-        text = await gen(built["user"], "proactive", built["system"], contexts=built.get("contexts"),
-                         umo=str(session_id or ""))
-        text = str(text or "").strip().strip('"')[:200]
+        text = await self._proactive_text({"session_id": session_id, "idle_min": idle}, zone, cfg)
+        built = getattr(self, "_last_prompt", {}) or {}
+        invalid_reason = str(built.get("invalid_reason") or "")
         return {
             "ok": bool(text), "text": text, "zone": zone, "idle_min": round(idle, 1),
             "ms": int((time.time() - started) * 1000),
-            "system_prompt": built["system"][:1500], "user_prompt": built["user"][:800],
-            "memories_used": len(built["memories"]), "persona_used": built["persona_used"], "kind": built["kind"],
-            # prompt_source：astrbot = 用的就是 AstrBot 拼好的完整提示词；persona = 该会话还没说过话，只取到人格；
-            # none = 都没取到（主动消息会吃不到人格，面板据此标红）
+            "system_prompt": str(built.get("system") or "")[:1500],
+            "user_prompt": str(built.get("user") or "")[:800],
+            "memories_used": len(built.get("memories") or []),
+            "persona_used": built.get("persona_used"), "kind": built.get("kind"),
             "prompt_source": built.get("prompt_source", "none"),
+            "memory_ids": built.get("memory_ids") or [],
+            "layer2_custom": bool(built.get("layer2_custom")),
             "contexts_used": len(built.get("contexts") or []),
-            "error": "" if text else "模型没有返回内容（这个声音由会话当前模型决定）",
+            "valid": bool(text), "invalid_reason": invalid_reason,
+            "error": "" if text else ("模型选择沉默" if invalid_reason == "model_silent" else "模型没有返回内容"),
         }
-
 
     # ---------------- 撤回反应（用户撤回一条消息 → 当场走主动通道起一轮） ----------------
     #
@@ -1559,7 +2322,8 @@ class StarHeartService:
         fn_agent = self.system.get("agent_prompt")
         if callable(fn_agent):
             try:
-                got = await fn_agent(sid) or {}
+                max_age = _cfg_float(cfg, "proactive_prompt_max_age_min", 720.0) * 60.0
+                got = await _maybe_await(fn_agent(sid, max_age=max_age)) or {}
                 agent_system = str(got.get("system") or "")
                 contexts = list(got.get("contexts") or [])
             except Exception:                                   # noqa: BLE001
@@ -1764,13 +2528,26 @@ class StarHeartService:
         vis, why = self.visible(k2, id2, cfg, platform=session_platform(sid))
         if not vis:
             warn = f"注意：这个目标{why}，自动主动扫描不会发它（本次手动试发仍然会发）"
+        # 试发按「会话真实关系档 + 真实静默时长」拼提示词（旧实现写死 NEUTRAL/0 分钟，
+        # 试看结果和真发不是一回事 —— 2026-10-15 修）
+        zone = "NEUTRAL"
+        idle_min = 0.0
+        try:
+            fav = {str(f.get("user_id") or ""): f for f in await self.store.list_favours()}
+            zone = str((fav.get(id2) or {}).get("zone") or "NEUTRAL")
+            base = await self.store.proactive_baseline(self._day_start_ts(cfg))
+            for it in base.get("sessions", []):
+                if str(it.get("session_id") or "") == sid:
+                    idle_min = (time.time() - float(it.get("last_user_ts") or 0)) / 60.0
+        except Exception:                                     # noqa: BLE001 试发不因读不到关系档而失败
+            pass
         started = time.time()
         text = str(text or "").strip()
         generated = False
         if not text:
             try:
                 text = await asyncio.wait_for(
-                    self._proactive_text({"session_id": sid, "idle_min": 0}, "NEUTRAL", cfg), timeout=30
+                    self._proactive_text({"session_id": sid, "idle_min": idle_min}, zone, cfg), timeout=30
                 )
             except TimeoutError:
                 return {"ok": False, "error": "生成超时（30s）：模型通道没响应，检查「模型分配 → 对话回复」", "session_id": sid, "warn": warn}
@@ -1780,17 +2557,23 @@ class StarHeartService:
             text = str(text or "").strip()
         if not text:
             return {"ok": False, "error": "模型没有返回内容（检查「模型分配 → 对话回复」）", "session_id": sid, "warn": warn}
+        meta = getattr(self, "_last_prompt", {}) or {}
+        prompt_source = str(meta.get("prompt_source") or "")
+        memory_ids = [str(x) for x in (meta.get("memory_ids") or [])]
         gen_ms = int((time.time() - started) * 1000)
         send_ms = 0
         try:
             t2 = time.time()
-            ok = bool(await asyncio.wait_for(send(sid, text, "手动试发"), timeout=20))
+            note = f"提示词:{prompt_source or '?'}" + (f" 记忆:{','.join(memory_ids)}" if memory_ids else "")
+            ok = bool(await asyncio.wait_for(send(sid, text, "手动试发", note=note), timeout=20))
             send_ms = int((time.time() - t2) * 1000)
         except TimeoutError:
             ok = False
             await self.store.log_proactive({
                 "session_id": sid, "status": "failed", "reason": "面板手动试发超时",
                 "text": text, "guard": {"manual": True, "timeout": 20},
+                "zone": zone, "idle_min": round(idle_min, 1),
+                "prompt_source": prompt_source, "memory_ids": memory_ids,
             })
             return {"ok": False, "error": "发送超时（20s）：平台适配器没回执，检查 bot 是否在线",
                     "text": text, "session_id": sid, "warn": warn}
@@ -1800,11 +2583,15 @@ class StarHeartService:
             "session_id": sid, "status": "sent" if ok else "failed",
             "reason": "面板手动试发", "text": text,
             "guard": {"manual": True, "generated": generated},
+            "zone": zone, "idle_min": round(idle_min, 1),
+            "prompt_source": prompt_source, "memory_ids": memory_ids,
         })
         return {
             "ok": ok, "text": text, "session_id": sid, "warn": warn,
             "generated": generated, "gen_ms": gen_ms if generated else 0, "send_ms": send_ms,
             "ms": int((time.time() - started) * 1000),
+            "zone": zone, "idle_min": round(idle_min, 1),
+            "prompt_source": prompt_source, "memory_ids": memory_ids,
             "error": "" if ok else "发送接口返回 False（bot 掉线或该会话不可达）",
         }
 
@@ -2029,10 +2816,15 @@ class StarHeartService:
     # 也改不了。现在统一登记进 TASK_PROMPTS：面板「模型分配」可展开查看与修改（留空 = 用内置默认）。
     # 注意：工具类（function calling）提示词不在清单里，按用户要求不展开。
     MEMORY_SUMMARY_SYSTEM = (
-        "你是记忆整理器。从对话里蒸馏出「关于用户的长期记忆」：偏好、习惯、事实、约定、情绪触发点。\n"
-        "硬性要求：1) 只写用户的事，不要写你自己（助手/bot）的内心戏或自夸；"
-        "2) 材料不足就少写几条，严禁编造；3) 每条必须是可复用的长期信息，不要流水账；"
-        "4) 严格按调用方给定的逐行格式输出，不要解释、不要多余文字。"
+        "你是记忆整理器。读一段对话，写下以后还用得上的事，像给未来的自己留便签。\n"
+        "写什么：这个人的稳定偏好与雷区、正在发生的事与计划、你们之间定下的称呼与约定、"
+        "一起经历过的事、对方教你的说法（原话加引号）、情绪触发点、关系的变化。\n"
+        "两个人都写：对方做了什么、你怎么回、你答应了什么——关系是双向的，只写一半以后会记错。\n"
+        "亲密/性相关互动照实记录双方意愿、边界、称呼与偏好；不做道德评判、不删减。\n"
+        "主语可以不写；要写就用「TA」指对方、「我」指你自己。\n"
+        "不写：逐字流水账、没有信息量的客套、你猜的（材料不够就少写，写「无」也行）。\n"
+        "每条一行：摘要|类型|强度|情绪浓度；"
+        "类型 ∈ planned/factual/preference/routine/episodic/relational/opinion；强度与情绪浓度 0-1。"
     )
     EXPRESSION_SYSTEM = (
         "你是语言风格分析器。从真实聊天记录里提取「可复用的说话方式」：口头禅、句尾语气词、"
@@ -2055,18 +2847,21 @@ class StarHeartService:
 
     # ---------------- 聚合页 ----------------
     # ---------------- 人物画像（补齐功能）----------------
-    # 画像该回答的是"这个人是谁、和她怎么相处"，而不是几条计数。
+    # 画像该回答的是"这个人是谁、和这个人怎么相处"，而不是几条计数。
     # 没数据就明说没有（面板会给出"生成画像"按钮），不许显示空壳当正常。
     PROFILE_SYSTEM = (
         "你在为一个真实的人写「人物画像」。只输出一个 JSON 对象，不要解释、不要 markdown 代码块、不要多余文字。\n"
+        "硬规则：如果这个人就是 bot 的主人本人，identity 里禁止写成「bot 主人的熟人/朋友/暧昧对象」，"
+        "要写「bot 的主人本人」；relation 用第二人称「你」来写你和他的关系。\n"
+        "硬规则：这是关于「这个人」的画像，不是关于助手的；不要把助手的性格、行为、口头禅、承诺写进任何字段。\n"
         "字段（全部按给定材料写，材料不足就留空，严禁臆造）：\n"
-        '{"one_line":"一句话她是谁（30字内，具体）",'
+        '{"one_line":"一句话这个人是谁（30字内，具体）",'
         '"identity":"身份/称呼/关系",'
         '"traits":["性格特点",...],'
         '"likes":["喜欢·在意的事",...],'
         '"dislikes":["忌讳·雷区",...],'
         '"topics":["常聊话题",...],'
-        '"relation":"和用户（bot 的主人）的关系与相处建议：2-3 句，要具体可执行",'
+        '"relation":"如果这个人是 bot 主人本人：写『你和他是什么关系、该怎么相处』；如果是别人：写『他和 bot 主人的关系，以及 bot 该怎么和他相处』。2-3 句，具体可执行",'
         '"events":[{"when":"时间","what":"关键事件"}],'
         '"notes":"其他要注意的：称呼习惯、语气偏好等"}'
     )
@@ -2165,7 +2960,7 @@ class StarHeartService:
         if not out["has_profile"]:
             # 缺陷要显式暴露：告诉面板"没有画像 + 为什么 + 怎么办"
             if out["mem_count"] == 0 and out["msg_count"] == 0:
-                out["reason"] = "这个人还没有任何记忆和互动记录 —— 先让 bot 和她正常聊几次，或用「导入」把历史记录补进来"
+                out["reason"] = "这个人还没有任何记忆和互动记录 —— 先让 bot 和这个人正常聊几次，或用「导入」把历史记录补进来"
             else:
                 out["reason"] = "还没有生成过画像（有 %d 条记忆可用）" % out["mem_count"]
         return out
@@ -2271,7 +3066,7 @@ class StarHeartService:
         dossier = await self.store.subject_dossier(pid, k, limit=120, persona_id=persona_id)
         mems = dossier.get("memories") or []
         if not mems and not dossier.get("msgs"):
-            tail = "先让 bot 在群里多聊几次，或用「导入」补历史记录" if k == "group" else "先让 bot 和她聊几次，或用「导入」补历史记录"
+            tail = "先让 bot 在群里多聊几次，或用「导入」补历史记录" if k == "group" else "先让 bot 和对方聊几次，或用「导入」补历史记录"
             return {"ok": False, "error": f"{who}还没有任何记忆和互动记录，没法做画像 —— " + tail}
         # 门槛：材料太少的画像就是模型瞎猜（真机上就生成过「身份未知，仅知为人物 id …」这种垃圾）。
         # 宁可明确拒绝并说清缺什么，也不许把垃圾写进库。
@@ -2300,7 +3095,7 @@ class StarHeartService:
         if dossier.get("top_cues"):
             lines.append("常出现的线索：" + "、".join(f"{c['name']}({c['n']})" for c in dossier["top_cues"][:16]))
         lines.append("")
-        lines.append("【这个群的记忆（按重要性排）】" if k == "group" else "【她的记忆（按重要性排）】")
+        lines.append("【这个群的记忆（按重要性排）】" if k == "group" else "【关于这个人的记忆（按重要性排）】")
         for i, m in enumerate(mems[:70], 1):
             when = ""
             if m.get("occurred_at"):
@@ -2407,7 +3202,14 @@ class StarHeartService:
     async def habit_log(self, limit: int = 100) -> dict[str, Any]:
         log = await self.store.habit_log(limit)
         # 语料统计：让「自学习」有可见进度（学了多少条原话 / 用掉多少）
-        return {**log, "corpus": await self.store.corpus_stats()}
+        corpus = {**(await self.store.corpus_stats()), "unused": await self.store.corpus_unused_count()}
+        return {
+            **log,
+            "corpus": corpus,
+            "runs": log.get("runs") or [],
+            "health": await self._evidence_health(),
+            "skipped_reason_enum": _skip_reason_enum(),
+        }
 
     async def corpus_list(self, limit: int = 50, *, is_bot: int | None = None) -> dict[str, Any]:
         """看语料原文（面板「表达学习 → 语料」用）。"""
@@ -2462,52 +3264,380 @@ class StarHeartService:
                 native = {"ok": False, "error": str(exc)[:120]}
         return {"ok": True, "task": task, "edited": bool(str(system_text).strip()), "_native_write": native}
 
+    # ---------------- 配置登记自检（无开关，启动 / 保存后自动跑） ----------------
+    def _schema_path(self) -> Path:
+        return Path(__file__).resolve().parent.parent / "_conf_schema.json"
+
+    def _load_schema(self, force: bool = False) -> dict[str, Any]:
+        path = self._schema_path()
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        cache = getattr(self, "_schema_cache", None)
+        if not force and cache and cache[0] == mtime:
+            return cache[1]
+        data: dict[str, Any] = {}
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8-sig"))
+            if isinstance(raw, dict):
+                data = raw
+        except Exception as exc:                            # noqa: BLE001
+            logger.warning(f"[StarHeart] 读取 _conf_schema.json 失败：{exc}")
+        self._schema_cache = (mtime, data)
+        return data
+
+    @staticmethod
+    def _infer_schema_type(value: Any) -> str:
+        if isinstance(value, bool):
+            return "bool"
+        if isinstance(value, int):
+            return "int"
+        if isinstance(value, float):
+            return "float"
+        if isinstance(value, (list, tuple)):
+            return "list"
+        return "string"
+
+    @staticmethod
+    def _field_type(value: Any, spec: dict[str, Any]) -> str:
+        t = str(spec.get("type") or "").lower()
+        if t in ("list", "array"):
+            return "list"
+        opts = spec.get("options") or spec.get("enum")
+        if isinstance(opts, (list, tuple)) and 0 < len(opts) <= 20 and t in ("", "string", "str", "select", "enum"):
+            return "select"
+        mapping = {
+            "bool": "bool", "boolean": "bool",
+            "int": "num", "integer": "num", "float": "num", "number": "num",
+            "list": "list", "array": "list",
+            "select": "select", "enum": "select",
+            "textarea": "textarea",
+        }
+        if t in mapping:
+            return mapping[t]
+        if isinstance(value, bool):
+            return "bool"
+        if isinstance(value, (int, float)):
+            return "num"
+        if isinstance(value, (list, tuple)):
+            return "list"
+        return "text"
+
+    def config_fields(self) -> dict[str, list[Any]]:
+        """给面板的字段兜底表：任何键都能渲染，不再依赖 views-conf.js 的静态表。"""
+        schema = self._load_schema()
+        out: dict[str, list[Any]] = {}
+        domain_keys = {k for keys in CONFIG_DOMAINS.values() for k in keys}
+        for key in sorted((set(schema) | domain_keys | set(DEFAULT_CONFIG)) - CONFIG_NATIVE_ONLY_KEYS):
+            if _is_internal_config_key(key) or key in CONFIG_REMOVED_KEYS:
+                continue
+            spec = schema.get(key) if isinstance(schema.get(key), dict) else {}
+            value = DEFAULT_CONFIG.get(key)
+            desc = str(spec.get("description") or "").strip()
+            name = (desc.split("：", 1)[0].strip()[:28] if desc else "") or str(key)
+            ftype = self._field_type(value, spec)
+            guard = PARAM_GUARDS.get(key) or {}
+            mn = spec.get("min")
+            mx = spec.get("max")
+            if mn is None:
+                mn = guard.get("min")
+            if mx is None:
+                mx = guard.get("max")
+            step = spec.get("step")
+            if step is None:
+                step = 1 if ftype == "num" and isinstance(value, int) else (0.01 if ftype == "num" else None)
+            options = spec.get("options") or spec.get("enum") or []
+            if isinstance(options, dict):
+                options = list(options.keys())
+            if not isinstance(options, (list, tuple)):
+                options = []
+            out[key] = [name, desc or "（自动补登记）", ftype, mn, mx, step, list(options)]
+        return out
+
+    async def config_registry_audit(self, record: bool = True) -> dict[str, Any]:
+        """五处登记一致性自检 + 自动补缺（无开关）。
+
+        - 默认值 DEFAULT_CONFIG、配置域 CONFIG_DOMAINS、参数护栏 PARAM_GUARDS、
+          原生 schema `_conf_schema.json`、面板字段 `config_fields()`。
+        - 新增键只写 DEFAULT_CONFIG 时，自动补 schema；
+        - 新增键带面板前缀（proactive_/memory_/…）但没进域时，自动补域；
+        - 面板字段由 `config_fields()` 兜底，不再因为漏写 views-conf.js 而消失。
+        - schema 写入前自动备份；写失败只告警，不阻塞启动。
+        """
+        schema = self._load_schema(force=True)
+        defaults = DEFAULT_CONFIG
+        if not schema:
+            # 读不到 schema 时绝不能按默认值全量重建：那会把已有描述/_special 全冲掉。
+            logger.error("[StarHeart] 配置自检：_conf_schema.json 为空或不可读，跳过自动补写（避免覆盖）")
+            return {"ok": False, "error": "schema_empty", "added_schema": [], "added_domain": {}}
+        internal = {k for k in defaults if _is_internal_config_key(k)}
+        auto_domain: dict[str, str] = {}
+        added_schema: dict[str, Any] = {}
+        unclassified_native: list[str] = []
+
+        def _ensure_domain(key: str, dom: str) -> None:
+            if not dom:
+                return
+            keys = CONFIG_DOMAINS.setdefault(dom, [])
+            if key not in keys:
+                keys.append(key)
+                auto_domain[key] = dom
+
+        # 1) 只在 DEFAULT_CONFIG 里、既不在 schema 也不在域：默认补进 schema；带面板前缀的再补域
+        domain_keys = {k for keys in CONFIG_DOMAINS.values() for k in keys}
+        removed_present = sorted((set(schema) | domain_keys) & CONFIG_REMOVED_KEYS)
+        for key in sorted(set(defaults) - domain_keys - set(schema) - internal - CONFIG_REMOVED_KEYS):
+            value = defaults[key]
+            safe_default = value if isinstance(value, (bool, int, float, str, list)) else ""
+            schema[key] = {
+                "type": self._infer_schema_type(value),
+                "description": f"自动补登记：{key}",
+                "default": safe_default,
+            }
+            added_schema[key] = schema[key]
+            _ensure_domain(key, _domain_for_key(key))
+
+        # 2) 在 schema、但不在任何域：已有原生专属键保持不动；新键按前缀补面板域
+        domain_keys = {k for keys in CONFIG_DOMAINS.values() for k in keys}
+        for key in sorted(set(schema) - domain_keys - internal - set(CONFIG_NATIVE_ONLY_KEYS) - CONFIG_REMOVED_KEYS):
+            dom = _domain_for_key(key)
+            if dom:
+                _ensure_domain(key, dom)
+            else:
+                unclassified_native.append(key)
+
+        # 3) schema 有、DEFAULT_CONFIG 没有：补运行时默认值（不改代码常量）
+        missing_defaults: dict[str, Any] = {}
+        for key, spec in schema.items():
+            if key not in defaults and key not in CONFIG_REMOVED_KEYS and isinstance(spec, dict) and "default" in spec:
+                defaults[key] = spec["default"]
+                missing_defaults[key] = spec["default"]
+
+        # 4) 写回 schema（仅新增项；先备份）
+        schema_write = "skipped"
+        if added_schema:
+            path = self._schema_path()
+            try:
+                st = path.stat() if path.exists() else None
+                if st is not None:
+                    bak = path.with_name(path.name + ".bak-registry-" + time.strftime("%Y%m%d-%H%M%S"))
+                    shutil.copy2(path, bak)
+                    if hasattr(os, "chown"):
+                        try:
+                            os.chown(bak, st.st_uid, st.st_gid)
+                        except OSError:
+                            pass
+                tmp = path.with_name(path.name + ".tmp")
+                tmp.write_text(json.dumps(schema, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                tmp.replace(path)
+                if st is not None:
+                    # 容器里通常以 root 跑；把属主/权限还原，避免宿主用户以后改不了插件文件
+                    if hasattr(os, "chown"):
+                        try:
+                            os.chown(path, st.st_uid, st.st_gid)
+                            os.chmod(path, st.st_mode)
+                        except OSError:
+                            pass
+                schema_write = "ok"
+            except Exception as exc:                        # noqa: BLE001
+                schema_write = f"failed: {exc}"
+                logger.warning(f"[StarHeart] 配置自检：写回 _conf_schema.json 失败（下轮重试）：{exc}")
+        self._schema_cache = (0.0, schema)
+
+        # 5) 汇总
+        domain_keys = {k for keys in CONFIG_DOMAINS.values() for k in keys}
+        seen_domains: dict[str, str] = {}
+        duplicate_domains: list[str] = []
+        for dom, keys in CONFIG_DOMAINS.items():
+            for key in keys:
+                if key in seen_domains and seen_domains[key] != dom:
+                    duplicate_domains.append(f"{key}:{seen_domains[key]}/{dom}")
+                else:
+                    seen_domains[key] = dom
+        domain_missing = sorted(domain_keys - set(defaults))
+        domain_missing_schema = sorted(domain_keys - set(schema) - CONFIG_REMOVED_KEYS)
+        guards_missing = sorted(
+            k for k in domain_keys
+            if isinstance(defaults.get(k), (int, float)) and not isinstance(defaults.get(k), bool)
+            and k not in PARAM_GUARDS
+        )
+        stale_guards = sorted(set(PARAM_GUARDS) - set(defaults))
+        fields = self.config_fields()
+        fields_missing = sorted(k for k in domain_keys if k not in fields)
+        report = {
+            "ok": not (domain_missing or domain_missing_schema or stale_guards or unclassified_native
+                       or fields_missing or duplicate_domains or removed_present
+                       or schema_write.startswith("failed")),
+            "defaults": len(defaults), "domains": len(domain_keys), "schema": len(schema),
+            "fields": len(fields),
+            "added_schema": sorted(added_schema), "added_domain": auto_domain,
+            "missing_defaults": sorted(missing_defaults),
+            "domain_missing_default": domain_missing,
+            "domain_missing_schema": domain_missing_schema,
+            "duplicate_domains": duplicate_domains,
+            "removed_present": removed_present,
+            "missing_guards": guards_missing, "stale_guards": stale_guards,
+            "unclassified_native": unclassified_native,
+            "fields_missing": fields_missing, "schema_write": schema_write,
+        }
+        logger.info(
+            f"[StarHeart] 配置自检：默认 {len(defaults)} / 域 {len(domain_keys)} / "
+            f"schema {len(schema)} / 字段 {len(fields)}；补 schema {len(added_schema)}、补域 {len(auto_domain)}"
+        )
+        if added_schema:
+            logger.info(f"[StarHeart] 配置自检：自动补 schema {sorted(added_schema)}（{schema_write}）")
+        if auto_domain:
+            logger.info(f"[StarHeart] 配置自检：自动补面板域 {auto_domain}")
+        if (domain_missing or domain_missing_schema or stale_guards or unclassified_native
+                or fields_missing or missing_defaults or duplicate_domains or removed_present):
+            logger.warning(
+                "[StarHeart] 配置自检需人工确认："
+                f"域键缺默认值={domain_missing} 域键缺schema={domain_missing_schema} "
+                f"schema键缺代码默认值={sorted(missing_defaults)} "
+                f"重复域键={duplicate_domains} 已删除但仍登记={removed_present} "
+                f"过期护栏={stale_guards} 未分类原生键={unclassified_native} 缺字段={fields_missing}"
+            )
+        if record:
+            try:
+                await self.store.audit("config.audit", json.dumps(report, ensure_ascii=False)[:1000], "")
+            except Exception as exc:                        # noqa: BLE001
+                logger.debug(f"[StarHeart] 配置自检审计写入失败：{exc}")
+        return report
+
     async def config_domains(self) -> dict[str, Any]:
         cfg = await self.config()
-        return {"domains": CONFIG_DOMAINS, "values": cfg}
+        # builtin：面板要展示/「载入默认」的内置文本（第 2 层提示词模板；留空配置时实际生效的就是它）
+        # guards：参数护栏清单（输入框上下界 / 「已拦下」判定都以它为准，面板不再自己抄一份）
+        # fields：字段兜底表（任何 DEFAULT_CONFIG / schema 键都能渲染，漏写 views-conf.js 也不会消失）
+        return {"domains": CONFIG_DOMAINS, "values": cfg, "guards": guards_payload(),
+                "fields": self.config_fields(),
+                "builtin": {"proactive_instruction": PROACTIVE_LAYER2_TEMPLATE}}
 
     # ---------------- 表达提取（真跑一次 LLM） ----------------
+    async def _active_pid(self) -> str:
+        """当前生效人格 id（表达归属 学习·{pid} / 手加·{pid} 用；拿不到就空串 → 退化写法）。"""
+        fn = self.system.get("active_persona")
+        if not callable(fn):
+            return ""
+        try:
+            return str(await _maybe_await(fn()) or "")
+        except Exception as exc:                            # noqa: BLE001
+            logger.debug(f"[StarHeart] 取当前人格失败（表达归属退化）：{exc}")
+            return ""
+
+    def _expr_scopes(self, persona_id: str) -> set[str] | None:
+        """当前人格可见的 scope 集合（E1）。
+
+        pid 空 = 没开人格隔离 → None（不过滤 scope）；pid 有值 → **fail-closed**：
+        只认 学习·{pid} / 全局 / 手加·{pid}，无匹配就是空 —— 原实现在「一条都没匹配上」时
+        回退成「全部 enabled」，于是别的人格条目会串进当前人格（真机可复现）。
+        """
+        pid = str(persona_id or "")
+        if not pid:
+            return None
+        return {f"学习·{pid}", "全局", f"手加·{pid}"}
+
+    def _expr_availability(
+        self, h: dict[str, Any], *, persona_id: str, review_first: bool, min_uses: int,
+        banned: set[str], now_ts: float,
+    ) -> tuple[str, bool]:
+        """只读求值这条现在能不能进当前人格的注入池（S4-3 available_now + S4-5 隔离徽标）。
+
+        返回 (人话标签, 当前人格可注入)。判定顺序与注入侧 habit_hints_detail 完全一致 ——
+        面板显示的「可用」就是真注入会选的（不做第二套口径）。
+        """
+        scopes = self._expr_scopes(persona_id)
+        state = str(h.get("checked_state") or "")
+        norm_key = str(h.get("norm_key") or "")
+        if str(h.get("status") or "active") != "active":
+            return "已清空（软删，可恢复）", False
+        if scopes is not None and str(h.get("scope") or "") not in scopes:
+            return "不在当前人格", False
+        if state == "user_reject" or (norm_key and norm_key in banned):
+            return "已驳回（进了「不再学」名单）", False
+        if review_first and state != "user_ok":
+            return "待审核（先审后用开着）", False
+        if not h.get("enabled"):
+            return "已停用", False
+        if float(h.get("cooldown_until") or 0) > now_ts:
+            return "冷却中", False
+        if int(h.get("injected_24h") or 0) >= EXPR_WINDOW_MAX_INJECT:
+            return "24 小时内已注入满 2 次", False
+        if int(h.get("use_count") or 0) < max(0, int(min_uses or 0)):
+            return "未达最小次数（名额有余就补位）", True
+        return "可注入", True
+
     async def habit_extract(self, limit: int = 60) -> dict[str, Any]:
-        """从群友/好友的真实原话里学说话习惯（语料库是数据源，记忆摘要只做辅助）。"""
+        """从群友/好友的真实原话里学说话习惯（语料库是数据源，记忆摘要只做辅助）。
+
+        S4 口径：每次运行都写一行 hf_expr_run_log（S4-4）—— 学 0 条也写，并且写清**为什么 0 条**；
+        学到的行带出处（corpus_id / message_id / 原话 / 时间 / 会话 / 说话人，E3）；
+        「不再学」名单里的说法一律跳过（S4-2：修「删了还会再学」）。
+        """
+        cfg = await self.config()
+        pid = await self._active_pid()
+        model = str(cfg.get("model_expression_extract") or "")
+        review_first = _as_bool(cfg.get("expression_review_first", False))
         gen = self.system.get("llm_generate")
         if not callable(gen):
-            return {"ok": False, "error": "模型通道不可用"}
-        persona_id = self.system.get("active_persona")
-        pid = ""
-        if callable(persona_id):
-            try:
-                pid = str(await persona_id() or "")
-            except Exception:
-                pid = ""
+            await self.store.log_expr_run({"scanned": 0, "saved": 0, "skipped_reason": "model_unavailable",
+                                           "model": model, "ok": 0, "persona_id": pid})
+            return {"ok": False, "error": "模型通道不可用", "saved": 0, "scanned": 0,
+                    "skipped_reason": "model_unavailable"}
+
+        async def _finish(scanned: int, saved: int, reason: str, ok: int = 1,
+                          extra: dict[str, Any] | None = None) -> dict[str, Any]:
+            await self.store.log_expr_run({
+                "scanned": int(scanned), "saved": int(saved), "skipped_reason": str(reason or ""),
+                "model": model, "ok": ok, "persona_id": pid,
+            })
+            await self.store.audit(
+                "habit.extract",
+                f"corpus={int(scanned)} saved={int(saved)} reason={reason or '-'} persona={pid}",
+            )
+            out: dict[str, Any] = {"ok": bool(ok), "saved": int(saved), "scanned": int(scanned),
+                                   "persona": pid, "skipped_reason": str(reason or "")}
+            out.update(extra or {})
+            return out
+
         # 优先取没学过的群友/好友原话
         rows = await self.store.list_corpus(limit=limit, is_bot=0, unused_only=True)
         used_ids = [int(r["id"]) for r in rows]
         if len(rows) < 10:  # 语料不够时拿已用过的补齐，保证能学
             rows += await self.store.list_corpus(limit=limit - len(rows), is_bot=0)
         if not rows:
-            return {"ok": False, "error": "还没有群友/好友的语料——先在群里聊几句（面板「表达学习 → 立即提取」）"}
-        by_chat: dict[str, list[str]] = {}
+            await self.store.log_expr_run({"scanned": 0, "saved": 0, "skipped_reason": "corpus_insufficient",
+                                           "model": model, "ok": 0, "persona_id": pid})
+            return {"ok": False, "saved": 0, "scanned": 0, "skipped_reason": "corpus_insufficient",
+                    "error": "还没有群友/好友的语料——先在群里聊几句（面板「语言学习 → 立即学一批」）"}
+        # 出处侧车（E3）：这些语料对应的原生 message_id
+        refs = await self.store.corpus_ref_map([int(r["id"]) for r in rows])
+        by_chat: dict[str, list[dict[str, Any]]] = {}
         for r in rows:
             body = str(r.get("text") or "").strip()[:120]
             if not body:
                 continue
             who = r.get("user_name") or r.get("user_id") or "某人"
-            by_chat.setdefault(f"{r.get('chat_type') or '群聊'}·{who}", []).append(body)
+            by_chat.setdefault(f"{r.get('chat_type') or '群聊'}·{who}", []).append(dict(r))
         # 编号原话列表：prompt 要求模型按「行号」回填出处，所以必须先编号，再把编号写进样本
-        numbered: list[tuple[int, str, str]] = []          # (行号, 场景标签, 原话)
-        for tag, lines in by_chat.items():
-            for line in lines[:12]:
-                numbered.append((len(numbered) + 1, tag, line))
+        numbered: list[tuple[int, str, str, dict[str, Any]]] = []      # (行号, 场景标签, 原话, 语料行)
+        for tag, items in by_chat.items():
+            for item in items[:12]:
+                body = str(item.get("text") or "").strip()[:120]
+                if not body:
+                    continue
+                numbered.append((len(numbered) + 1, tag, body, item))
         numbered = numbered[:60]
         # 逐行拼样本，超 3500 字就停：样本里出现的编号一定在 by_idx 里（模型不会引用到被截掉的行）
         sample_lines: list[str] = []
         used = 0
-        for idx, tag, line in numbered:
-            item = f"{idx}. [{tag}] {line}"
-            if used + len(item) > 3500:
+        for idx, tag, line, _item in numbered:
+            item_txt = f"{idx}. [{tag}] {line}"
+            if used + len(item_txt) > 3500:
                 break
-            sample_lines.append(item)
-            used += len(item)
+            sample_lines.append(item_txt)
+            used += len(item_txt)
         sample = "\n".join(sample_lines)
         prompt = (
             "下面是我这个聊天机器人的群友和好友平时真实说的话（原文照抄，不要改）。\n"
@@ -2523,11 +3653,17 @@ class StarHeartService:
             "6. 第三段只填你真的参考过的原话行号（上面编号列表里的号），别瞎填；不要编号、不要 markdown、不要解释。\n\n"
             f"【他们的原话】\n{sample}"
         )
-        out = await gen(prompt, "expression_extract")
-        saved = 0
-        by_idx = {idx: line for idx, _tag, line in numbered}
-        for line in str(out or "").splitlines():
-            line = line.strip().lstrip("-*0123456789. ")
+        try:
+            out = await gen(prompt, "expression_extract")
+        except Exception as exc:                            # noqa: BLE001 模型调用失败也要留诊断行
+            logger.warning(f"[StarHeart] 表达提取模型调用失败：{exc}")
+            return await _finish(len(rows), 0, "model_error", ok=0,
+                                 extra={"error": f"模型调用失败：{str(exc)[:120]}"})
+        banned = await self.store.banned_keys()
+        saved = merged = banned_hit = 0
+        by_idx = {idx: (line, item) for idx, _tag, line, item in numbered}
+        for raw in str(out or "").splitlines():
+            line = raw.strip().lstrip("-*0123456789. ")
             if "|" not in line:
                 continue
             parts = [x.strip() for x in line.split("|")]
@@ -2535,34 +3671,67 @@ class StarHeartService:
             way = parts[1] if len(parts) > 1 else ""
             if not scene or not way or way in ("无", "none"):
                 continue
+            norm_key = expr_norm_key(scene, way)
+            if norm_key and norm_key in banned:
+                banned_hit += 1                             # 「不再学」名单先过（S4-2）
+                continue
             # 出处：模型回填的行号 → 真实原话（最多 3 条）。回填不出来就留空，
-            # 面板会明确标"无来源原话"，不假装有出处。
+            # 面板会明确标「没记出处」，不假装有出处。
             cues: list[str] = []
+            src_ids: list[dict[str, Any]] = []
+            evidence: list[dict[str, Any]] = []
             for tok in str(parts[2] if len(parts) > 2 else "").replace("，", ",").split(","):
                 tok = tok.strip().lstrip("#")
                 if not tok.isdigit():
                     continue
-                src = by_idx.get(int(tok))
-                if src and src not in cues:
-                    cues.append(src[:60])
+                hit = by_idx.get(int(tok))
+                if not hit:
+                    continue
+                text, row = hit
+                cid = int(row.get("id") or 0)
+                who = str(row.get("user_name") or row.get("user_id") or "某人")
+                ts_row = float(row.get("ts") or 0)
+                if text[:60] not in cues:
+                    cues.append(text[:60])
+                ref = refs.get(cid) or {}
+                mid = str(ref.get("message_id") or "")
+                src_ids.append({"corpus_id": cid, "message_id": mid,
+                                "session_id": str(row.get("session_id") or ""), "who": who, "ts": ts_row})
+                evidence.append({"text": text, "ts": ts_row, "session_id": str(row.get("session_id") or ""),
+                                 "who": who, "corpus_id": cid, "message_id": mid})
                 if len(cues) >= 3:
                     break
-            await self.store.upsert_habit(
-                {
-                    "scene": scene[:40],
-                    "way": way[:120],
-                    "cues": cues,
-                    "weight": 0.5,
-                    "scope": f"学习·{pid}" if pid else "学习",
-                    "enabled": 1,
-                }
-            )
-            saved += 1
-        if used_ids:
+            _eid, is_new = await self.store.merge_expr({
+                "scene": scene[:40], "way": way[:120], "cues": cues,
+                "scope": f"学习·{pid}" if pid else "学习",
+                "enabled": 1, "norm_key": norm_key,
+                # 默认自动通过（定稿口径 #2）：没开「先审后用」就直接 user_ok；
+                # 合并路径（merge_expr）**不动**已有行的审核态 —— 学习回写绝不回退审核。
+                "checked_state": "ai_pending" if review_first else "user_ok",
+                "source_ids": src_ids, "evidence_snap": evidence,
+            })
+            if is_new:
+                saved += 1
+            else:
+                merged += 1
+        # 语料标记：只有真学到东西才算「学过」。学 0 条不标记 ——
+        # 原实现无条件标记，一次失败就让这批语料永久沉底（S4-4 复核项）。
+        if (saved or merged) and used_ids:
             await self.store.mark_corpus_used(used_ids)
-        await self.store.prune_corpus(5000)
-        await self.store.audit("habit.extract", f"corpus={len(rows)} saved={saved} persona={pid}")
-        return {"ok": True, "saved": saved, "scanned": len(rows), "persona": pid}
+        await self.store.prune_corpus(5000)                 # 被引用语料免删（E3）
+        total = saved + merged
+        if banned_hit and total == 0:
+            reason = "banned_filtered"
+        elif total == 0:
+            reason = "empty_parse"
+        elif saved == 0:
+            reason = "all_duplicate"
+        elif banned_hit:
+            reason = "banned_filtered"
+        else:
+            reason = ""
+        return await _finish(len(rows), total, reason,
+                             extra={"new": saved, "merged": merged, "banned": banned_hit})
 
     async def summarize_dialogue(
         self,
@@ -2594,32 +3763,41 @@ class StarHeartService:
         ]
         if not cleaned:
             return {"ok": False, "skipped": "empty"}
-        limit = int(cfg.get("memory_capture_max_per_run", 5) or 5)
+        limit = cfg.get("memory_capture_max_per_run")
+        limit = 5 if limit is None else int(limit)
+        # 不再截断到「末 12 轮」：配置允许 50 轮，却只把末 12 轮喂给模型，前面白扫。
+        # 改成按字符预算装（超预算从最早的一轮开始丢，保留最近），并如实回报 scanned。
+        budget_chars = 12000
+        kept: list[dict[str, Any]] = []
+        used_chars = 0
+        for t in reversed(cleaned):
+            who_seg = (t.get("name") or "").strip()
+            seg_len = (len(str(t.get("user") or "")) + len(str(t.get("bot") or "")) + len(who_seg) + 8)
+            if kept and used_chars + seg_len > budget_chars:
+                break
+            kept.append(t)
+            used_chars += seg_len
         convo_lines: list[str] = []
-        for i, t in enumerate(cleaned[-12:], 1):
+        for i, t in enumerate(reversed(kept), 1):
+            who_s = (t.get("name") or "").strip() or "用户"
             u = (t.get("user") or "").strip().replace("\n", " ")[:200]
             b = (t.get("bot") or "").strip().replace("\n", " ")[:200]
             if u or b:
-                convo_lines.append(f"{i}. 用户：{u}\n   助手：{b}")
+                convo_lines.append(f"{i}. {who_s}：{u}\n   我：{b}")
         if not convo_lines:
             return {"ok": False, "skipped": "empty"}
         who = f"对话对象：{user_name}（{user_id}）" if user_id else ""
         prompt = (
-            "下面是一段人机对话。请从中提取**关于对话对象（对方，不是助手自己）**值得长期记住的信息，"
-            f"最多 {limit} 条。每条一行，格式：\n"
+            f"下面是一段人机对话。请提取值得长期记住的信息，最多 {limit} 条。每条一行，格式：\n"
             "摘要|类型|强度|情绪浓度\n"
-            "其中：类型 ∈ planned（未来计划与约定）/factual（客观事实）/preference（偏好习惯）/"
-            "routine（日常规律）/episodic（共同经历）/relational（关系与称呼变化）/opinion（用户的观点态度）；"
-            "强度与情绪浓度都是 0-1 的小数（如 0.7）。\n"
-            "硬性规则：\n"
-            "1. 只写用户的事。助手的性格、偏好、想法、对用户的好感一律不记（那是助手自己的状态，不是关于用户的记忆）。\n"
-            "2. 不要记录寒暄、表情、客套、安慰与纯闲聊；不记录助手许下的承诺或意愿。\n"
-            "3. 只写具体可复述的事实，不要推断、不要编造；同一件事不要重复。\n"
-            "4. 简写要像人给自己记的笔记：**不要每条都以「用户」开头**，直接说事"
-            "（如「偏好消息分开发送，觉得换行不是好习惯」「下周三约了朋友吃饭」）；"
-            "确实需要主语时用「对方」，不要用「用户」二字，也不要以「助手」开头。\n"
-            "5. 只写内容本身，不要写「在群里说的」「刚刚用户说」这类来源或时间状语。\n"
-            "6. 没有值得记的就只输出一行「无」。不要编号、不要 markdown、不要解释。\n\n"
+            "类型 ∈ planned/factual/preference/routine/episodic/relational/opinion；"
+            "强度与情绪浓度 0-1。\n"
+            "写法：\n"
+            "1. 双方都写：用户做了什么、助手怎么回、助手答应了什么；关系是双向的。\n"
+            "2. 尽量写清谁对谁；主语可省略，要写就用「TA」指对方、「我」指助手自己。\n"
+            "3. 称呼、调情、亲密/性相关互动照实记：双方意愿、边界、称呼、偏好；不做道德评判、不删减。\n"
+            "4. 不编造；材料不够就少写；没有值得记的就输出「无」。\n"
+            "5. 不要编号、不要 markdown、不要解释；只写内容本身。\n\n"
             f"{who}\n对话内容：\n" + "\n".join(convo_lines)
         )
         custom_prompt = str(cfg.get("memory_summary_prompt") or "").strip()
@@ -2634,7 +3812,9 @@ class StarHeartService:
                 else custom_prompt + "\n\n" + prompt
             )
         try:
-            out = await gen(prompt, "memory_summary")
+            # 图片必须真的传给模型：收了 image_urls 却不传参 = 图片 100% 进不了记忆（P0-8）。
+            # 失败时上层会降级重跑纯文本，绝不换一个「吃不到提示词」的图像模型去描述。
+            out = await gen(prompt, "memory_summary", None, image_urls=image_urls or None)
         except Exception as exc:  # LLM 故障不阻塞对话
             await self.store.audit("memory.capture", f"llm_error {exc}")
             return {"ok": False, "error": str(exc)}
@@ -2645,10 +3825,9 @@ class StarHeartService:
                 continue
             parts = [x.strip() for x in line.split("|")]
             summary = parts[0][:200]
+            # 插件自己的好感标签不是记忆内容，别让它混进长期记忆
+            summary = re.sub(r"[\[【(（]?\s*好感\s*[:：]?\s*[+＋-]?\s*\d+\s*[\]】)）]?", "", summary).strip()
             if not summary or summary in ("无", "none", "None"):
-                continue
-            # 兜底：助手的内心戏/承诺不是「关于用户的记忆」，模型不听话时也拦住
-            if _ASSISTANT_SUBJECT.search(summary):
                 continue
             atom = (parts[1] if len(parts) > 1 else "factual").lower()
             if atom not in _ATOM_TYPES:
@@ -2676,17 +3855,75 @@ class StarHeartService:
             if len(items) >= limit:
                 break
         if not items:
-            await self.store.audit("memory.capture", f"no_memory turns={len(cleaned)}")
-            return {"ok": True, "saved": 0, "scanned": len(cleaned)}
+            await self.store.audit("memory.capture", f"no_memory turns={len(kept)}/{len(cleaned)}")
+            return {"ok": True, "saved": 0, "scanned": len(kept), "turns_total": len(cleaned)}
         saved = 0
+        deduped = 0
         linked = 0
         link_errors = 0
         evidence = "\n".join(
-            f"{(t.get('user') or '').strip()[:80]} / {(t.get('bot') or '').strip()[:80]}"
+            f"用户：{(t.get('user') or '').strip()[:80]}\n助手：{(t.get('bot') or '').strip()[:80]}"
             for t in cleaned[-3:]
             if (t.get("user") or t.get("bot"))
         )[:500]
+        # 同人格、同会话的近期记忆：新条目如果只是换了个说法，就并回旧条目，
+        # 不再新增一条。同一件事换三种说法在短时间写入多条，是实机出现过的退化路径。
+        existing: list[tuple[str, str, str]] = []
+        try:
+            rows_ex = await (await self.store.db.execute(
+                "SELECT id, summary, content FROM hf_memories WHERE status='active' "
+                "AND COALESCE(persona_id,'')=? AND session_id=? "
+                "ORDER BY COALESCE(occurred_at, created_at) DESC LIMIT 300",
+                (persona_id or "", session_id or ""),
+            )).fetchall()
+            existing = [(str(r["id"]), str(r["summary"] or ""), str(r["content"] or "")) for r in rows_ex]
+        except Exception as exc:                    # noqa: BLE001 去重查询失败就按原逻辑插入
+            logger.debug(f"[StarHeart] 记忆去重查询失败（按不去重处理）：{exc}")
         for it in items:
+            replace_id = None
+            dup_id = None
+            new_summary = it["summary"]
+            new_norm = engine._norm_for_similarity(new_summary)
+            for old_id, old_summary, old_content in existing:
+                old_norm = engine._norm_for_similarity(old_summary)
+                # 只替换「摘要就是全文」的简单记忆；导入记忆的 content 是长原文，
+                # 用一句新摘要覆盖会把原文整段吃掉，宁可新增一条。
+                simple_old = (not old_content.strip()) or old_content.strip() == old_summary.strip()
+                if (simple_old and len(old_norm) >= 6 and old_norm and new_norm
+                        and old_norm in new_norm and len(new_norm) > len(old_norm) + 2):
+                    # 新记忆是旧记忆的补充/纠正（「怕黑」→「怕黑，睡觉要留灯」）：
+                    # 用新内容替换旧行，保留原始发生时间，不把它顶成「刚刚」。
+                    replace_id = old_id
+                    break
+                if old_summary and engine.text_similarity(new_summary, old_summary) >= 0.995:
+                    dup_id = old_id
+                    break
+            if replace_id:
+                try:
+                    did = int(str(replace_id).lstrip("m"))
+                    now = time.time()
+                    await self.store.db.execute(
+                        "UPDATE hf_memories SET summary=?, content=?, cues=?, "
+                        "strength=MIN(1.0, COALESCE(strength,0)+0.15), "
+                        "recalls=COALESCE(recalls,0)+1, updated_at=? WHERE id=?",
+                        (new_summary, new_summary,
+                         json.dumps([new_summary[:24]], ensure_ascii=False),
+                         now, did),
+                    )
+                    await self.store.db.commit()
+                except Exception as exc:            # noqa: BLE001
+                    logger.debug(f"[StarHeart] 记忆补充失败：{exc}")
+                deduped += 1
+                logger.info(f"[StarHeart] 记忆补充：{new_summary[:40]} → 更新 #{replace_id}")
+                continue
+            if dup_id:
+                try:
+                    await self.store.touch_memory(dup_id)
+                except Exception as exc:            # noqa: BLE001
+                    logger.debug(f"[StarHeart] 记忆去重加固失败：{exc}")
+                deduped += 1
+                logger.info(f"[StarHeart] 记忆去重：{new_summary[:40]} → 刷新 #{dup_id}")
+                continue
             mid = await self.store.insert_memory(
                 {
                     "summary": it["summary"],
@@ -2704,10 +3941,16 @@ class StarHeartService:
                     "evidence": evidence,
                     "recalls": 0,
                     "status": "active",
+                    # 时间锚：这批对话第一轮的真实时间，而不是总结完成时刻（P0-9）
+                    "occurred_at": float((kept[-1] or {}).get("ts") or 0) or None,
+                    # 归属主体：同人格多个私聊时，A 的记忆不该原样注入给 B（P0-10）。
+                    # 群聊不写：那里的「主体」是群，不是最后说话的那个人。
+                    "subject_id": str(user_id or "") if session_kind(session_id)[0] == "private" else "",
                 }
             )
             if mid:
                 saved += 1
+                existing.append((str(mid), it["summary"], it["summary"]))
                 # 关键：新记忆立刻建关系链（实体边 + 同会话时序边 + 共享实体语义边）。
                 # 不建链的话图谱就是一堆孤点，用户看到的就是「没有关系链」。
                 try:
@@ -2723,12 +3966,15 @@ class StarHeartService:
                     link_errors += 1
         await self.store.audit(
             "memory.capture",
-            f"saved={saved} turns={len(cleaned)} session={session_id} links={linked} link_errors={link_errors}",
+            f"saved={saved} deduped={deduped} turns={len(kept)}/{len(cleaned)} "
+            f"session={session_id} links={linked} link_errors={link_errors}",
         )
         return {
             "ok": True,
             "saved": saved,
-            "scanned": len(cleaned),
+            "deduped": deduped,
+            "scanned": len(kept),
+            "turns_total": len(cleaned),
             "links": linked,
             "link_errors": link_errors,
             "ids": [],
@@ -2741,85 +3987,161 @@ class StarHeartService:
         return {"removed": n, "persona_id": persona_id or "", "mode": "soft_delete"}
 
     async def memory_maintenance(self) -> dict[str, Any]:
-        """记忆衰减 + 淘汰（设计里的「向量记忆与衰减」落地点）。"""
+        """记忆衰减 + 淘汰（设计里的「向量记忆与衰减」落地点）。
+
+        2026-10-17：安全阀按 persona 分别算。旧实现拿全局 active 比例，
+        历史人格 archived 很多时会把全局压到 15% 以下，导致当前人格的记忆也永远不衰减
+        （当前人格 active 正常、历史人格全是 archived 的库会踩到）。
+        """
         cfg = await self.config()
-        half = float(cfg.get("memory_decay_half_life_days") or 21)
-        floor = float(cfg.get("memory_evict_below") or 0.08)
+        half = 45.0 if cfg.get("memory_decay_half_life_days") is None else float(cfg["memory_decay_half_life_days"])
+        floor = 0.05 if cfg.get("memory_evict_below") is None else float(cfg["memory_evict_below"])
         if half <= 0:
             return {"decayed": 0, "evicted": 0}
         await self.store.ensure_strength_updated_at()
-        total = int((await (await self.store.db.execute(
-            "SELECT COUNT(*) AS n FROM hf_memories WHERE status != 'deleted'")).fetchone())["n"] or 0)
-        act = int((await (await self.store.db.execute(
-            "SELECT COUNT(*) AS n FROM hf_memories WHERE status='active'")).fetchone())["n"] or 0)
-        # 安全阀：active 比例过低说明衰减已经失控（真机出现过 5.5%），先停下并记账，别再继续往下压
-        if total >= 50 and act < total * 0.15:
-            await self.store.audit("memory.maintenance", f"跳过衰减：active 比例过低 ({act}/{total})")
-            return {"decayed": 0, "evicted": 0, "skipped": "active_ratio_too_low", "active": act, "total": total}
-        rows = await (await self.store.db.execute(
-            "SELECT id, strength, COALESCE(NULLIF(strength_updated_at,0), NULLIF(last_used_at,0), "
-            "         occurred_at, created_at) AS ts FROM hf_memories WHERE status='active'"
+        groups = await (await self.store.db.execute(
+            "SELECT COALESCE(persona_id,'') AS pid, COUNT(*) AS total, "
+            "       SUM(CASE WHEN status='active' THEN 1 ELSE 0 END) AS act "
+            "FROM hf_memories WHERE status != 'deleted' GROUP BY COALESCE(persona_id,'')"
         )).fetchall()
-        decayed = evicted = 0
+        decayed = evicted = skipped = 0
         stamp = time.time()
-        for row in rows:
-            cur = float(row["strength"] or 0)
-            # 增量幂等：只补算「距上次衰减基线」的这段时间；旧实现拿累计年龄反复乘当前强度 = 复利崩塌
-            new_s = engine.decay_strength(cur, engine.age_days(row["ts"]), half)
-            if new_s >= cur:
-                continue
-            decayed += 1
-            if new_s < floor:
-                evicted += 1
-                await self.store.db.execute(
-                    "UPDATE hf_memories SET strength=?, strength_updated_at=?, status='stale', updated_at=? WHERE id=?", (new_s, stamp, stamp, row["id"])
-                )
-            else:
-                await self.store.db.execute(
-                    "UPDATE hf_memories SET strength=?, strength_updated_at=?, updated_at=? WHERE id=?", (new_s, stamp, stamp, row["id"])
-                )
+        for g in groups:
+            pid = str(g["pid"] or "")
+            total = int(g["total"] or 0)
+            act = int(g["act"] or 0)
+            _ = (total, act)
+            # 已删除「active 比例 <15% 就冻结衰减」的阀门：它让老库永远不衰减，
+            # 且把「记忆多」当成异常状态 —— 记忆变多是正常事，不该反过来冻结维护。
+            rows = await (await self.store.db.execute(
+                "SELECT id, strength, atom_type, COALESCE(NULLIF(strength_updated_at,0), NULLIF(last_used_at,0), "
+                "         occurred_at, created_at) AS ts FROM hf_memories "
+                "WHERE status='active' AND COALESCE(persona_id,'')=?",
+                (pid,),
+            )).fetchall()
+            for row in rows:
+                cur = float(row["strength"] or 0)
+                # 增量幂等：只补算「距上次衰减基线」的这段时间；旧实现拿累计年龄反复乘当前强度 = 复利崩塌
+                # 半衰期按 atom_type 分化：称呼/雷点/承诺（relational/preference/planned）掉得最慢
+                new_s = engine.decay_strength(cur, engine.age_days(row["ts"]), half,
+                                             atom_type=str(row["atom_type"] or ""))
+                if new_s >= cur:
+                    continue
+                decayed += 1
+                if new_s < floor:
+                    evicted += 1
+                    await self.store.db.execute(
+                        "UPDATE hf_memories SET strength=?, strength_updated_at=?, status='stale', updated_at=? WHERE id=?",
+                        (new_s, stamp, stamp, row["id"]),
+                    )
+                else:
+                    await self.store.db.execute(
+                        "UPDATE hf_memories SET strength=?, strength_updated_at=?, updated_at=? WHERE id=?",
+                        (new_s, stamp, stamp, row["id"]),
+                    )
         await self.store.db.commit()
         if decayed:
-            await self.store.audit("memory.maintenance", f"decayed={decayed} evicted={evicted}")
-        return {"decayed": decayed, "evicted": evicted}
+            await self.store.audit("memory.maintenance", f"decayed={decayed} evicted={evicted} skipped_personas={skipped}")
+        return {"decayed": decayed, "evicted": evicted, "skipped_personas": skipped}
 
     # ---------------- 表达习惯注入（把学到的说话方式带进 prompt） ----------------
-    async def habit_hints(self, persona_id: str = "", limit: int = 6) -> str:
-        """把启用的表达习惯拼成注入片段（表达学习从「只提取不使用」变成真生效）。"""
-        habits = await self.store.list_habits()
+    async def habit_hints_detail(self, persona_id: str = "", limit: int = 6) -> tuple[str, list[int]]:
+        """把当前人格可用的表达拼成注入片段，并返回本次真注入的 id（表达使用记账用）。
+
+        S4 口径：
+          · 名额 = output_expr_max_inject（0 = 不注入；上限 10，与 PARAM_GUARDS 同界）；
+          · scope 走 _expr_scopes()（E1：**fail-closed**，无匹配 = 空，不再回退「全部 enabled」）；
+          · 冷却中 / 24h 内已注入满 2 次 / 已驳回 / 在「不再学」名单 / 已停用 —— 都不选；
+          · 「先审后用」开着时只有 user_ok 能进池（默认自动通过 → ai_pending/学来的也能进）。
+        """
         cfg = await self.config()
         try:
+            cap = int(limit if limit is not None else cfg.get("output_expr_max_inject", 5))
+        except (TypeError, ValueError):
+            cap = 5
+        cap = max(0, min(10, cap))
+        if cap <= 0:
+            return "", []
+        try:
             min_uses = max(0, int(cfg.get("expression_min_uses") or 0))
-        except Exception:
+        except (TypeError, ValueError):
             min_uses = 0
-        usable = [h for h in habits if h.get("enabled")]
-        if persona_id:
-            scoped = [h for h in usable if str(h.get("scope") or "") in (f"学习·{persona_id}", "全局")]
-            if scoped:
-                usable = scoped
-        usable.sort(key=lambda h: (float(h.get("weight") or 0.5), int(h.get("uses") or 0)), reverse=True)
+        review_first = _as_bool(cfg.get("expression_review_first", False))
+        habits = await self.store.list_habits()
+        banned = await self.store.banned_keys()
+        now_ts = time.time()
+        scopes = self._expr_scopes(persona_id)
+        allowed = ("user_ok",) if review_first else ("user_ok", "ai_pending")
+        usable: list[dict[str, Any]] = []
+        for h in habits:
+            if str(h.get("status") or "active") != "active" or not h.get("enabled"):
+                continue
+            if scopes is not None and str(h.get("scope") or "") not in scopes:
+                continue
+            if str(h.get("checked_state") or "") not in allowed:
+                continue
+            if str(h.get("norm_key") or "") and str(h.get("norm_key")) in banned:
+                continue
+            if float(h.get("cooldown_until") or 0) > now_ts:
+                continue
+            if int(h.get("injected_24h") or 0) >= EXPR_WINDOW_MAX_INJECT:
+                continue
+            usable.append(h)
+        # 排序：用过的（出站命中）优先，其次最近更新的 —— 原实现按 weight 排，weight 已删（拍-11）
+        usable.sort(key=lambda h: (int(h.get("use_count") or 0), float(h.get("updated_at") or 0)), reverse=True)
         # 「表达最少使用次数」：达到 N 次才算"已验证"，优先注入；没达标的只在名额没用满时补位
-        # （不能直接排除：habit_mark_used 只给"启用中的习惯"计数，直接排除会让新习惯永远升不上来）
-        verified = [h for h in usable if int(h.get("uses") or 0) >= min_uses]
-        fresh = [h for h in usable if int(h.get("uses") or 0) < min_uses]
-        picked = (verified + fresh)[:max(1, limit)]
+        verified = [h for h in usable if int(h.get("use_count") or 0) >= min_uses]
+        fresh = [h for h in usable if int(h.get("use_count") or 0) < min_uses]
+        picked = (verified + fresh)[:cap]
         lines = [f"- {h.get('scene')}→{h.get('way')}" for h in picked if h.get("scene") and h.get("way")]
         if not lines:
-            return ""
-        return "【表达习惯参考】像真人一样说话，可以参考这些习惯（不要逐字复读）：\n" + "\n".join(lines)
+            return "", []
+        text = "【表达习惯参考】像真人一样说话，可以参考这些习惯（不要逐字复读）：\n" + "\n".join(lines)
+        ids: list[int] = []
+        for h in picked:
+            if not (h.get("scene") and h.get("way")):
+                continue
+            try:
+                ids.append(int(h["id"]))
+            except (KeyError, TypeError, ValueError) as exc:  # noqa: BLE001 缺 id 的行不该挡住注入
+                logger.debug(f"[StarHeart] 表达使用记账跳过一条（无 id）：{exc}")
+                continue
+        return text, ids
 
-    async def habit_mark_used(self) -> None:
-        """注入即计一次使用（weight 演化与面板「生效次数」的数据来源）。"""
-        habits = await self.store.list_habits()
-        enabled = [h for h in habits if h.get("enabled")][:6]
-        stamp = time.time()
-        for h in enabled:
-            await self.store.db.execute(
-                "UPDATE hf_habits SET uses=uses+1, updated_at=? WHERE id=?",
-                (stamp, h["id"]),
-            )
-        if enabled:
-            await self.store.db.commit()
+    async def habit_hints(self, persona_id: str = "", limit: int = 6) -> str:
+        """把启用的表达拼成注入片段（表达学习从「只提取不使用」变成真生效）。"""
+        text, _ids = await self.habit_hints_detail(persona_id, limit)
+        return text
+
+    async def habit_mark_used(self, persona_id: str = "", ids: list[int] | None = None) -> int:
+        """表达「用过了」的写侧（E1 一并修）：只盖**本次真注入**那几条的冷却戳，且按人格范围过滤。
+
+        原实现是「给前 6 条 enabled 加 uses+1」——既不看人格（跨人格串号），也不看真注入了谁。
+        S4 之后没有 uses 回写列（拍-5：use_count 走查询聚合），这里只维护冷却戳；
+        不传 ids 直接返回 0（绝不瞎猜是哪些被注入了）。
+        """
+        picked: list[int] = []
+        for x in ids or []:
+            try:
+                v = int(x)
+            except (TypeError, ValueError):
+                continue
+            if v > 0:
+                picked.append(v)
+        if not picked:
+            return 0
+        scopes = self._expr_scopes(persona_id)
+        marks = ",".join("?" for _ in picked)
+        where = f" WHERE id IN ({marks})"
+        args: list[Any] = list(picked)
+        if scopes is not None:
+            where += " AND scope IN (" + ",".join("?" for _ in scopes) + ")"
+            args += sorted(scopes)
+        cur = await self.store.db.execute(
+            f"UPDATE hf_expr SET cooldown_until=?{where}", [time.time() + EXPR_COOLDOWN_SECONDS] + args
+        )
+        await self.store.db.commit()
+        return int(cur.rowcount or 0)
 
     # ---------------- 关系边 ----------------
     async def memory_edges(self, mid: str | int) -> dict[str, Any]:
@@ -2840,16 +4162,53 @@ class StarHeartService:
         return merged
 
     async def save_config(self, patch: dict[str, Any]) -> dict[str, Any]:
-        """保存配置：先写本插件库（per-session 开关的家），再**写回原生插件配置**。
+        """保存配置：先过参数护栏，再写本插件库（per-session 开关的家），最后**写回原生插件配置**。
+
+        护栏（勘误冻结）：越界或踩到「一次改坏」硬拦的整批拒绝 —— 一个字都不写，
+        并把原因抛给调用方（面板直接显示）。校验只覆盖 PARAM_GUARDS 里的键，其余键照旧。
 
         为什么要写回原生：红队审计实测「面板私库 / 原生页 / hf_config」是两份源，只写一份
         就会出现「原生页改了不生效、面板改了原生页看不见」。插件只是调用原生 —— 不另造权威。
         """
+        clean = {k: v for k, v in (patch or {}).items() if k in DEFAULT_CONFIG}
+        # 面板/原生页都可能把数字当字符串发过来：按 schema 收口，避免 "90" 落库后
+        # 又被 JSON 读出来参与比较（"90" != 90），或空串被 Number() 当成 0。
+        _schema = self._load_schema()
+        for _k, _v in list(clean.items()):
+            _spec = _schema.get(_k) or {}
+            _t = str(_spec.get("type") or "").lower()
+            if _t in ("int", "integer", "number", "float") and isinstance(_v, str):
+                _raw = _v.strip()
+                if not _raw:
+                    raise ValueError(f"「{_k}」不能为空")
+                try:
+                    clean[_k] = int(float(_raw)) if _t in ("int", "integer") else float(_raw)
+                except ValueError as exc:
+                    raise ValueError(f"「{_k}」需要数字，收到 {_v!r}") from exc
+            elif _t in ("bool", "boolean") and isinstance(_v, str):
+                clean[_k] = _v.strip().lower() in ("1", "true", "yes", "on", "是", "开")
+            elif _t in ("list", "array") and isinstance(_v, str):
+                clean[_k] = _as_id_list(_v)
+        violations = validate_config_patch(clean, await self.config())
+        if violations:
+            msg = guard_reject_message(violations)
+            try:
+                await self.store.audit("config.reject",
+                                       ",".join(str(v.get("key")) for v in violations)[:160], msg[:200])
+            except Exception as exc:                          # noqa: BLE001 留痕失败不改变拒绝结论
+                logger.warning(f"[StarHeart] 护栏拒绝留痕失败：{exc}")
+            raise ValueError(msg)
+        # 改动前自动留一份快照（可一键回滚到这次保存之前的整库配置）；快照失败不挡保存
+        if clean:
+            try:
+                await self.config_snapshot_save(name="保存前自动快照", auto=True,
+                                                note=",".join(sorted(clean))[:160])
+            except Exception as exc:                          # noqa: BLE001
+                logger.warning(f"[StarHeart] 保存前自动快照失败（不影响保存）：{exc}")
         written: dict[str, Any] = {}
-        for k, v in (patch or {}).items():
-            if k in DEFAULT_CONFIG:
-                await self.store.set_config(k, v)
-                written[k] = v
+        for k, v in clean.items():
+            await self.store.set_config(k, v)
+            written[k] = v
         await self.store.audit("config.save", ",".join(list((patch or {}).keys())[:8]))
         native: dict[str, Any] = {"ok": False, "error": "未接入原生写回"}
         fn = self.system.get("save_native_config")
@@ -2861,7 +4220,80 @@ class StarHeartService:
         out = await self.config()
         if isinstance(out, dict):
             out["_native_write"] = native                     # 面板可见：哪些键真的写进原生配置了
+        # 保存后自动跑一次登记自检：新键如果只加在某一处，下一次保存就会补齐
+        try:
+            await self.config_registry_audit(record=False)
+        except Exception as exc:                              # noqa: BLE001
+            logger.warning(f"[StarHeart] 保存后配置自检失败（不影响保存）：{exc}")
         return out
+
+    # ---------------- 参数快照 / 一键回滚 ----------------
+    async def config_snapshots(self, limit: int = 25) -> dict[str, Any]:
+        """快照列表（设置页「参数快照」卡）。只给元信息，配置本体不出库、不发前端。"""
+        items = await self.store.list_config_snapshots(limit=max(1, min(int(limit or 25), 100)))
+        return {"items": items, "total": await self.store.count_config_snapshots(),
+                "keep": CONFIG_SNAPSHOT_KEEP}
+
+    async def config_snapshot_save(self, name: str = "", auto: bool = False, note: str = "",
+                                   actor: str = "panel") -> dict[str, Any]:
+        """存一份快照：内容是 hf_config 里**真正存着的**键值（回滚就是把它原样写回）。"""
+        cfg = await self.store.all_config()
+        label = str(name or "").strip()[:60] or time.strftime("快照 %m-%d %H:%M")
+        item = await self.store.save_config_snapshot(label, cfg, auto=auto, note=note, actor=actor)
+        try:
+            pruned = await self.store.prune_config_snapshots()
+        except Exception as exc:                              # noqa: BLE001
+            pruned = 0
+            logger.warning(f"[StarHeart] 快照保留清理跳过：{exc}")
+        if not auto:
+            await self.store.audit("config.snapshot", str(item.get("id")), label)
+        return dict(item, pruned=pruned)
+
+    async def config_rollback(self, sid: int, actor: str = "panel") -> dict[str, Any]:
+        """一键回滚：把快照里的键值写回 hf_config，并清掉「快照之后才出现」的配置键。
+
+        回滚前先自动存一份当前值 —— 滚错了还能再滚回来。写回内容以快照为准（哪怕个别值
+        超出今天的护栏范围：那是当时真在生效的值，回滚是用户的显式选择，只提示不拦）。
+        """
+        try:
+            target = int(sid)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("快照 id 不是数字") from exc
+        snap = await self.store.get_config_snapshot(target)
+        if not snap:
+            raise ValueError(f"找不到这份快照（id={target}）")
+        try:
+            saved = json.loads(snap.get("config_json") or "{}")
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"快照内容读不出来：{exc}") from exc
+        if not isinstance(saved, dict) or not saved:
+            raise ValueError("这份快照里没有配置内容，回滚不了")
+        cur = await self.store.all_config()
+        await self.config_snapshot_save(name=f"回滚 #{target} 前的自动快照", auto=True, note="回滚前")
+        restored = {k: v for k, v in saved.items() if k in DEFAULT_CONFIG}
+        skipped = sorted(k for k in saved if k not in DEFAULT_CONFIG)
+        for k, v in restored.items():
+            await self.store.set_config(k, v)
+        # 快照里没有、现在却有的配置键 = 快照之后新加的：一起清掉，值才算真的还原
+        extra = sorted(k for k in cur if k not in saved and k in DEFAULT_CONFIG)
+        for k in extra:
+            await self.store.delete_config_key(k)
+        native: dict[str, Any] = {"ok": False, "error": "未接入原生写回"}
+        fn = self.system.get("save_native_config")
+        if callable(fn) and restored:
+            try:
+                native = await fn(restored)
+            except Exception as exc:                          # noqa: BLE001
+                native = {"ok": False, "error": str(exc)[:120]}
+        after = await self.config()
+        bad = validate_config_patch(restored, after)
+        if bad:
+            logger.warning(f"[StarHeart] 回滚后的配置仍有 {len(bad)} 个键超出当前护栏（按快照原样写回）")
+        await self.store.audit("config.rollback", f"snapshot#{target}",
+                               f"写入 {len(restored)} / 清除 {len(extra)}")
+        return {"ok": True, "id": target, "name": snap.get("name") or "", "ts": snap.get("ts") or 0,
+                "restored": len(restored), "removed": extra, "skipped": skipped,
+                "violations": bad, "native": native, "values": after}
 
     # ---------------- 总览 ----------------
     async def overview(self, persona_id: str = "") -> dict[str, Any]:
@@ -2909,11 +4341,24 @@ class StarHeartService:
         return await self.store.panel_stats(persona_id=persona_id)
 
     async def purge(self, scope: str, session_id: str = "") -> dict[str, Any]:
-        """危险区操作。scope: gate | learning | session。"""
+        """危险区操作。scope: gate | learning | expressions | session。
+
+        两个学习类动作都**先备份再动**（拍-14：备份落数据目录 backups/，保留最近 5 份）：
+        learning = 原语义（记忆+实体+关系+表达，好感保留）；expressions = 只清表达（软删 + 进名单）。
+        返回值带 backup 文件名；"" = 备份没建成 —— 面板必须如实说出来，不假装有备份。
+        """
+        backup = ""
         if scope == "gate":
             removed: Any = await self.store.purge_gate_log()
         elif scope == "learning":
-            removed = await self.store.purge_learning()
+            out = await self.store.purge_learning()
+            backup = str(out.pop("backup", "") or "")
+            removed = out
+        elif scope == "expressions":
+            out = await self.store.purge_expressions()
+            backup = str(out.get("backup") or "")
+            removed = {"soft_deleted": int(out.get("soft_deleted") or 0),
+                       "banned": int(out.get("banned") or 0)}
         elif scope == "session":
             sid = (session_id or "").strip()
             if not sid:
@@ -2921,13 +4366,20 @@ class StarHeartService:
             removed = await self.store.purge_session_memories(sid)
         else:
             raise ValueError(f"unknown scope: {scope}")
-        await self.store.audit(f"purge.{scope}", str(removed))
-        return {"scope": scope, "removed": removed}
+        await self.store.audit(f"purge.{scope}", str(removed), f"backup={backup or '-'}")
+        return {"scope": scope, "removed": removed, "backup": backup}
 
     async def memory_delete(self, mid: str) -> dict[str, Any]:
-        await self.store.delete_memory(mid)
-        await self.store.audit("memory.delete", str(mid))
-        return {"deleted": True}
+        """单条删除 = 软删（可恢复）。面板文案必须跟着改：不是「永久删除」。"""
+        ok = await self.store.delete_memory(mid)
+        await self.store.audit("memory.delete", str(mid), "soft")
+        return {"deleted": bool(ok), "soft": True}
+
+    async def memory_restore(self, mid: str) -> dict[str, Any]:
+        """撤销删除（回收站恢复）。"""
+        ok = await self.store.restore_memory(mid)
+        await self.store.audit("memory.restore", str(mid))
+        return {"restored": bool(ok)}
 
     async def graph(self, limit: int = 4000, persona_id: str = "") -> dict[str, Any]:
         return await self.store.graph(limit, persona_id=persona_id)
@@ -3042,26 +4494,495 @@ class StarHeartService:
             await self.store.audit("recall.withdraw_reply", session_id, f"清掉 bot 语料 {n} 条")
         return n
 
-    # ---------------- 表达习惯 ----------------
-    async def habits(self) -> dict[str, Any]:
-        return {"items": await self.store.list_habits()}
+    # ---------------- 表达习惯（S4：hf_expr） ----------------
+    async def _evidence_health(self, rows: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        """出处回查健康度（E3 / 勘误 D5「证据可回查 ≥95%」）：证据快照逐条对语料库。
+
+        旧库的条目只有 60 字快照、没有 corpus_id → 不计入分母（如实标 n=0，不编数字）。
+        """
+        items = rows if rows is not None else await self.store.list_habits()
+        pairs: list[tuple[int, str]] = []
+        for it in items:
+            snap = it.get("evidence_snap")
+            if not isinstance(snap, list):
+                try:
+                    snap = json.loads(snap or "[]")
+                except (TypeError, ValueError):
+                    snap = []
+            for ev in snap or []:
+                if not isinstance(ev, dict):
+                    continue
+                try:
+                    cid = int(ev.get("corpus_id") or 0)
+                except (TypeError, ValueError):
+                    cid = 0
+                if cid:
+                    pairs.append((cid, str(ev.get("text") or "")))
+        if not pairs:
+            return {"value": None, "n": 0, "state": "INSUFFICIENT_DATA",
+                    "reason": "还没有带出处的表达（旧条目只有 60 字快照，补不齐）"}
+        live = await self.store.corpus_rows_by_ids([c for c, _t in pairs])
+        recoverable = 0
+        for cid, text in pairs:
+            row = live.get(cid)
+            if row and (not text or str(row.get("text") or "").strip() == text.strip()):
+                recoverable += 1
+        return {"value": round(recoverable / len(pairs), 4), "n": len(pairs),
+                "recoverable": recoverable, "state": "ok" if len(pairs) >= 5 else "INSUFFICIENT_DATA"}
+
+    async def habits(self, persona_id: str = "") -> dict[str, Any]:
+        """表达库数据源：条目 + 当前可用性 + 出处回查 + 「不再学」名单 + 审核计数。
+
+        E1（人格隔离 fail-closed + 手加纳入）/ E3（出处可回查）/ S4-2（审核与名单）/
+        S4-3（冷却、24h≤2、use_count 出站命中）的读数全在这一处，面板与注入侧不会两套口径。
+        """
+        cfg = await self.config()
+        pid = str(persona_id or "")
+        review_first = _as_bool(cfg.get("expression_review_first", False))
+        try:
+            min_uses = max(0, int(cfg.get("expression_min_uses") or 0))
+        except (TypeError, ValueError):
+            min_uses = 0
+        items = await self.store.list_habits()
+        bans = await self.store.list_bans()
+        banned = {str(b.get("norm_key") or "") for b in bans}
+        # 出处回查（E3）：证据快照 → 语料行 + 消息 id 侧车（逐字相等才算可回查）
+        cids: list[int] = []
+        for h in items:
+            for ev in h.get("evidence_snap") or []:
+                try:
+                    v = int(ev.get("corpus_id") or 0)
+                except (TypeError, ValueError):
+                    v = 0
+                if v:
+                    cids.append(v)
+        live = await self.store.corpus_rows_by_ids(cids)
+        refs = await self.store.corpus_ref_map(cids)
+        now_ts = time.time()
+        counts = {"total": len(items), "enabled": 0, "pending": 0, "ok": 0, "rejected": 0,
+                  "banned": len(bans), "available": 0}
+        for h in items:
+            state = str(h.get("checked_state") or "")
+            if h.get("enabled"):
+                counts["enabled"] += 1
+            if state in counts:
+                counts[state] += 1
+            label, can = self._expr_availability(
+                h, persona_id=pid, review_first=review_first, min_uses=min_uses,
+                banned=banned, now_ts=now_ts,
+            )
+            h["available_now"] = label
+            h["current_persona_ok"] = bool(can)
+            if can:
+                counts["available"] += 1
+            h["cooldown_active"] = float(h.get("cooldown_until") or 0) > now_ts
+            h["used_24h"] = int(h.get("used_24h") or 0)
+            h["injected_24h"] = int(h.get("injected_24h") or 0)
+            ev_out: list[dict[str, Any]] = []
+            for ev in h.get("evidence_snap") or []:
+                try:
+                    cid = int(ev.get("corpus_id") or 0)
+                except (TypeError, ValueError):
+                    cid = 0
+                row = live.get(cid) if cid else None
+                text = str(ev.get("text") or "")
+                ev_out.append({
+                    **ev, "corpus_id": cid,
+                    "message_id": str((refs.get(cid) or {}).get("message_id") or ev.get("message_id") or ""),
+                    "recoverable": bool(row) and (not text or str(row.get("text") or "").strip() == text.strip()),
+                })
+            h["evidence"] = ev_out
+        return {"items": items, "banned": bans, "review_first": review_first,
+                "counts": counts, "persona_id": pid}
 
     async def habit_save(self, habit: dict[str, Any]) -> dict[str, Any]:
-        hid = await self.store.upsert_habit(habit or {})
-        await self.store.audit("habit.save", str(hid), habit.get("scene", ""))
-        return {"id": hid}
+        """新增/就地编辑一条表达（面板手加与「改说法」）。
+
+        手加归属按拍-4 归一：'手加' → '手加·{pid}'（pid 拿不到就保持 '手加'）。
+        手加是用户自己写的 → 建行即 user_ok（不受「先审后用」影响，否则用户手加的还要自己审自己）。
+        """
+        h = dict(habit or {})
+        pid = await self._active_pid()
+        scope = str(h.get("scope") or "")
+        if not scope or scope.startswith("手加"):
+            h["scope"] = f"手加·{pid}" if pid else "手加"
+        else:
+            h["scope"] = scope
+        h["norm_key"] = str(h.get("norm_key") or "").strip() or expr_norm_key(h.get("scene", ""), h.get("way", ""))
+        if not h.get("id"):
+            h.setdefault("checked_state", "user_ok")
+        hid = await self.store.upsert_expr(h)
+        await self.store.audit("habit.save", str(hid), str(h.get("scene") or "")[:40])
+        return {"id": hid, "scope": h["scope"], "norm_key": h["norm_key"]}
 
     async def habit_delete(self, hid: int) -> dict[str, Any]:
-        await self.store.delete_habit(int(hid))
-        await self.store.audit("habit.delete", str(hid))
-        return {"deleted": True}
+        """「删除」= 软删 + 写「不再学」名单（S4-2 / 拍-14）—— 修「删了还会再学」。
+
+        真删归数据治理（设置 · 数据治理 →「只清表达」）。行还在，移出名单即恢复。
+        """
+        out = await self.store.archive_expr(int(hid), actor="panel")
+        await self.store.audit("habit.delete", str(hid), f"banned={out.get('banned')}")
+        return {"deleted": True, "archived": int(out.get("archived") or 0),
+                "banned": int(out.get("banned") or 0)}
+
+    # ---------------- 审核 / 名单 / 诊断（S4-2 / S4-4） ----------------
+    async def expr_review(self, ids: list[int], action: str, reason: str = "") -> dict[str, Any]:
+        """审核状态机（POST expr/review）：approve → user_ok；reject → user_reject + 进名单。"""
+        act = "approve" if str(action) == "approve" else "reject"
+        out = await self.store.set_expr_review(ids, act, reason=str(reason or ""), actor="panel")
+        await self.store.audit(f"expr.review.{act}", str(out.get("ids") or []), f"reason={reason or '-'}")
+        return {"ok": True, "action": act, **out}
+
+    async def expr_review_queue(self, limit: int = 200) -> dict[str, Any]:
+        """GET expr/review：待审行 + 四种计数（面板「待审 N」与菜单徽标的数据源）。"""
+        return await self.store.expr_review_queue(limit)
+
+    async def expr_bans(self, limit: int = 200) -> dict[str, Any]:
+        items = await self.store.list_bans(limit)
+        return {"items": items, "total": len(items)}
+
+    async def expr_ban_remove(self, norm_key: str) -> dict[str, Any]:
+        """移出「不再学」名单（v8「可移出」）：同键可再学，被软删的同键行一并恢复。"""
+        out = await self.store.remove_ban(norm_key)
+        await self.store.audit("expr.ban.remove", str(norm_key), f"removed={out.get('removed')}")
+        return {"ok": bool(out.get("removed") or out.get("restored")), **out}
+
+    async def expr_runs(self, limit: int = 20) -> dict[str, Any]:
+        """GET expr/runs：运行行 + 语料存量 + 出处健康度 + 原因枚举（面板③学习诊断）。"""
+        return {
+            "items": await self.store.expr_runs(limit),
+            "corpus": {**(await self.store.corpus_stats()), "unused": await self.store.corpus_unused_count()},
+            "health": await self._evidence_health(),
+            "skipped_reason_enum": _skip_reason_enum(),
+        }
+
+    # ---------------- S5 黑话（hf_jargon）：理解注入 / 命中记账 / 人工闸门 / 试解读 ----------------
+    @staticmethod
+    def _jargon_mechanical_matches(text: str, pool: list[dict[str, Any]],
+                                   limit: int = JARGON_MATCH_LIMIT) -> list[dict[str, Any]]:
+        """机械匹配器 —— 命中日志与理解注入共用（round1-C1 §4「写一次两用」）。
+
+        朴素子串（小写化）、长词优先；命中的片段从比对串里抹掉，
+        防「破防了 / 破防」这类同区域重复记账。上限 = JARGON_MATCH_LIMIT（上游 10）。
+        """
+        low = str(text or "").lower()
+        if not low:
+            return []
+        out: list[dict[str, Any]] = []
+        for row in sorted(pool, key=lambda r: -len(str(r.get("term") or ""))):
+            if len(out) >= max(1, int(limit)):
+                break
+            t = str(row.get("term") or "").strip().lower()
+            if not t or t not in low:
+                continue
+            out.append(row)
+            low = low.replace(t, " ")
+        return out
+
+    async def jargon_context_block(self, text: str, scopes: list[str],
+                                   session_id: str = "") -> tuple[str, list[dict[str, Any]]]:
+        """入站消息的黑话处理：机械匹配 → 命中记账（hf_jargon_hit）→ 拼「理解参考」注入片段。
+
+        硬约束（S5 全条）：这段只进 prompt 供听懂，**不进回复库、不产生任何回复**；
+        命中日志与理解注入共用同一匹配器（写一次两用）。无命中原样返回空串。
+        """
+        try:
+            pool = await self.store.jargon_match_pool(list(scopes or []))
+        except Exception as exc:                            # noqa: BLE001 读不到候选池=本轮不注入
+            logger.warning(f"[StarHeart] 黑话候选池读取失败（本轮不注入）：{exc}")
+            return "", []
+        matched = self._jargon_mechanical_matches(text, pool)
+        if not matched:
+            return "", []
+        rows: list[dict[str, Any]] = []
+        lines: list[str] = []
+        for m in matched:
+            meaning = str(m.get("meaning") or "").strip()
+            rows.append({"term_id": int(m["id"]), "session_id": str(session_id or ""),
+                         "msg": str(text or ""), "injected": 1 if meaning else 0})
+            if meaning:
+                lines.append(f"- {m['term']}：{meaning}")
+        await self.store.jargon_log_hits(rows)
+        if not lines:
+            return "", matched                           # 全是没释义的待推断词：只记账，不占 prompt
+        block = ("【黑话理解参考】群友用的这些词/梗，只用于听懂他们在说什么，"
+                 "**不要照搬进你自己的回复**：\n" + "\n".join(lines))
+        return block, matched
+
+    async def jargon_list(self, status: str = "", q: str = "", scope: str = "") -> dict[str, Any]:
+        """GET jargon：黑话清单 + 计数 + 命中聚合 + 「未进入回复库」标记 + 阈值/配额读数（块②）。"""
+        st = str(status or "").strip()
+        if st and st not in JARGON_STATUSES:
+            st = ""
+        items = await self.store.jargon_list(status=st, q=q, scope=scope)
+        stats_map = await self.store.jargon_hit_stats()
+        exprs = await self.store.jargon_expr_map()
+        counts = {"total": len(items), "pending": 0, "confirmed": 0, "denied": 0, "enabled": 0, "hits": 0}
+        for it in items:
+            stt = str(it.get("status") or "")
+            if stt in counts:
+                counts[stt] += 1
+            if it.get("enabled"):
+                counts["enabled"] += 1
+            agg = stats_map.get(int(it.get("id") or 0)) or {}
+            it["sessions"] = int(agg.get("sessions") or 0)
+            it["hits_logged"] = int(agg.get("hits") or 0)
+            it["in_reply_lib"] = bool(exprs.get(str(it.get("term") or "")))
+            counts["hits"] += int(it.get("hit_count") or 0)
+        cfg = await self.config()
+        return {
+            "items": items,
+            "counts": counts,
+            "status_enum": list(JARGON_STATUSES),
+            "config": {
+                "jargon_enabled": _as_bool(cfg.get("jargon_enabled", True)),
+                "jargon_name_filter": _as_bool(cfg.get("jargon_name_filter", True)),
+                "candidate_min_sessions": int(cfg.get("jargon_candidate_min_sessions") or 2),
+                "candidate_min_hits": int(cfg.get("jargon_candidate_min_hits") or 4),
+                "infer_daily_batches": int(cfg.get("jargon_infer_daily_batches") or 0),
+                "try_daily_quota": int(cfg.get("jargon_try_daily_quota") or 0),
+                "try_used_today": await self._jargon_quota_peek("jargon_try_day", "jargon_try_day_count"),
+            },
+        }
+
+    async def jargon_decide(self, jid: int, action: str) -> dict[str, Any]:
+        """人工闸门（洞③）：confirm → confirmed（启用）；deny → denied（归档：不再推断、不再注入）。"""
+        act = str(action or "").strip()
+        if act not in ("confirm", "deny"):
+            raise ValueError(f"不认识的动作：{action!r}（只接受 confirm / deny）")
+        target = int(jid)
+        row = await self.store.jargon_get(target)
+        if not row:
+            raise ValueError(f"没有这条黑话（id={target}）")
+        if act == "confirm":
+            await self.store.jargon_set_status(target, "confirmed", enabled=1)
+        else:
+            await self.store.jargon_set_status(target, "denied", enabled=0)
+        await self.store.audit(f"jargon.{act}", f"#{target} {str(row.get('term') or '')[:40]}")
+        return {"ok": True, "id": target, "status": "confirmed" if act == "confirm" else "denied"}
+
+    async def jargon_save(self, jid: int, term: str = "", meaning: str = "",
+                          enabled: Any = None) -> dict[str, Any]:
+        """改词条 / 改释义 / 停用-启用（人工）。长度超限直接拒绝（不静默截断）。"""
+        target = int(jid)
+        t = str(term or "").strip()
+        if not t:
+            raise ValueError("词条不能为空")
+        if len(t) > JARGON_TERM_MAX_CHARS:
+            raise ValueError(f"词条最长 {JARGON_TERM_MAX_CHARS} 字")
+        if len(str(meaning or "")) > JARGON_MEANING_MAX_CHARS:
+            raise ValueError(f"释义最长 {JARGON_MEANING_MAX_CHARS} 字")
+        if not await self.store.jargon_get(target):
+            raise ValueError(f"没有这条黑话（id={target}）")
+        n = await self.store.jargon_update(
+            target, term=t, meaning=str(meaning or ""),
+            enabled=(None if enabled is None else (1 if _as_bool(enabled) else 0)),
+        )
+        await self.store.audit("jargon.save", f"#{target}", t[:40])
+        return {"ok": bool(n), "id": target, "changed": int(n)}
+
+    async def jargon_delete(self, jid: int) -> dict[str, Any]:
+        """真删（行 + 命中日志）。注意：「否定」≠ 删除 —— 否定是归档（denied），不动数据。"""
+        target = int(jid)
+        out = await self.store.jargon_delete(target)
+        await self.store.audit("jargon.delete", f"#{target}", f"hits={out.get('hits_removed')}")
+        return {"ok": bool(out.get("deleted")), **out}
+
+    async def jargon_hits(self, term_id: int, limit: int = 20) -> dict[str, Any]:
+        """GET jargon/hits：命中日志（验证物①）—— 哪一轮真的读到了这个词、原话是什么。"""
+        target = int(term_id)
+        items = await self.store.jargon_hits_list(target, limit)
+        row = await self.store.jargon_get(target)
+        return {"items": items, "term": str((row or {}).get("term") or ""), "total": len(items)}
+
+    async def jargon_check(self) -> dict[str, Any]:
+        """GET jargon/check：「未进入回复库 ✓」检查行（验证物②）——黑话词是否漏进表达库。"""
+        exprs = await self.store.jargon_expr_map()
+        violations = [v for group in exprs.values() for v in group]
+        terms = await self.store.jargon_list()
+        return {"violations": violations, "checked": len(terms), "ok": not violations}
+
+    # ---- 试解读 / 推断（拍-19：手动触发 + 每日配额；hard 约束 = 不进回复库） ----
+    @staticmethod
+    def _jargon_day() -> str:
+        return time.strftime("%Y-%m-%d", time.localtime())
+
+    async def _jargon_quota_peek(self, day_key: str, cnt_key: str) -> int:
+        cfg = await self.config()
+        if str(cfg.get(day_key) or "") != self._jargon_day():
+            return 0                                        # 跨天自动归零（读侧）
+        try:
+            return max(0, int(cfg.get(cnt_key) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    async def _jargon_quota_take(self, day_key: str, cnt_key: str) -> int:
+        """记一次今日用量（写侧同样跨天归零）。返回记完之后今日已用次数。"""
+        used = (await self._jargon_quota_peek(day_key, cnt_key)) + 1
+        await self.store.set_config(day_key, self._jargon_day())
+        await self.store.set_config(cnt_key, used)
+        return used
+
+    async def jargon_try(self, text: str) -> dict[str, Any]:
+        """POST jargon/try 试解读（验证物③，拍-19）：手动触发；走「表达提取」离线槽位。
+
+        约束：单次 ≤1 条短请求、输出 ≤200 tokens（提示词写死）；每日配额默认 20（可调）。
+        硬约束：只读理解 —— 不调用任何发送/回复路径，reply_side 恒为 "blocked"；
+        不写命中日志（试解读不是入站消息，不污染「被观察到的命中次数」口径）。
+        """
+        raw = str(text or "").strip()
+        if not raw:
+            raise ValueError("先打一句话再试解读")
+        cfg = await self.config()
+        quota = max(0, int(cfg.get("jargon_try_daily_quota") or 0))
+        used = await self._jargon_quota_peek("jargon_try_day", "jargon_try_day_count")
+        if quota and used >= quota:
+            return {"ok": False, "error": f"今日试解读配额已用完（{used}/{quota}；可在参数中心调大）",
+                    "reading": "", "matched": [], "reply_side": "blocked",
+                    "quota": {"limit": quota, "used": used}}
+        pool = [r for r in await self.store.jargon_list()
+                if int(r.get("enabled") or 0) and str(r.get("status")) in ("pending", "confirmed")]
+        matched = self._jargon_mechanical_matches(raw, pool)
+        gen = self.system.get("llm_generate")
+        if callable(gen):
+            used = await self._jargon_quota_take("jargon_try_day", "jargon_try_day_count")
+            matched_txt = "\n".join(f"- {m['term']}：{str(m.get('meaning') or '').strip() or '（暂无释义）'}"
+                                    for m in matched) or "（这句里没有已学到的词条）"
+            prompt = JARGON_TRY_PROMPT.format(text=raw, matched=matched_txt, cap=JARGON_TRY_MAX_TOKENS)
+            try:
+                reading = str(await gen(prompt, "expression_extract") or "").strip()[:600]
+            except Exception as exc:                        # noqa: BLE001 模型失败如实回报，不假装有解读
+                logger.warning(f"[StarHeart] 试解读模型调用失败：{exc}")
+                reading = f"（模型调用失败：{str(exc)[:120]}）"
+        else:
+            reading = "（模型通道不可用：先去「设置 · 模型分配」给「表达提取」选一个模型）"
+        await self.store.audit("jargon.try", raw[:40], f"matched={len(matched)} used={used}/{quota or '∞'}")
+        return {
+            "ok": True,
+            "reading": reading,
+            "matched": [{"id": int(m["id"]), "term": str(m["term"]),
+                         "meaning": str(m.get("meaning") or ""), "scope": str(m.get("scope") or "")}
+                        for m in matched],
+            "reply_side": "blocked",
+            "quota": {"limit": quota, "used": used},
+            "note": "试解读只做理解：结果不进回复库、不产生任何回复",
+        }
+
+    async def jargon_infer_batch(self) -> dict[str, Any]:
+        """机械候选 → 一批 LLM 含义推断（拍-16：每日 ≤jargon_infer_daily_batches 批，默认 1）。
+
+        · 候选门槛 = 跨 ≥min_sessions 会话、出现 ≥min_hits 次（参数中心可调）；
+        · 人名过滤（洞②）在候选侧生效（接 hf_person_names）；
+        · 只产 pending：确认/否定仍是全人工（洞③）；denied 的词不再参与推断（不再学）。
+        """
+        cfg = await self.config()
+        if not _as_bool(cfg.get("jargon_enabled", True)):
+            return {"ok": False, "skipped_reason": "disabled", "created": 0}
+        try:
+            daily = max(0, int(cfg.get("jargon_infer_daily_batches") or 0))
+        except (TypeError, ValueError):
+            daily = 0
+        if daily <= 0:
+            return {"ok": False, "skipped_reason": "disabled", "created": 0}
+        used = await self._jargon_quota_peek("jargon_infer_day", "jargon_infer_day_count")
+        if used >= daily:
+            return {"ok": False, "skipped_reason": "daily_cap", "created": 0, "used": used, "limit": daily}
+        gen = self.system.get("llm_generate")
+        if not callable(gen):
+            return {"ok": False, "skipped_reason": "model_unavailable", "created": 0}
+        try:
+            min_sessions = max(1, int(cfg.get("jargon_candidate_min_sessions") or 2))
+            min_hits = max(1, int(cfg.get("jargon_candidate_min_hits") or 4))
+        except (TypeError, ValueError):
+            min_sessions, min_hits = 2, 4
+        rows = await self.store.list_corpus(limit=JARGON_CORPUS_SCAN, is_bot=0)
+        exclude = await self.store.jargon_existing_terms()
+        names: set[str] = set()
+        if _as_bool(cfg.get("jargon_name_filter", True)):
+            names = set(await self.store.person_names_all())
+        cands = _mine_jargon_candidates(rows, min_sessions=min_sessions, min_hits=min_hits,
+                                        exclude_terms=exclude, name_terms=names)
+        if not cands:
+            return {"ok": True, "skipped_reason": "no_candidates", "created": 0, "scanned": len(rows)}
+        prompt = JARGON_INFER_PROMPT_HEAD + "\n".join(
+            f"{c['term']}（出现 {c['hits']} 次 / {c['sessions']} 个会话）" for c in cands
+        )
+        try:
+            out = await gen(prompt, "expression_extract")
+        except Exception as exc:                            # noqa: BLE001 推断失败不下配额（可重试）
+            logger.warning(f"[StarHeart] 黑话含义推断失败：{exc}")
+            return {"ok": False, "skipped_reason": "model_error", "created": 0, "error": str(exc)[:160]}
+        used = await self._jargon_quota_take("jargon_infer_day", "jargon_infer_day_count")
+        by_term = {str(c["term"]).lower(): c for c in cands}
+        created = 0
+        got: list[dict[str, Any]] = []
+        for line in str(out or "").splitlines():
+            raw = line.strip().lstrip("-*0123456789. ")
+            if "|" not in raw:
+                continue
+            term, _, meaning = raw.partition("|")
+            term, meaning = term.strip(), meaning.strip()
+            cand = by_term.get(term.lower())
+            if not cand or not meaning or meaning.lower().strip("。 .") in _ANN_NO:
+                continue
+            evidence = [{"text": str(s.get("text") or "")[:200], "ts": float(s.get("ts") or 0),
+                         "session": str(s.get("session_id") or ""),
+                         "who": str(s.get("user_name") or s.get("user_id") or "")}
+                        for s in (cand.get("samples") or [])]
+            jid, is_new = await self.store.jargon_upsert({
+                "term": term, "meaning": meaning[:JARGON_MEANING_MAX_CHARS], "status": "pending",
+                "scope": str(cand.get("scope") or "全局"), "evidence_json": evidence,
+            })
+            if is_new:
+                created += 1
+                got.append({"id": jid, "term": term, "meaning": meaning[:80]})
+        await self.store.audit("jargon.infer", f"candidates={len(cands)}",
+                               f"created={created} batch={used}/{daily}")
+        return {"ok": True, "scanned": len(rows), "candidates": len(cands), "created": created,
+                "used": used, "limit": daily, "items": got}
 
     # ---------------- 门控 / token ----------------
     async def gate_log(self, limit: int = 100, offset: int = 0) -> dict[str, Any]:
-        return {
+        """门控页数据源：老的逐条流水 + 决策流水（带人工改判列，供「逐条改判」用）。
+
+        决策流水读取失败只记 WARNING：它是新增的账，不该拖垮门控页原有的那半张表。
+        """
+        out: dict[str, Any] = {
             "items": await self.store.list_gate(max(1, min(limit, 200)), max(0, offset)),
             "total": await self.store.count_gate(),
         }
+        try:
+            out["decisions"] = {
+                "items": await self.store.list_decisions(limit=max(5, min(int(limit or 30), 60)), offset=0),
+                "total": await self.store.count_decisions(),
+            }
+        except Exception as exc:                              # noqa: BLE001
+            logger.warning(f"[StarHeart] 决策流水读取失败（门控页只少这一块）：{exc}")
+            out["decisions"] = {"items": [], "total": 0, "error": str(exc)[:160]}
+        return out
+
+    async def gate_verdict(self, did: int, verdict: str, actor: str = "panel") -> dict[str, Any]:
+        """门控行内改判：把人工判定写回决策流水（hf_decision_log.user_verdict）并留审计。
+
+        只记账：不改判定结果、不写任何训练样本（样本表还没建）。重复提交同一判定是幂等的。
+        """
+        v = str(verdict or "").strip()
+        if v not in GATE_VERDICTS:
+            raise ValueError(f"不认识的判定值：{verdict!r}（只接受 {'/'.join(GATE_VERDICTS)}）")
+        try:
+            target = int(did)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("决策记录 id 不是数字") from exc
+        if target <= 0:
+            raise ValueError("缺少决策记录 id")
+        ok = await self.store.set_decision_verdict(target, "" if v == "clear" else v, actor)
+        if not ok:
+            raise ValueError(f"没有这条决策记录（id={target}）")
+        row = await self.store.get_decision(target)
+        await self.store.audit("gate.verdict", f"decision#{target}", GATE_VERDICTS[v])
+        return {"id": target, "verdict": v, "label": GATE_VERDICTS[v],
+                "user_verdict": (row or {}).get("user_verdict", ""),
+                "verdict_at": (row or {}).get("verdict_at", 0) or 0}
 
     async def tokens(self, days: int = 7) -> dict[str, Any]:
         return await self.store.tokens_summary(days)
@@ -3409,8 +5330,8 @@ class StarHeartService:
     async def lifecycle_preview(self) -> dict[str, Any]:
         """面板要看的两条队列 + 现状统计（只读）。"""
         cfg = await self.config()
-        arch = float(cfg.get("archive_after_days") or 30)
-        forg = float(cfg.get("forget_after_days") or 30)
+        arch = 90.0 if cfg.get("archive_after_days") is None else float(cfg["archive_after_days"])
+        forg = 180.0 if cfg.get("forget_after_days") is None else float(cfg["forget_after_days"])
         queue = await self.store.memory_lifecycle_scan(archive_days=arch, forget_days=forg)
         nowt = __import__("time").time()
         arch_cut = nowt - arch * 86400
@@ -3419,8 +5340,8 @@ class StarHeartService:
             "enabled": bool(cfg.get("forget_enabled", True)),
             "archive_after_days": arch,
             "forget_after_days": forg,
-            "min_strength": float(cfg.get("forget_min_strength") or 0.35),
-            "keep_poignancy": float(cfg.get("forget_keep_poignancy") or 8),
+            "min_strength": 0.2 if cfg.get("forget_min_strength") is None else float(cfg["forget_min_strength"]),
+            "keep_poignancy": 6.0 if cfg.get("forget_keep_poignancy") is None else float(cfg["forget_keep_poignancy"]),
             "counts": await self.store.lifecycle_counts(),
             "archive_queue": [x for x in queue if x.get("status") == "active" and float(x.get("last_touch") or 0) < arch_cut],
             "forget_queue": [x for x in queue if x.get("status") == "archived"],
@@ -3431,10 +5352,12 @@ class StarHeartService:
         cfg = await self.config()
         if not cfg.get("forget_enabled", True):
             return {"ok": True, "skipped": "自动遗忘已关闭"}
-        arch = float(cfg.get("archive_after_days") or 30)
-        forg = float(cfg.get("forget_after_days") or 30)
-        min_s = float(cfg.get("forget_min_strength") or 0.35)
-        keep_p = float(cfg.get("forget_keep_poignancy") or 8)
+        # 0 是合法值（= 立刻归档），不能被 `or` 吞成默认值；只有 None 才取默认。
+        # 默认值同步上调：30/30 太短，两个月的沉默不该等于死亡。
+        arch = 90.0 if cfg.get("archive_after_days") is None else float(cfg["archive_after_days"])
+        forg = 180.0 if cfg.get("forget_after_days") is None else float(cfg["forget_after_days"])
+        min_s = 0.2 if cfg.get("forget_min_strength") is None else float(cfg["forget_min_strength"])
+        keep_p = 6.0 if cfg.get("forget_keep_poignancy") is None else float(cfg["forget_keep_poignancy"])
         limit = int(limit or cfg.get("forget_batch_per_tick") or 20)
         pv = await self.lifecycle_preview()
         arch_ids = [int(x["id"]) for x in pv["archive_queue"][:limit]]
@@ -3655,3 +5578,266 @@ class StarHeartService:
             "per_kind": per,
             "counts": {"gate": int(gate_all), "pro": sent + skipped + cand, "recall": int(recall_total)},
         }
+
+    # ===================== 拟人指标（只读聚合：六指标 + 长度分布 + 门控因子分布） =====================
+    # 三态纪律：ok / INSUFFICIENT_DATA（样本不足）/ NOT_IMPLEMENTED（口径未接）/ ERROR（读失败）。
+    # 非 ok 一律 value=null，不返 0 冒充。每项 definition 写清算法：口径变化只改这里，前端不重算。
+    # 出站口径：只统计真发出（emit_ok=0 不计入；首条未确认单独记账并按已交发计入，见 main._log_first_seg）。
+    N_MIN_ABS = 200              # 绝对类指标最小样本（长度/连发/回复间隔/因子分布）
+    N_MIN_RATIO = 250            # 比例类指标最小样本（沉默率/表情率/表达命中率）
+    BURST_GAP_SECONDS = 30.0     # 连发：同会话相邻两条发出间隔 ≤ 30s 算同一串
+    REPLY_WINDOW_SECONDS = 600.0 # 回复间隔：入站消息后 10 分钟内跟上的第一条发出才算回复
+    READ_LIMIT = 20000           # 每类流水最多读入的行数（取窗口内最近 N 行）
+
+    @staticmethod
+    def _pct(values: list[float], p: float) -> float | None:
+        """最近秩分位（样本为空返回 None，不返 0 冒充）。"""
+        if not values:
+            return None
+        xs = sorted(float(v) for v in values)
+        idx = min(len(xs) - 1, max(0, int(round((len(xs) - 1) * p))))
+        return round(xs[idx], 1)
+
+    @staticmethod
+    def _read_err(table: str, exc: Exception) -> str:
+        """读失败的原因文案：与「样本不足/未实现」严格区分（随接口 reason 返回）。"""
+        return f"读失败（{table}）：{str(exc)[:160]}"
+
+    async def metrics(self, days: int = 30) -> dict[str, Any]:
+        """拟人指标页数据源（GET /page/metrics）：每项带 n 与 state，空表/样本不足/读失败如实报态。"""
+        window = max(1, int(days))
+        since = time.time() - window * 86400
+        db = self.store.db
+        out: dict[str, Any] = {
+            "ok": True,
+            "window_days": window,
+            "n_min": {"absolute": self.N_MIN_ABS, "ratio": self.N_MIN_RATIO},
+            "metrics": {},
+            "length_dist": {"state": "INSUFFICIENT_DATA", "n": 0, "bins": [],
+                            "p50": None, "p90": None, "mean": None},
+            "gate_factors": {"state": "INSUFFICIENT_DATA", "n": 0, "items": [],
+                            "note": "只统计出现过该因子的记录；constant=窗口内该因子只有一个取值（低频因子的恒值未必代表退化）"},
+            "notes": [
+                "沉默率与因子分布取自决策记录；长度、连发、回复间隔、表情率取自发送记录；表达命中率等待出站对账接入。",
+                f"统计窗口 = 最近 {window} 天；每类最多读取窗口内最近 20000 行；发送失败的记录不计入出站指标。",
+                "每轮回复的首条由框架管线直接发出、拿不到发送回执：单独记账并以「未确认」计入出站指标。",
+            ],
+        }
+
+        # ---------- 决策流水：沉默率 + 因子分布 ----------
+        dec: list[dict[str, Any]] = []
+        dec_err = ""
+        try:
+            rows = await (await db.execute(
+                "SELECT ts,session_id,decision,factors_json FROM hf_decision_log"
+                " WHERE ts>=? ORDER BY ts DESC LIMIT ?", (since, self.READ_LIMIT))).fetchall()
+            dec = [dict(r) for r in rows]
+        except Exception as exc:                            # noqa: BLE001 表不可读 → ERROR + reason
+            dec_err = self._read_err("hf_decision_log", exc)
+            out["decision_error"] = dec_err
+        n_dec = len(dec)
+        n_silent = sum(1 for d in dec if str(d.get("decision") or "") in ("silent", "backoff", "blocked"))
+        sil_state = ("ok" if n_dec >= self.N_MIN_RATIO
+                     else ("ERROR" if dec_err else "INSUFFICIENT_DATA"))
+        out["metrics"]["silence_rate"] = {
+            "value": (round(n_silent / n_dec, 4) if sil_state == "ok" else None),
+            "n": n_dec,
+            "n_min": self.N_MIN_RATIO,
+            "state": sil_state,
+            "definition": "沉默率 = 门控判定为沉默/退避/拦截的轮数 ÷ 有决策记录的轮数；影子模式下的判定同样计入",
+            "reason": dec_err,
+        }
+        fac: dict[str, dict[str, int]] = {}
+        for d in dec:
+            try:
+                f = json.loads(d.get("factors_json") or "{}")
+            except (TypeError, ValueError):
+                f = {}
+            if not isinstance(f, dict):
+                continue
+            for k, v in f.items():
+                vals = fac.setdefault(str(k), {})
+                vals[str(v)] = vals.get(str(v), 0) + 1
+        items: list[dict[str, Any]] = []
+        for k, vals in sorted(fac.items(), key=lambda kv: -sum(kv[1].values())):
+            top = sorted(vals.items(), key=lambda kv: (-kv[1], kv[0]))[:3]
+            items.append({
+                "factor": k,
+                "n": sum(vals.values()),
+                "distinct": len(vals),
+                "constant": len(vals) <= 1,
+                "top": [{"value": v, "n": c} for v, c in top],
+            })
+        fac_state = ("ok" if n_dec >= self.N_MIN_ABS
+                     else ("ERROR" if dec_err else "INSUFFICIENT_DATA"))
+        out["gate_factors"] = {
+            "state": fac_state,
+            "n": n_dec,
+            "n_min": self.N_MIN_ABS,
+            "items": items,
+            "reason": dec_err,
+            "note": "只统计出现过该因子的记录；constant=窗口内该因子只有一个取值（低频因子的恒值未必代表退化）",
+        }
+
+        # ---------- 出站流水：长度 / 连发 / 回复间隔 / 表情率 ----------
+        # 口径 = 真发出：emit_ok=0（确认失败）不计入；NULL 是首条未确认（见 main._log_first_seg），按已交发计入。
+        sent: list[dict[str, Any]] = []
+        sent_err = ""
+        try:
+            rows = await (await db.execute(
+                "SELECT ts,session_id,kind,length_chars FROM hf_sent_log"
+                " WHERE ts>=? AND (emit_ok=1 OR emit_ok IS NULL) ORDER BY ts DESC LIMIT ?",
+                (since, self.READ_LIMIT))).fetchall()
+            sent = [dict(r) for r in rows]
+        except Exception as exc:                            # noqa: BLE001
+            sent_err = self._read_err("hf_sent_log", exc)
+        n_sent = len(sent)
+        sent_state = ("ok" if n_sent >= self.N_MIN_ABS
+                      else ("ERROR" if sent_err else "INSUFFICIENT_DATA"))
+        sent_by_sess: dict[str, list[float]] = {}
+        for s in sent:
+            sent_by_sess.setdefault(str(s.get("session_id") or ""), []).append(float(s.get("ts") or 0))
+        for v in sent_by_sess.values():
+            v.sort()
+
+        # 长度 P50（去空白单条长度；hf_sent_log.length_chars 写入时即去空白）
+        lengths = [int(s.get("length_chars") or 0) for s in sent if int(s.get("length_chars") or 0) > 0]
+        len_state = ("ok" if len(lengths) >= self.N_MIN_ABS
+                     else ("ERROR" if sent_err else "INSUFFICIENT_DATA"))
+        out["metrics"]["length_p50"] = {
+            "value": (self._pct(lengths, 0.5) if len_state == "ok" else None),
+            "unit": "字",
+            "n": len(lengths),
+            "n_min": self.N_MIN_ABS,
+            "state": len_state,
+            "definition": "去空白单条长度（拆段后每条单独算）的 P50；发送失败不计入",
+            "reason": sent_err,
+        }
+
+        # 连发条数（同会话相邻发出间隔 ≤30s 的连续段长度）
+        bursts: list[int] = []
+        for tss in sent_by_sess.values():
+            run = 1 if tss else 0
+            for a, b in zip(tss, tss[1:]):
+                if (b - a) <= self.BURST_GAP_SECONDS:
+                    run += 1
+                else:
+                    bursts.append(run)
+                    run = 1
+            if tss:
+                bursts.append(run)
+        out["metrics"]["burst_length"] = {
+            "value": (self._pct(bursts, 0.5) if sent_state == "ok" else None),
+            "unit": "条",
+            "n": n_sent,
+            "n_extra": {"bursts": len(bursts), "mean": (round(sum(bursts) / len(bursts), 2) if bursts else None)},
+            "n_min": self.N_MIN_ABS,
+            "state": sent_state,
+            "definition": "连发条数 = 同会话内相邻两条发出间隔 ≤30 秒的连续段长度（报 P50，段数见 n_extra.bursts）；发送失败不计入",
+            "reason": sent_err,
+        }
+
+        # 回复间隔 P50（入站消息 → 其后的第一条发出；同一条发出只计一次，避免被连续多条入站重复计入）
+        dec_by_sess: dict[str, list[float]] = {}
+        for d in dec:
+            dec_by_sess.setdefault(str(d.get("session_id") or ""), []).append(float(d.get("ts") or 0))
+        gaps: list[float] = []
+        for sid, dts in dec_by_sess.items():
+            stss = sent_by_sess.get(sid) or []
+            if not stss:
+                continue
+            ptr = 0
+            for t in sorted(dts):
+                while ptr < len(stss) and stss[ptr] < t:
+                    ptr += 1
+                if ptr >= len(stss):
+                    break
+                if (stss[ptr] - t) <= self.REPLY_WINDOW_SECONDS:
+                    gaps.append(stss[ptr] - t)
+                    ptr += 1                                 # 这条发出已配对，下一条入站从再下一条发出找
+        ri_state = ("ok" if len(gaps) >= self.N_MIN_ABS
+                    else ("ERROR" if (sent_err or dec_err) else "INSUFFICIENT_DATA"))
+        out["metrics"]["reply_interval_p50"] = {
+            "value": (self._pct(gaps, 0.5) if ri_state == "ok" else None),
+            "unit": "秒",
+            "n": len(gaps),
+            "n_min": self.N_MIN_ABS,
+            "state": ri_state,
+            "definition": "回复间隔 = 入站消息 → 其后的第一条发出（同一条发出只计一次）的时间差（报 P50）；发送失败不计入",
+            "reason": sent_err or dec_err,
+        }
+
+        # 表情率（表情包发出 ÷ 全部发出）
+        n_sticker = sum(1 for s in sent if str(s.get("kind") or "") == "sticker")
+        sticker_state = ("ok" if n_sent >= self.N_MIN_RATIO
+                         else ("ERROR" if sent_err else "INSUFFICIENT_DATA"))
+        out["metrics"]["sticker_rate"] = {
+            "value": (round(n_sticker / n_sent, 4) if sticker_state == "ok" else None),
+            "n": n_sent,
+            "n_min": self.N_MIN_RATIO,
+            "state": sticker_state,
+            "definition": "表情率 = 表情包（sticker）发出条数 ÷ 全部发出条数；发送失败不计入",
+            "reason": sent_err,
+        }
+
+        # ---------- 表达命中率（分子待出站对账接入） ----------
+        n_expr = n_recon = n_hit = 0
+        expr_err = ""
+        try:
+            row = await (await db.execute(
+                "SELECT COUNT(*) AS n,"
+                " SUM(CASE WHEN emit_ok IS NOT NULL THEN 1 ELSE 0 END) AS recon,"
+                " SUM(CASE WHEN emit_ok=1 THEN 1 ELSE 0 END) AS hits"
+                " FROM hf_expr_use_log WHERE used_at>=?", (since,))).fetchone()
+            n_expr = int(row["n"] or 0)
+            n_recon = int(row["recon"] or 0)
+            n_hit = int(row["hits"] or 0)
+        except Exception as exc:                            # noqa: BLE001
+            expr_err = self._read_err("hf_expr_use_log", exc)
+        if expr_err:
+            out["metrics"]["expr_hit_rate"] = {
+                "value": None,
+                "n": n_expr,
+                "n_min": self.N_MIN_RATIO,
+                "state": "ERROR",
+                "definition": "表达命中率 = 出站文本真的含该表达的次数 ÷ 已对账的注入次数",
+                "reason": expr_err,
+            }
+        elif n_recon > 0:
+            expr_state = "ok" if n_recon >= self.N_MIN_RATIO else "INSUFFICIENT_DATA"
+            out["metrics"]["expr_hit_rate"] = {
+                "value": (round(n_hit / n_recon, 4) if expr_state == "ok" else None),
+                "n": n_recon,
+                "n_min": self.N_MIN_RATIO,
+                "state": expr_state,
+                "definition": "表达命中率 = 出站文本真的含该表达的次数 ÷ 已对账的注入次数",
+                "reason": "",
+            }
+        else:
+            out["metrics"]["expr_hit_rate"] = {
+                "value": None,
+                "n": n_expr,
+                "n_min": self.N_MIN_RATIO,
+                "state": "NOT_IMPLEMENTED",
+                "definition": "表达命中率 = 出站文本真的含该表达的次数 ÷ 注入次数",
+                "reason": "等待出站对账接入：当前只记录「注入即命中」，尚未回读实际发出内容",
+            }
+
+        # ---------- 长度分布（条形用） ----------
+        bin_defs = [(0, 10), (11, 20), (21, 40), (41, 80), (81, 160), (161, 10 ** 9)]
+        bins = []
+        for lo, hi in bin_defs:
+            label = f"{lo}-{hi}" if hi < 10 ** 9 else f"{lo}+"
+            bins.append({"label": label, "n": sum(1 for v in lengths if lo <= v <= hi)})
+        out["length_dist"] = {
+            "state": len_state,
+            "n": len(lengths),
+            "n_min": self.N_MIN_ABS,
+            "bins": bins,
+            "p50": self._pct(lengths, 0.5),
+            "p90": self._pct(lengths, 0.9),
+            "mean": (round(sum(lengths) / len(lengths), 1) if lengths else None),
+            "definition": "去空白单条长度分桶（字）；发送失败不计入",
+            "reason": sent_err,
+        }
+        return out

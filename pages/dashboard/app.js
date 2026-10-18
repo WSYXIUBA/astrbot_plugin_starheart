@@ -7,17 +7,18 @@
  * 「先读到数据再画」，不会出现图表画在空容器上的空白页。
  */
 
-import * as charts from "./charts.js?v=1.0.1";
-import { MemoryGraph } from "./graph.js?v=1.0.1";
-import { Graph3D } from "./graph3d.js?v=1.0.1";
+import * as charts from "./charts.js?v=1.0.2";
+import { MemoryGraph } from "./graph.js?v=1.0.2";
+import { Graph3D } from "./graph3d.js?v=1.0.2";
 import {
   $, $$, STATE, initBridge, setLive, setRefreshHook, goPage, toggleTheme, toast, openDrawer, closeDrawer, esc,
-   syncSeg, jsStr, emptyBlock, refreshCurrent,
-} from "./store.js?v=1.0.1";
-import * as mem from "./views-memory.js?v=1.0.1";
-import * as evt from "./views-events.js?v=1.0.1";
-import * as sys from "./views-system.js?v=1.0.1";
-import { hfSaveDomain } from "./views-conf.js?v=1.0.1";
+   syncSeg, jsStr, emptyBlock, refreshCurrent, hfGoParams, consumeParamsAnchor, noteConfigDirty,
+} from "./store.js?v=1.0.2";
+import * as mem from "./views-memory.js?v=1.0.2";
+import * as evt from "./views-events.js?v=1.0.2";
+import * as sys from "./views-system.js?v=1.0.2";
+import * as mt from "./views-metrics.js?v=1.0.2";
+import { hfSaveDomain } from "./views-conf.js?v=1.0.2";
 
 /* ---------------- 页面表 ---------------- */
 const PAGES = {
@@ -36,7 +37,7 @@ const PAGES = {
       sub === "list" ? mem.renderMemoryList() : sub === "person" ? mem.renderPersons() : sub === "conf" ? mem.renderMemoryConf() : mem.renderGraph(),
   },
   expression: {
-    title: "表达学习",
+    title: "语言学习",
     icon: "✎",
     nav: "expression",
     // 一页到底：主体是"学到的东西"，日志/参数/语料收进默认折叠区（不再拆子页）
@@ -60,6 +61,14 @@ const PAGES = {
       { id: "favour", label: "好感", hint: "关系结算列表 + 页底折叠洞察与参数" },
     ],
     render: (sub) => evt.renderMsgDomain(sub || "hub"),
+  },
+  metrics: {
+    title: "拟人指标",
+    icon: "◔",
+    nav: "metrics",
+    // 一页到底的聚合页（六张 KPI 卡 + 两组分布），没有子页 → subs 留空，页头下不摆子页签
+    subs: [],
+    render: () => mt.renderMetrics(),
   },
   persona: {
     title: "人格管理",
@@ -89,9 +98,13 @@ const PAGES = {
 const DEFAULT_SUB = { memory: "graph", expression: "lib", messages: "hub", persona: "list", settings: "main" };
 
 /* ---------------- 路由 ---------------- */
+/** 上一次解析到的原始 hash：用来判断「这次是导航还是同 hash 的软刷新」
+ *  （#settings/params/<域> 的锚点只在真正导航时投放，软刷新不反复滚动） */
+let lastRawHash = "";
+
 function parseHash() {
   const raw = String(location.hash || "").replace(/^#/, "").replace(/^\/+/, "");
-  const [page, sub] = raw.split("/");
+  const [page, sub, extra] = raw.split("/");
   const p = PAGES[page] ? page : "overview";
   let s = sub || DEFAULT_SUB[p] || "";
   // 老书签兼容：旧的子页 id 映射到新的域 + 域内页
@@ -107,6 +120,14 @@ function parseHash() {
       if (location.hash !== `#${p}/${s}`) history.replaceState(null, "", `#${p}/${s}`);
     } catch (err) { /* 沙箱里可能不允许改 URL，忽略 */ }
   }
+  // 设置 · 参数中心域深链：#settings/params/<domain>（收尾批）
+  // 真导航（hash 变了）才投放锚点 →「设置 · 模块与参数」的对应域分区会被滚动 + 高亮；
+  // 同 hash 的软刷新（保存 / 切置顶 / 点刷新）不会反复跳位置。
+  if (p === "settings" && s === "params") {
+    if (raw !== lastRawHash) STATE.paramsAnchor = String(extra || "").trim();
+    s = "main";
+  }
+  lastRawHash = raw;
   return { page: p, sub: PAGES[p] && PAGES[p].subs ? s : "" };
 }
 
@@ -138,7 +159,7 @@ let rendering = false;
 let pendingKey = null;
 
 // 视图层需要「重新查一次当前页」时调它。之前各处调用的 refreshCurrent() 并不存在，
-// 导致记忆库 / 表达学习的交互点了没反应（写入路径直接 ReferenceError）。
+// 导致记忆库 / 语言学习的交互点了没反应（写入路径直接 ReferenceError）。
 window.hfRerender = () => route(true);
 
 async function route(force = false) {
@@ -150,7 +171,14 @@ async function route(force = false) {
   // 域内页也算进 key：否则「同一个域、换域内页」会被当成没变而提前 return
   const viewKey = page === "messages" && typeof evt.msgViewKey === "function" ? "#" + evt.msgViewKey() : "";
   const key = `${page}/${sub}${viewKey}`;
-  if (!force && key === currentKey) return;
+  if (!force && key === currentKey) {
+    // 同页的 hash 跳转（如 #settings/main → #settings/params/gate）：不重渲染，
+    // 但锚点要消费 —— 直接滚到对应参数域分区
+    if (page === "settings") {
+      try { consumeParamsAnchor(); } catch (err) { /* 锚点消费失败不阻断路由 */ }
+    }
+    return;
+  }
   // 同页强制重查（按钮 / 开关 / 筛选 / 保存后的 hfRerender）＝软刷新：不铺骨架、不播进场动画，
   // 旧内容原地等新内容，到了再换 —— 不能再让「点一下 ＝ 整页刷新」（用户反馈）。
   // 跨页切换 ＝ 硬路由：数据先读，200ms 还没到齐才铺骨架（快时不闪，慢仍有明确加载态）。
@@ -234,6 +262,12 @@ async function route(force = false) {
       }
     }
     bindSubTabs(host);
+    // 参数中心域深链（#settings/params/<domain>）：渲染完成后滚到对应域分区 + 高亮；
+    // 真滚了就让下面的「还原滚动位置」让位，别把它顶回去
+    let anchored = false;
+    if (page === "settings" && sub === "main") {
+      try { anchored = consumeParamsAnchor(); } catch (err) { /* 锚点消费失败不阻断渲染 */ }
+    }
     // 还原：① 折叠块展开状态（按 summary 文本匹配，对不上就保持默认收起）② 滚动位置（等一帧/两拍，防止被后落地内容顶走）
     if (openFolds.length) {
       host.querySelectorAll("details").forEach((d) => {
@@ -241,7 +275,7 @@ async function route(force = false) {
         if (k && openFolds.includes(k)) d.open = true;
       });
     }
-    if (prevTop > 0) {
+    if (prevTop > 0 && !anchored) {
       const sc = document.querySelector(".main") || document.scrollingElement;
       const put = () => { if (sc) sc.scrollTop = prevTop; };
       put();
@@ -332,7 +366,7 @@ function openHelp() {
       <b>门控</b>：看「最新一条：分数是怎么凑出来的」，就知道为什么它没回你。<br>
       <b>好感</b>：daily 会冷却、lifetime 只增不减；分数不进 prompt，只有区间会变成语气。<br>
       <b>主动</b>：静默时长、每日上限、名单三重护栏，先开影子模式观察它想说什么；「主动设置」页里可以直接给某个人试发一条。<br>
-      <b>设置</b>：模型分配、名单勾选、导入与危险区。<br><br>
+      <b>设置</b>：模型分配、名单勾选、导入与数据治理（破坏性操作集中卡）。<br><br>
       <span class="mut">顶栏的人格下拉只切换「记忆查看视角」，不会改 bot 实际人格；改实际人格请到「人格管理」。</span>
     </div>`
   );
@@ -343,6 +377,7 @@ function bindActions() {
   Object.assign(window, {
     // 导航 / 壳层（抽屉里的「取消」按钮是内联 onclick，必须挂到 window 上）
     goPage,
+    hfGoParams,          // 参数中心域深链：去「设置 · 模块与参数」的对应域（带锚点）
     closeDrawer,
     hfRefresh,
     hfCopyText: (t) => {
@@ -396,8 +431,10 @@ function bindActions() {
     hfToggleMore: mem.hfToggleMore,
     hfMemDetail: mem.hfMemDetail,
     hfMemBoost: mem.hfMemBoost,
+    hfMemDemote: mem.hfMemDemote,
     hfPersonsRefresh: mem.hfPersonsRefresh,
     hfMemDelete: mem.hfMemDelete,
+    hfMemRestore: mem.hfMemRestore,
     hfMemFilter: mem.hfMemFilter,
     hfMemMaintain: mem.hfMemMaintain,
     hfPurgeStale: mem.hfPurgeStale,
@@ -421,6 +458,8 @@ function bindActions() {
       evt.gateState && (evt.gateState.result = v);
       route(true);
     },
+    hfGateSince: evt.hfGateSince,     // 门控时间筛选（纯前端过滤本页已加载记录）
+    hfFoldJump: evt.hfFoldJump,       // 页底折叠区跳转（原 8 个同 hash 死按钮的替代）
     hfGatePage: (delta) => {
       if (!evt.gateState) return;
       evt.gateState.offset = Math.max(0, evt.gateState.offset + delta * evt.gateState.limit);
@@ -439,6 +478,9 @@ function bindActions() {
     hfProTestFill: evt.hfProTestFill,
     hfProactivePreview: evt.hfProactivePreview,
     hfProactiveSend: evt.hfProactiveSend,
+    hfL2LoadDefault: evt.hfL2LoadDefault,
+    hfL2Reset: evt.hfL2Reset,
+    hfL2Save: evt.hfL2Save,
     hfFavourAdjustOpen: evt.hfFavourAdjustOpen,
     hfFavourAdjustSubmit: evt.hfFavourAdjustSubmit,
     // 表达 / 人格 / 设置
@@ -446,7 +488,6 @@ function bindActions() {
     hfHabitDelete: sys.hfHabitDelete,
     hfHabitFilter: sys.hfHabitFilter,
     hfExtractHabits: sys.hfExtractHabits,
-    hfLearnParamSave: sys.hfLearnParamSave,
     hfHabitAdd: sys.hfHabitAdd,
     hfHabitSaveEdit: sys.hfHabitSaveEdit,
     hfHabitEdit: sys.hfHabitEdit,
@@ -469,6 +510,8 @@ function bindActions() {
     renderPersonaRefresh: sys.renderPersonaRefresh,
     hfSaveConfig: sys.hfSaveConfig,
     hfSaveDomain,
+    hfParamsSearch: sys.hfParamsSearch,             // 参数中心搜索（纯前端过滤行，不重渲染）
+    hfParamsRecentToggle: sys.hfParamsRecentToggle, // 参数中心「最近改过置顶」开关
     hfSaveModels: sys.hfSaveModels,
     hfTestModel: sys.hfTestModel,
     hfTestAllModels: sys.hfTestAllModels,
@@ -525,6 +568,21 @@ async function boot() {
   applyInitialTheme();
   bindShell();
   bindActions();
+  // 参数中心「最近改过」：只有**用户手改过**的键才登记（委托监听挂在常驻的 #pagehost 上，
+  // 重渲染产生的新控件自动覆盖；程序性赋值不触发 input 事件，不会被误记）
+  const ph = document.getElementById("pagehost");
+  if (ph && !ph.__hfDirtyHooked) {
+    ph.__hfDirtyHooked = true;
+    ph.addEventListener(
+      "input",
+      (e) => {
+        const t = e.target;
+        const el = t && typeof t.closest === "function" ? t.closest("[data-hf-cfg]") : null;
+        if (el) noteConfigDirty(el.getAttribute("data-hf-cfg"));
+      },
+      true
+    );
+  }
   const ok = await initBridge();
   if (!ok) return;
   setRefreshHook(() => route(true));

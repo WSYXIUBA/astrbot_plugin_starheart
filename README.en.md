@@ -1,55 +1,48 @@
 # StarHeart
 
-**Long-term memory for AstrBot.** It writes your chats down, recalls what is relevant when it matters, and keeps a light profile of the people and groups behind them.
+**Long-term memory for AstrBot.** It turns conversations into local memories, injects the relevant ones before the model replies, and maintains person / group profiles, relationships and expression habits.
 
 **English** · [中文](./README.md)
 
-|  |  |
+| | |
 | --- | --- |
 | Package | `astrbot_plugin_starheart` |
-| Display name | StarHeart |
-| Current version | `1.0.1` |
+| Version | `1.0.2` |
 | Author | 肆一纸心 |
 | Repository | <https://github.com/WSYXIUBA/astrbot_plugin_starheart> |
-| Adapters | `aiocqhttp` (OneBot v11 — NapCat, Lagrange, …) |
-| Requires | AstrBot **>= 4.24.0** |
+| Adapters | `aiocqhttp` (OneBot v11) |
+| AstrBot | >= 4.24.0 |
 
 ## How it works
 
-Once installed it simply listens along: messages come in and get answered as usual — it never cuts in and never rewrites your bot's replies. It only folds what is worth keeping into memories kept in a local database, then hands the possibly relevant ones to the model before the next reply goes out.
+- Listens to message events; does not intercept or rewrite replies.
+- Injects memories before the LLM request, limited to entries relevant to the current topic.
+- Proactive messages are optional and off by default, bounded by quiet hours, daily quota and allow/deny lists.
 
 ## Features
 
-- **Long-term memory** — conversations are distilled into memories; the ones nobody touches for a while fade out and get archived instead of piling up.
-- **Relevant recall** — every turn it picks the memories that match the current topic, so the bot remembers what was said.
-- **Person / group profiles** — a running "what is this person or group like", updated on its own.
-- **Relationship score** — everyday interaction builds a score that nudges the tone of voice.
-- **Expression habits** — it picks up how people phrase things, and blends in more the longer you chat.
-- **Proactive lines** (optional) — after a quiet stretch it may open a topic by itself.
-- **Recall log** — when someone deletes a message, what it said is kept (images included).
-- **Dashboard** — memory graph, memory list, message events, persona, settings: all built in.
+- Long-term memory: conversations are distilled into entries stored locally; entries not accessed for a long time decay and are archived.
+- Relevant recall: memories are retrieved per turn by topic.
+- Person / group profiles: generated and updated per person and per group.
+- Relationship score: interaction accumulates a score that affects tone.
+- Expression habits: learned from conversations and referenced in replies.
+- Proactive messages: may start a conversation after a quiet period (optional).
+- Retracted messages: keeps the text and images of retracted messages.
+- Dashboard: memory graph, memory list, message events, persona, settings.
+- Upgrade compatibility: existing config and panel values survive upgrades.
 
 ## Install
 
-Two ways, either one works:
-
-1. **From AstrBot** (recommended): Plugins → Install plugin → search `StarHeart`; or pick "install from URL" and paste this repository's address.
-2. **Manually**: download this repository, drop the `astrbot_plugin_starheart` folder into AstrBot's `data/plugins/` (you should see `main.py` right inside it), then restart AstrBot or hit "Reload" in the plugin manager.
-
-Afterwards, open the plugin's configuration and dashboard from the plugin page.
+Search `StarHeart` in the plugin market, or use "Install from URL" with this repository; manual install: drop `astrbot_plugin_starheart` into `data/plugins/`.
 
 ## Data
 
-Memories, profiles, relationship scores and settings all live locally, under `data/plugin_data/astrbot_plugin_starheart/`. Apart from the model endpoints you configure yourself, the plugin sends nothing to any third party.
+All data stays local under `data/plugin_data/astrbot_plugin_starheart/`; nothing is sent to third parties except the model endpoints you configure.
 
 ## License
 
 MIT License — see [`LICENSE`](./LICENSE).
 
-```
-Copyright (c) 2026 肆一纸心 (WSYXIUBA)
-```
-
 ## How it was built: entirely with AI
 
-**Everything in this plugin — backend logic, dashboard frontend, copy and documentation — was written by AI**: requirements, trade-offs, review and testing are handled by the maintainer, while the implementation was written from scratch by AI. There is no "AI drafted it, a human rewrote every line" part.
+Requirements, trade-offs, review and testing are handled by the maintainer; the implementation (backend, dashboard, copy and docs) was written by AI.

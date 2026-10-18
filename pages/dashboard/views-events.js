@@ -9,13 +9,13 @@
  * - 好感：关系是连续量 → 区间色带 + 数值环，而不是只写一个数字。
  */
 
-import * as C from "./charts.js?v=1.0.1";
+import * as C from "./charts.js?v=1.0.2";
 import {
   $, $$, api, apiSafe, contactLabel, apiPostSafe, esc, fmtNum, fmt1, fmtPct, fmtTime, timeAgo, toast, openDrawer, closeDrawer,
   pageHead, card, kpiCard, kpis, mount, emptyBlock, skelBlock, jsStr, STATE, segmentHtml, syncSeg, countUp,
-  refreshCurrent, goPage,
-} from "./store.js?v=1.0.1";
-import { renderDomainConf } from "./views-conf.js?v=1.0.1";
+  refreshCurrent, goPage, noteConfigTouched, takeConfigDirty, nativeWriteError,
+} from "./store.js?v=1.0.2";
+import { renderDomainConf } from "./views-conf.js?v=1.0.2";
 
 const ZONE_RANK = { HOSTILE: 0, COLD: 1, NEUTRAL: 2, FAMILIAR: 3, CLOSE: 4, DEVOTED: 5 };
 const ZONE_COLOR = { HOSTILE: "#f44336", COLD: "#90a4ae", NEUTRAL: "#8e8e93", FAMILIAR: "#03c9d7", CLOSE: "#3c96ca", DEVOTED: "#e0559a" };
@@ -203,18 +203,50 @@ const zoneRank = (z) => ZONE_RANK[String(z || "NEUTRAL")] ?? 2;
    门控：决策流水
    ================================================================== */
 /** 门控流水的分页/筛选状态：app.js 的分页与筛选按钮直接改这里再重渲染 */
-export const gateState = { offset: 0, limit: 30, result: "", session: "" };
+export const gateState = { offset: 0, limit: 30, result: "", since: "", session: "" };
+
+/** 配置型布尔归一：true/false、1/0、"true"/"false" 都认；认不出（含拿不到配置）返回 null —— 调用方不猜 */
+function cfgBool(v) {
+  if (v === true || v === false) return v;
+  if (v === 1 || v === 0) return v === 1;
+  if (typeof v === "string") {
+    const t = v.trim().toLowerCase();
+    if (t === "true" || t === "1") return true;
+    if (t === "false" || t === "0" || t === "") return false;
+  }
+  return null;
+}
+
+/** 门控「时间」筛选（纯前端）：只过滤本页已加载的记录，不触发后端查询 */
+export function hfGateSince(v) {
+  gateState.since = String(v || "");
+  refreshCurrent();
+}
 
 /* ======================= D-PAGE: renderGateLive ======================= */
 export async function renderGateLive() {
-  const [page, ov, stats] = await Promise.all([
+  const [page, ov, stats, dom] = await Promise.all([
     apiSafe("gate", { limit: gateState.limit, offset: gateState.offset }, { items: [], total: 0 }),
     apiSafe("overview", {}, {}),
     apiSafe("stats", {}, {}),
+    // 影子模式横幅要从配置读（拿不到配置就不显示横幅 —— 不猜）
+    apiSafe("config/domains", {}, { values: {} }),
   ]);
   STATE.gate = page;
   const all = page.items || [];
-  const items = all.filter((g) => (gateState.result ? g.decision === gateState.result : true));
+  // 结果 + 时间两档筛选都是纯前端：只作用于本页已加载的记录（不改后端查询）
+  let sinceCut = 0;
+  if (gateState.since === "today") {
+    const d0 = new Date();
+    d0.setHours(0, 0, 0, 0);
+    sinceCut = d0.getTime() / 1000;
+  } else {
+    const span = { "1h": 3600, "6h": 6 * 3600, "24h": 24 * 3600, "3d": 3 * 86400 }[gateState.since] || 0;
+    if (span) sinceCut = Date.now() / 1000 - span;
+  }
+  const items = all
+    .filter((g) => (gateState.result ? g.decision === gateState.result : true))
+    .filter((g) => !sinceCut || (Number(g.ts) || 0) >= sinceCut);
   const total = page.total ?? 0;
   const reply = Number(ov.gate_reply) || 0;
   const evals = Number(ov.gate_total) || stats.gate || total;
@@ -261,11 +293,19 @@ export async function renderGateLive() {
       }　·　本页窗口 ${fmtNum(items.length)} 条里开口 ${fmtNum(replyPage)} 条${topNeg.length ? ` · 最常扣分：<b>${esc(FACTOR_LABEL[topNeg[0]] || topNeg[0])}</b>` : ""}`
     : `还没有门控记录：开启门控后随便聊几句就会出现评分流水（全库累计评估 ${fmtNum(evals)} 次）`;
 
+  // 影子开关的判读：配置可能是 true/false、1/0、"true"/"false" 任一种形态 —— 统一真值判断；
+  // 拿不到配置就不显示横幅（不猜）。关掉影子后只有「群聊且未被 @」的会话会被真拦（main.py 语义）。
+  const shadowOn = cfgBool(dom && dom.values ? dom.values.gate_shadow : undefined);
+
   const html = `
+  ${shadowOn === true ? `<div class="noteblock" style="border-left-color:var(--warning,#e0a800);margin-bottom:11px">
+    <span class="tag warn">影子模式</span> 当前是影子模式：标为「沉默」的记录实际并未被拦下，只是记了一笔。
+    到「设置 · 模块与参数」的门控域（本页页头「参数 →」直达）里关掉影子模式，沉默与退避才会真正拦住事件 —— 且只拦「群聊里没被 @ 到」的那部分；私聊与被 @ 的会话照常回复（这两种情况，静默本来就不拦）。</div>` : ""}
   ${pageHead(
     "门控 · 裁决矩阵",
     "行 = 会话，列 = 因子：<b>蓝=加分、红=扣分、深浅=影响大小</b>，格子里写的就是原始分数。点行或点格 → 完整算式",
-    `<button class="btn s" onclick="hfGateReload(this)">刷新</button>`,
+    `<button class="btn s" onclick="hfGateReload(this)">刷新</button>
+     <button class="btn s" onclick="hfGoParams('gate')" title="去「设置 · 模块与参数」门控域（阈值 / 窗口 / 影子模式），带域锚点">参数 →</button>`,
     "◉",
     conclusion
   )}
@@ -276,6 +316,11 @@ export async function renderGateLive() {
     })}
     ${card(`<div id="gateSide"></div>`, { title: "现在什么状态" })}
   </div>
+  ${card(`<div id="gateDecide"></div>`, {
+    title: "逐条改判",
+    sub: "决策流水：行内记下「该回 / 判定正确」→ 写进 hf_decision_log.user_verdict（只记账）",
+    cls: "sec",
+  })}
   <details style="margin-top:12px"><summary style="cursor:pointer;font-size:12.5px;padding:6px 0">
     <span class="tag gy">逐条记录（原始表格）</span><span class="mut">默认收起 —— 与上面矩阵同一批数据，需要抄数字时再展开</span></summary>
   ${card(
@@ -283,6 +328,9 @@ export async function renderGateLive() {
       <div class="row wrap" style="gap:8px">
         <select class="inp" id="gateResult" style="font-size:11.5px" onchange="hfGateFilter(this.value)">
           <option value="">全部结果</option><option value="reply" ${gateState.result === "reply" ? "selected" : ""}>仅触发</option><option value="silent" ${gateState.result === "silent" ? "selected" : ""}>仅沉默</option><option value="backoff" ${gateState.result === "backoff" ? "selected" : ""}>仅退避</option>
+        </select>
+        <select class="inp" id="gateSince" style="font-size:11.5px" title="时间筛选只过滤本页已加载的记录（不改后端查询）" onchange="hfGateSince(this.value)">
+          <option value="">全部时间</option><option value="1h" ${gateState.since === "1h" ? "selected" : ""}>最近 1 小时</option><option value="6h" ${gateState.since === "6h" ? "selected" : ""}>最近 6 小时</option><option value="today" ${gateState.since === "today" ? "selected" : ""}>今天</option><option value="3d" ${gateState.since === "3d" ? "selected" : ""}>最近 3 天</option>
         </select>
         <span class="mut" id="gateTotal" style="font-size:11px">读取中…</span>
       </div>
@@ -292,7 +340,7 @@ export async function renderGateLive() {
       </div>
     </div>
     <div id="gateTable">${skelBlock(4)}</div>`,
-    { title: "逐条记录", sub: "点行展开因子明细（含「因子和 × 系数 = 总分」的当场校验）" }
+    { title: "逐条记录", sub: "点行展开因子明细（含「因子和 × 系数 = 总分」的当场校验）；结果 / 时间筛选只作用于本页已加载的记录" }
   )}</details>`;
 
   return {
@@ -325,7 +373,7 @@ export async function renderGateLive() {
             return d === "reply" ? { t: "tagok", v: "开口" } : d === "backoff" ? { t: "tagwarn", v: "退避" } : { t: "tag", v: "沉默" };
           },
           legend: [["acc", "加分"], ["neg", "扣分"], ["zero", "未命中 / 无记录"], ["tagok", "越阈值 → 开口"], ["tag", "沉默"]],
-          note: "空格 = 该条记录里没有这个因子。想让它更容易开口，调的是<b>阈值</b>（门控参数折叠卡），不是改评分。",
+          note: "空格 = 该条记录里没有这个因子。想让它更容易开口，调的是<b>阈值</b>（「设置 · 模块与参数」的门控域，本页页头「参数 →」直达），不是改评分。",
           onPick: (r) => mxGateDrawer(rowsSrc[r] && rowsSrc[r].latest),
           onRow: (r) => mxGateDrawer(rowsSrc[r] && rowsSrc[r].latest),
           emptyText: "本页窗口里还没有门控记录",
@@ -351,6 +399,7 @@ export async function renderGateLive() {
       }
 
       mxGateTable(host, items, total);
+      mount(host, "#gateDecide", (el) => gateVerdictTable(el, page.decisions || {}));
     },
   };
 }
@@ -359,13 +408,86 @@ export async function renderGateLive() {
 
 
 /* ==================================================================
+   门控 · 逐条改判（决策流水 hf_decision_log）
+   ------------------------------------------------------------------
+   「该回」= 这次其实该开口；「判定正确」= 认同这次判定。两者都只写 user_verdict 记账，
+   不改判定结果、不写训练样本（样本表还没建）。写库走 POST gate/verdict。
+   ================================================================== */
+const GATE_VERDICT_LABEL = { should_reply: "该回", correct: "判定正确" };
+
+/** 改判状态单元格（写库后用返回值原地刷新，不整页重渲染） */
+function verdictStateHtml(g) {
+  const v = String((g && g.user_verdict) || "");
+  if (!v) return '<span class="mut">未改判</span>';
+  const at = Number((g && g.verdict_at) || 0);
+  return `<span class="tag ok">${esc(GATE_VERDICT_LABEL[v] || v)}</span>${
+    at ? `<span class="mut" style="font-size:10.5px"> · ${esc(fmtTime(at, true))}</span>` : ""
+  }`;
+}
+
+function gateVerdictTable(el, pack) {
+  const items = (pack && pack.items) || [];
+  const total = Number((pack && pack.total) || 0) || items.length;
+  if (!items.length) {
+    el.innerHTML = emptyBlock(
+      (pack && pack.error) || "还没有决策流水 —— 门控评估过一次就会出现（上面那张表的记录来自旧流水表，改判只对决策流水生效）",
+      "◎"
+    );
+    return;
+  }
+  el.innerHTML = `<div style="overflow-x:auto"><table>
+      <thead><tr><th>时间</th><th>会话</th><th>对方说</th><th>分数</th><th>判定</th><th>改判</th><th>当前状态</th></tr></thead>
+      <tbody>${items
+        .map((g) => {
+          const dec = g.decision === "reply" ? "开口" : g.decision === "backoff" ? "退避" : "沉默";
+          const shadow = Number(g.gate_shadow) ? ' <span class="tag gy" title="影子模式：只记录没真拦">影子</span>' : "";
+          const did = Number(g.id);
+          return `<tr>
+            <td class="mono">${fmtTime(g.ts, true)}</td>
+            <td class="mono" style="max-width:150px;overflow:hidden;text-overflow:ellipsis">${esc(mxSessLabel(g.session_id))}</td>
+            <td style="max-width:320px;overflow:hidden;text-overflow:ellipsis" title="${esc(String(g.msg_text || ""))}">${
+              g.msg_text ? esc(String(g.msg_text)) : '<span class="mut">（这条没留下原文）</span>'
+            }</td>
+            <td class="mono">${fmt1(g.score)}</td>
+            <td>${esc(dec)}${shadow}</td>
+            <td><div class="row" style="gap:5px">
+              <button class="btn xs" data-hf-verdict="${did}" data-vd="should_reply" title="我认为这次应该开口">该回</button>
+              <button class="btn xs" data-hf-verdict="${did}" data-vd="correct" title="这次判定是对的">判定正确</button>
+            </div></td>
+            <td data-vdstate="${did}">${verdictStateHtml(g)}</td></tr>`;
+        })
+        .join("")}</tbody></table></div>
+    <div class="mut" style="font-size:10.5px;margin-top:6px">全库 ${fmtNum(total)} 条决策记录（这里列最近 ${items.length} 条）· 改判只记账：不改判定结果，也不写任何训练样本</div>`;
+  el.querySelectorAll("button[data-hf-verdict]").forEach((b) => {
+    b.addEventListener("click", async () => {
+      const did = Number(b.getAttribute("data-hf-verdict"));
+      const vd = String(b.getAttribute("data-vd") || "");
+      b.disabled = true;
+      const res = await apiPostSafe("gate/verdict", { id: did, verdict: vd });
+      b.disabled = false;
+      if (!res.ok) {
+        toast("改判失败：" + res.error, "err");
+        return;
+      }
+      const cell = el.querySelector(`[data-vdstate="${did}"]`);
+      if (cell) cell.innerHTML = verdictStateHtml(res.data || {});
+      toast(`已记下「${GATE_VERDICT_LABEL[vd] || vd}」`, "ok");
+    });
+  });
+}
+
+/* ==================================================================
    门控参数
    ================================================================== */
-export async function renderGateConf() {
+export async function renderGateConf(opts = {}) {
   const stats = await apiSafe("stats", {}, {});
-  const evals = stats.gate_total || 0;
-  const reply = stats.gate_reply || 0;
+  const statsErr = stats && stats.__err;
+  const evals = statsErr ? 0 : (stats.gate_total || 0);
+  const reply = statsErr ? 0 : (stats.gate_reply || 0);
   const out = await renderDomainConf("gate", {
+    bare: !!opts.bare,
+    recentFirst: !!opts.recentFirst,
+    chartId: "dcChart_gate",
     actions: `<button class="btn s" onclick="hfGateReload(this)">看决策流水 →</button>`,
     side: card(
       `<div id="gcRate"></div>
@@ -373,7 +495,7 @@ export async function renderGateConf() {
          · 阈值越低越爱开口；影子模式打开时只记录不拦截，适合先观察<br>
          · 因子权重固化在 engine：@我 / 私聊 / 疑问句 / 请求 / 压力加成 为正，存在感与短反应为负
        </div>`,
-      { title: "当前触发率", sub: `累计 ${fmtNum(evals)} 次评估，开口 ${fmtNum(reply)} 次` }
+      { title: "当前触发率", sub: statsErr ? `统计读取失败：${statsErr}` : `累计 ${fmtNum(evals)} 次评估，开口 ${fmtNum(reply)} 次` }
     ),
   });
   // ⚠️ 这个 id="gcRate" 以前**从来没被 mount 过** —— 卡片里就一直空着一块（空白组件）。
@@ -383,6 +505,10 @@ export async function renderGateConf() {
     if (typeof inner === "function") inner(host);
     // 触发开口：线性条 + 精确条数（用户否掉圆环与百分比 —— 仪表盘读不出精确值）
   mount(host, "#gcRate", (el) => {
+    if (statsErr) {
+      el.innerHTML = `<div class="fnote">⚠ 统计读取失败，不是 0：${esc(String(statsErr))}</div>`;
+      return;
+    }
     el.innerHTML = `<div class="hfline" style="border-bottom:0">
       <div class="row bt" style="font-size:12px;margin-bottom:5px"><span>触发开口</span>
         <span class="ok"><b class="mono">${fmtNum(reply)}</b> <span class="mut">/ 评估 ${fmtNum(evals)} 条</span></span></div>
@@ -482,7 +608,7 @@ export async function renderRecallFeed() {
   ${pageHead(
     "撤回 · 会话 × 近 7 天",
     "行 = 会话，列 = 最近 7 天：<b>格色越深 = 那天撤回次数越多</b>；点格子看那天撤回了什么（正文 + 图片），点行看这个会话的全部记录",
-    `<button class="btn s" onclick="goPage('messages','recall')">撤回参数 →</button>`,
+    `<button class="btn s" onclick="hfGoParams('recall')" title="去「设置 · 模块与参数」撤回域（三档处理 / 降权系数 / 保留天数），带域锚点">参数 →</button>`,
     "↩",
     concl
   )}
@@ -604,8 +730,11 @@ export async function renderRecallFeed() {
 }
 
 
-export async function renderRecallConf() {
+export async function renderRecallConf(opts = {}) {
   return renderDomainConf("recall", {
+    bare: !!opts.bare,
+    recentFirst: !!opts.recentFirst,
+    chartId: "dcChart_recall",
     side: card(
       `<div class="mut" style="font-size:11.5px;line-height:1.8">
         · <b>log_only</b>：只记录，不动记忆（最保守）<br>
@@ -672,6 +801,28 @@ export function msgTabSet(domain, tab) {
   if (MSG_TABS[domain] && MSG_TABS[domain].tabs.some(([v]) => v === tab)) msgTabState[domain] = tab;
 }
 
+/**
+ * 页底折叠区跳转（原「同 hash 死按钮」整改）：不再 goPage 到当前页白点一下，
+ * 而是原地展开对应折叠区并滚到位；key="top" 表示回到本页主内容顶部。
+ */
+export function hfFoldJump(key) {
+  const host = document.getElementById("pagehost");
+  if (!host) return;
+  if (key === "top") {
+    try { host.scrollIntoView({ block: "start", behavior: "smooth" }); } catch (err) { host.scrollIntoView(); }
+    return;
+  }
+  const hit = Array.from(host.querySelectorAll("details")).find((d) => {
+    const s = d.querySelector("summary");
+    return s && String(s.textContent || "").includes(key);
+  });
+  if (!hit) { toast("没找到「" + key + "」折叠区（页面可能已更新）"); return; }
+  hit.open = true;
+  try { hit.scrollIntoView({ block: "start", behavior: "smooth" }); } catch (err) { hit.scrollIntoView(); }
+  hit.style.outline = "2px solid var(--primary,#3c96ca)";
+  setTimeout(() => { hit.style.outline = ""; }, 1600);
+}
+
 async function renderMessagesLegacy(domain) {
   // 旧书签里存在「有域、没页」的组合（如 recall_live）：以前会取到 undefined 渲染器 → 直接抛错白屏。
   const ALIAS = { gate_live: "gate", recall_live: "recall", proactive_pool: "proactive", proactive_audit: "proactive",
@@ -724,14 +875,23 @@ export async function renderProactivePool() {
     apiSafe("proactive/rules", {}, { sessions: [], allowed: 0, blocked: 0, names: {}, modes: {} }),
     apiSafe("proactive", { limit: 200 }, { items: [], sessions: [], candidates: 0, config: {} }),
   ]);
+  if ((rules && rules.__err) || (log && log.__err)) {
+    const why = (rules && rules.__err) || (log && log.__err);
+    return {
+      html: pageHead("主动消息读取失败", `接口现在拿不到名单/日志：${esc(String(why))}`,
+        `<button class="btn p" onclick="hfRefresh()">重试</button>`, "⚠")
+        + card(`<div class="fnote">⚠ 不渲染空名单，避免把「读取失败」当成「名单为空」再保存一次。</div>`,
+               { title: "读取失败" }),
+    };
+  }
   STATE.rules = rules;
   const cfg = log.config || {};
   const sessions = rules.sessions || [];
   const names = rules.names || {};
   const sent = (log.items || []).filter((x) => x.status === "sent");
   const todaySent = sessions.reduce((a, x) => a + (x.sent_today || 0), 0);
-  const cap = Number(cfg.proactive_daily_cap) || 3;
-  const idleMin = Number(cfg.proactive_idle_min) || 120;
+  const cap = (cfg.proactive_daily_cap === 0 ? 0 : (Number(cfg.proactive_daily_cap) || 3));
+  const idleMin = (cfg.proactive_idle_min === 0 ? 0 : (Number(cfg.proactive_idle_min) || 120));
   const modes = rules.modes || {};
 
   // 勾选状态：群/私聊 × 白/黑 各自独立（切模式不串味）
@@ -770,7 +930,7 @@ export async function renderProactivePool() {
   };
 
   const rowHtml = (kind, r) => {
-    const mode = String(modes[kind] || "white");
+    const mode = String(modes[kind] || "black");
     const picked = (STATE.proPick[`${kind}:${mode}`]) || new Set();
     const nm = r.name || "";
     const label = nm && nm !== r.id ? nm : `${kind === "group" ? "群" : "QQ"} ${r.id}`;
@@ -798,7 +958,7 @@ export async function renderProactivePool() {
 
   const listBlock = (kind, title) => {
     // saved = 服务器上真正生效的；mode = 正在查看/编辑的（切段只改它，按保存才写服务器）
-    const saved = String(modes[kind] || "white");
+    const saved = String(modes[kind] || "black");
     const mode = String((STATE.proMode && STATE.proMode[kind]) || saved);
     const picked = (STATE.proPick[`${kind}:${mode}`]) || new Set();
     const rowsAll = rowsOf(kind);
@@ -810,7 +970,7 @@ export async function renderProactivePool() {
     return `<div>
       <div class="row bt wrap" style="gap:7px;margin-bottom:8px">
         <b style="font-size:12.5px">${esc(title)}</b>
-        ${segmentHtml([{ value: "white", label: "白名单", title: "只主动对名单内的会话开口" }, { value: "black", label: "黑名单", title: "名单内不主动，其余都可以" }], mode, `promode_${kind}`)}
+        ${segmentHtml([{ value: "white", label: "白名单", title: "只主动对名单内的会话开口" }, { value: "black", label: "黑名单", title: "名单内不主动，其余都可以" }, { value: "off", label: "不主动", title: "关闭这一类的主动消息" }], mode, `promode_${kind}`)}
         <span class="mut" style="font-size:11px">已选 <b id="proCnt_${kind}">${picked.size}</b> / 共 ${rows.length}（其中可主动 ${allowed.length}）</span>
         <button class="btn xs" onclick="hfProAll('${kind}', true)">全选</button>
         <button class="btn xs" onclick="hfProAll('${kind}', false)">清空</button>
@@ -818,10 +978,10 @@ export async function renderProactivePool() {
         <span class="searchbox" style="width:130px"><i class="ic">⌕</i><input placeholder="过滤…" oninput="hfProFilter(this.value, '${kind}')"></span>
       </div>
       <div class="noteblock" id="proDirty_${kind}" style="border-left-color:var(--warning);margin-bottom:8px;display:${mode === saved ? "none" : ""}">
-        <b>未保存</b>：你正在查看 / 编辑的是<b>${mode === "white" ? "白名单" : "黑名单"}</b>；当前生效的仍是<b>${saved === "white" ? "白名单" : "黑名单"}</b> —— 点「保存并生效」才会切换。
+        <b>未保存</b>：你正在查看 / 编辑的是<b>${mode === "white" ? "白名单" : mode === "off" ? "不主动" : "黑名单"}</b>；当前生效的仍是<b>${saved === "white" ? "白名单" : saved === "off" ? "不主动" : "黑名单"}</b> —— 点「保存并生效」才会切换。
       </div>
       <div class="noteblock" id="proNote_${kind}" style="border-left-color:var(--warning);margin-bottom:8px;display:${mode === "white" && !picked.size ? "" : "none"}">白名单为空 = <b>谁都不主动</b>（不会打扰任何人）。想主动找谁就勾上它再点「保存并生效」。</div>
-      <div class="mut" style="font-size:10.5px;margin-bottom:5px">遵循 AstrBot 原生白名单：<b>为空 = 全部放行</b>（下面列出全部）；<b>非空 = 只列名单内的成员</b>。此前保存过、但已不在原生名单里的会显示成「被拦 · 已失效」—— 取消勾选并保存即可清理。</div>
+      <div class="mut" style="font-size:10.5px;margin-bottom:5px">群聊遵循 AstrBot 原生白名单：<b>为空 = 全部放行</b>（下面列出全部）；<b>非空 = 只列名单内的群</b>；私聊只看本插件名单。此前保存过、但已不在原生名单里的会显示成「被拦 · 已失效」—— 取消勾选并保存即可清理。</div>
       <div class="picklist" data-kind="${kind}" style="max-height:min(56vh,520px);border:1px solid var(--bd);border-radius:6px;overflow-y:auto;overflow-x:hidden;scrollbar-gutter:stable">
         ${rows.length ? rows.map((r) => rowHtml(kind, r)).join("") : emptyBlock("还没有会话：先在群里聊几句，或把要主动的人加进白名单", "☎")}
       </div>
@@ -837,7 +997,7 @@ export async function renderProactivePool() {
     "主动消息",
     `静默满 <b>${idleMin} 分钟</b>才有资格；每天最多 <b>${cap}</b> 条开口（当天随机排布时间点）；判定顺序：可见性名单 → 主动名单 → 开口时间点 → 额度/时钟/关系档`,
     `<button class="btn p" onclick="hfProactiveScan(this)">立即扫描一轮</button>
-     <button class="btn s" onclick="goPage(\"messages\", \"proactive\")">参数与审计 →</button>`,
+     <button class="btn s" onclick="hfFoldJump('投递审计')">投递审计 ↓</button>`,
     "☎"
   )}
   ${kpis(
@@ -918,7 +1078,7 @@ export async function renderProactivePool() {
 export function hfProToggle(kind, id, on) {
   // 勾的是「正在查看」的那份名单（切段只改视图；保存才写服务器）
   const mode = String((STATE.proMode && STATE.proMode[kind])
-    || (STATE.rules && STATE.rules.modes && STATE.rules.modes[kind]) || "white");
+    || (STATE.rules && STATE.rules.modes && STATE.rules.modes[kind]) || "black");
   const key = `${kind}:${mode}`;
   STATE.proPick = STATE.proPick || {};
   STATE.proPick[key] = STATE.proPick[key] || new Set();
@@ -930,7 +1090,7 @@ export function hfProToggle(kind, id, on) {
 
 export function hfProAll(kind, on) {
   const mode = String((STATE.proMode && STATE.proMode[kind])
-    || (STATE.rules && STATE.rules.modes && STATE.rules.modes[kind]) || "white");
+    || (STATE.rules && STATE.rules.modes && STATE.rules.modes[kind]) || "black");
   const key = `${kind}:${mode}`;
   STATE.proPick = STATE.proPick || {};
   STATE.proPick[key] = new Set();
@@ -952,7 +1112,7 @@ export function hfProAll(kind, on) {
  *  既不会收起任何折叠卡，也不会因连点段选堆积渲染（旧版「卡住」的来源之一）。
  */
 export function hfProMode(kind, mode) {
-  const m = mode === "black" ? "black" : "white";
+  const m = mode === "off" ? "off" : (mode === "black" ? "black" : "white");
   STATE.proMode = STATE.proMode || {};
   STATE.proMode[String(kind)] = m;
   const seg = document.querySelector(`[data-seg="promode_${kind}"]`);
@@ -970,18 +1130,18 @@ export function hfProMode(kind, mode) {
   if (note) note.style.display = m === "white" && !picked.size ? "" : "none";
   const dirtyEl = document.querySelector(`#proDirty_${kind}`);
   if (dirtyEl) {
-    const saved = String((STATE.rules && STATE.rules.modes && STATE.rules.modes[kind]) || "white");
+    const saved = String((STATE.rules && STATE.rules.modes && STATE.rules.modes[kind]) || "black");
     dirtyEl.style.display = m === saved ? "none" : "";
-    dirtyEl.innerHTML = `<b>未保存</b>：你正在查看 / 编辑的是<b>${m === "white" ? "白名单" : "黑名单"}</b>；`
-      + `当前生效的仍是<b>${saved === "white" ? "白名单" : "黑名单"}</b> —— 点「保存并生效」才会切换。`;
+    dirtyEl.innerHTML = `<b>未保存</b>：你正在查看 / 编辑的是<b>${m === "white" ? "白名单" : m === "off" ? "不主动" : "黑名单"}</b>；`
+      + `当前生效的仍是<b>${saved === "white" ? "白名单" : saved === "off" ? "不主动" : "黑名单"}</b> —— 点「保存并生效」才会切换。`;
   }
 }
 
 export async function hfProSave(kind, btn) {
   // 保存 = 把「正在查看的模式 + 该模式的勾选」一起写下去 —— 这是切换生效的**唯一**入口
   const mode = String((STATE.proMode && STATE.proMode[kind])
-    || (STATE.rules && STATE.rules.modes && STATE.rules.modes[kind]) || "white");
-  const ids = Array.from((STATE.proPick && STATE.proPick[`${kind}:${mode}`]) || []);
+    || (STATE.rules && STATE.rules.modes && STATE.rules.modes[kind]) || "black");
+  const ids = mode === "off" ? [] : Array.from((STATE.proPick && STATE.proPick[`${kind}:${mode}`]) || []);
   if (btn) btn.classList.add("loading");
   const res = await apiPostSafe("proactive/set", { kind, mode, ids });
   if (btn) btn.classList.remove("loading");
@@ -991,7 +1151,7 @@ export async function hfProSave(kind, btn) {
   }
   STATE.rules = res.data || STATE.rules;
   const warn = mode === "white" && !ids.length ? "（白名单为空：不会主动打扰任何人）" : "";
-  toast(`已保存主动${kind === "group" ? "群聊" : "私聊"}${mode === "white" ? "白名单" : "黑名单"}：${ids.length} 项${warn}`, "ok");
+  toast(`已保存主动${kind === "group" ? "群聊" : "私聊"}${mode === "white" ? "白名单" : mode === "off" ? "不主动" : "黑名单"}：${ids.length} 项${warn}`, "ok");
   refreshCurrent();
 }
 
@@ -1026,19 +1186,25 @@ export async function hfProactivePreview(btn, sessionId) {
     return;
   }
   if (btn) btn.classList.add("loading");
-  const res = await apiPostSafe("proactive/preview", { session_id: sid, zone: "FAMILIAR" });
+  // 不再写死 zone：后端会按这个会话的真实关系档 + 真实静默时长试写（2026-10-15 修；旧版写死 FAMILIAR，试看与真发两张皮）
+  const res = await apiPostSafe("proactive/preview", { session_id: sid });
   if (btn) btn.classList.remove("loading");
   const d = res.data || {};
+  const src = { astrbot: "完整（AstrBot 拼好的那份）", persona: "降级：仅人格（缓存超时 / 该会话还没聊过）", none: "没取到（会吃不到人格）" }[String(d.prompt_source || "")] || String(d.prompt_source || "—");
+  const memIds = (d.memory_ids || []).map((x) => "#" + x).join(" ");
   openDrawer(
     "主动消息试看 · " + sid,
     d.ok
       ? `<div class="chip" style="font-size:12.5px;white-space:normal;line-height:1.7">${esc(d.text || "")}</div>
-        <div class="dkv" style="margin-top:10px"><div class="k">静默时长</div><div class="v mono">${fmt1(d.idle_min)} 分钟</div></div>
+        <div class="dkv" style="margin-top:10px"><div class="k">关系档 / 静默</div><div class="v mono">${esc(d.zone || "—")} · ${fmt1(d.idle_min)} 分钟</div></div>
+        <div class="dkv"><div class="k">提示词来源</div><div class="v">${esc(src)}</div></div>
         <div class="dkv"><div class="k">耗时</div><div class="v mono">${d.ms || "—"} ms</div></div>
-        <div class="dkv"><div class="k">带入记忆</div><div class="v mono">${d.memories_used || 0} 条</div></div>
+        <div class="dkv"><div class="k">带入记忆</div><div class="v mono">${d.memories_used || 0} 条${memIds ? " · " + esc(memIds) : ""}</div></div>
         <div class="dkv"><div class="k">使用人格</div><div class="v">${d.persona_used ? "是" : "否"}</div></div>
-        <div class="mut" style="font-size:11px;margin:12px 0 4px">实际交给模型的 system prompt</div>
-        <div class="chip" style="white-space:pre-wrap;line-height:1.6;max-height:240px;overflow:auto">${esc(d.system_prompt || "")}</div>`
+        <div class="mut" style="font-size:11px;margin:12px 0 4px">实际交给模型的 system prompt${d.layer2_custom ? "（含你自己写的第 2 层）" : "（含内置第 2 层）"}</div>
+        <div class="chip" style="white-space:pre-wrap;line-height:1.6;max-height:240px;overflow:auto">${esc(d.system_prompt || "")}</div>
+        <div class="mut" style="font-size:11px;margin:10px 0 4px">user prompt（含参考记忆与时间锚）</div>
+        <div class="chip" style="white-space:pre-wrap;line-height:1.6;max-height:200px;overflow:auto">${esc(d.user_prompt || "")}</div>`
       : `<div class="mut">生成失败：${esc(d.error || res.error || "原因未知")}</div>`
   );
 }
@@ -1130,14 +1296,23 @@ export async function renderProactiveMatrix() {
     apiSafe("proactive/rules", {}, { sessions: [], allowed: 0, blocked: 0, names: {}, modes: {} }),
     apiSafe("proactive", { limit: 200 }, { items: [], sessions: [], candidates: 0, config: {} }),
   ]);
+  if ((rules && rules.__err) || (log && log.__err)) {
+    const why = (rules && rules.__err) || (log && log.__err);
+    return {
+      html: pageHead("主动消息读取失败", `接口现在拿不到名单/日志：${esc(String(why))}`,
+        `<button class="btn p" onclick="hfRefresh()">重试</button>`, "⚠")
+        + card(`<div class="fnote">⚠ 不渲染空名单，避免把「读取失败」当成「名单为空」再保存一次。</div>`,
+               { title: "读取失败" }),
+    };
+  }
   STATE.rules = rules;
   const cfg = log.config || {};
   const sessions = (rules.sessions || []).slice();
   const logSess = {};
   (log.sessions || []).forEach((s) => { logSess[String(s.session_id || "")] = s; });
-  const cap = Number(cfg.proactive_daily_cap) || 0;
+  const cap = (cfg.proactive_daily_cap === 0 ? 0 : (Number(cfg.proactive_daily_cap) || 0));
   const gapMin = Number(cfg.proactive_min_interval_min) || 0;
-  const idleMin = Number(cfg.proactive_idle_min) || 0;
+  const idleMin = (cfg.proactive_idle_min === 0 ? 0 : (Number(cfg.proactive_idle_min) || 0));
   const qsTxt = String(cfg.proactive_quiet_start || "");
   const qeTxt = String(cfg.proactive_quiet_end || "");
   const hm = (v) => { const m = /^(\d{1,2}):(\d{2})$/.exec(String(v || "").trim()); return m && Number(m[1]) < 24 && Number(m[2]) < 60 ? Number(m[1]) * 60 + Number(m[2]) : null; };
@@ -1196,9 +1371,17 @@ export async function renderProactiveMatrix() {
       sub: "只列<b>名单内</b>的会话（不在主动名单里的不显示）；行多时滚动看全。点格子看这道闸的当前值，点行看完整判定与快捷试发",
     })}
   </div>
+  ${card(
+    `<div class="kv">静默窗（当前生效）<span class="mono">${qs !== null && qe !== null ? `${esc(qsTxt)} – ${esc(qeTxt)}` : "未配置（不拦截）"}</span></div>
+     <div class="kv">此刻判定<span>${inQuiet === null ? "静默未启用（不会拦主动）" : inQuiet ? `<b>在静默期内</b>（暂不主动开口）· ${esc(qeTxt)} 解禁` : "不在静默期（可以主动）"}</span></div>
+     <div class="kv">作用范围<span>仅主动 + 学习任务 · <b>回复侧永不静默</b>（有人说话该回就回，静默不拦任何回复）</span></div>
+     <div class="kv">编辑<span><button class="btn xs" onclick="hfGoParams('proactive')" title="去「设置 · 模块与参数」主动域（静默窗 / 额度 / 间隔），带域锚点">去参数中心 · 主动域 →</button></span></div>`,
+    { title: "作息时段", sub: "静默窗只掐「主动开口」与学习类后台任务；静默不会拦回复", cls: "sec",
+      actions: '<span class="tag ok" title="S5-3 收口（拍-21）：本卡读 config 真值（静默窗/额度/间隔）；不建独立作息表（无冻结 DDL，且与 config 双源）">已上线</span>' }
+  )}
   <div class="mut" style="font-size:11.5px;margin-top:10px;line-height:1.8">
     · 被挡住的记录都留在「投递审计」里。<br>
-    · 想改谁能收到 → 页底折叠卡「候选人名单」；想改额度 / 静默 / 间隔 → 折叠卡「参数」。
+    · 想改谁能收到 → 页底折叠卡「候选人名单」；想改额度 / 静默 / 间隔 → 「设置 · 模块与参数」主动域（上面「作息时段」卡里的编辑入口直达）。
   </div>`;
 
   return {
@@ -1396,7 +1579,7 @@ export async function renderProactiveAudit() {
   const st = {};
   items.forEach((x) => (st[x.status || "candidate"] = (st[x.status || "candidate"] || 0) + 1));
   const html = `
-  ${pageHead("投递审计", "每一次「想开口」都被记下来了：候选、跳过、发送、失败，以及当时的护栏判据", `<button class="btn s" onclick="goPage(\"messages\", \"proactive\")">候选池 →</button>`, "☰")}
+  ${pageHead("投递审计", "每一次「想开口」都被记下来了：候选、跳过、发送、失败，以及当时的护栏判据", `<button class="btn s" onclick="hfFoldJump('候选人名单')">候选池 ↓</button>`, "☰")}
   ${kpis(
     kpiCard("paAll", fmtNum(items.length), "本页窗口记录")
     + kpiCard("paSent", fmtNum(st.sent || 0), "窗口内已发送")
@@ -1454,7 +1637,7 @@ export async function renderProactiveAudit() {
           items: items.slice(0, 60).map((x) => ({
             ts: x.ts,
             title: `${x.status || "candidate"} · ${x.session_id || "—"}`,
-            desc: `${x.reason || ""}${x.text ? " · " + String(x.text).slice(0, 60) : ""}`,
+            desc: `${x.reason || ""}${x.text ? " · " + String(x.text).slice(0, 60) : ""}${x.prompt_source ? " · 提示词:" + ({ astrbot: "完整", persona: "仅人格", none: "无" }[x.prompt_source] || x.prompt_source) : ""}${x.memory_ids ? " · 记忆:" + String(x.memory_ids).slice(0, 40) : ""}`,
             color: { sent: "#00c853", skipped: "#ffc107", failed: "#f44336" }[x.status] || "#3c96ca",
             tag: x.zone || "",
           })),
@@ -1465,32 +1648,111 @@ export async function renderProactiveAudit() {
   };
 }
 
-export async function renderProactiveConf() {
+export async function renderProactiveConf(opts = {}) {
   const [rules, filter] = await Promise.all([
     apiSafe("proactive/rules", {}, { sessions: [], allowed: 0, blocked: 0 }),
     apiSafe("contacts/filter", {}, { modes: {}, counts: {} }),
   ]);
+  if ((rules && rules.__err) || (filter && filter.__err)) {
+    const why = (rules && rules.__err) || (filter && filter.__err);
+    return {
+      html: pageHead("主动参数读取失败", `接口现在拿不到名单现状：${esc(String(why))}`,
+        `<button class="btn p" onclick="hfRefresh()">重试</button>`, "⚠")
+        + card(`<div class="fnote">⚠ 不渲染「放行 0 / 拦截 0 / 不过滤」这种假状态，避免你按错误数字去改名单。</div>`,
+               { title: "读取失败" }),
+    };
+  }
   const base = (kind) => {
     const mode = String((filter.modes || {})[kind] || "off");
     const n = ((filter.counts || {})[kind] || {})[mode === "black" ? "black" : "white"] || 0;
     return mode === "off" ? "不过滤" : `${mode === "black" ? "黑名单" : "白名单"} ${n} 项`;
   };
   return renderDomainConf("proactive", {
+    bare: !!opts.bare,
+    recentFirst: !!opts.recentFirst,
+    chartId: "dcChart_proactive",
+    // 名单写入（私聊/群聊 白/黑）**不迁**：它有专属编辑面（主动页「候选人名单」折叠卡走
+    // proactive/set 接口 + 「设置 · 名单与可见性」，与 AstrBot 原生名单语义耦合），
+    // 在参数中心再渲染一份裸 id 输入 = 第二写入面。这 4 个键仍在那两处照常编辑。
+    exclude: ["proactive_wl_private", "proactive_bl_private", "proactive_wl_group", "proactive_bl_group"],
     actions: `<button class="btn s" onclick="hfProactiveScan(this)">扫描一轮</button>
               <button class="btn s" onclick="goPage('settings','contacts')">名单与可见性 →</button>`,
     side: card(
       `<div class="mut" style="font-size:11.5px;line-height:1.8">
         <b>主动名单</b>：放行 <b>${rules.allowed || 0}</b> 个会话，拦截 <b>${rules.blocked || 0}</b> 个。<br>
         原生白名单是地基（实时只读）：为空 = 全部放行，主动名单说了算；非空 = 只在名单内收窄，名单外的会话自动失效。<br>
-        <span class="mut">（参考：可见性名单当前 群聊 ${esc(base("group"))} · 私聊 ${esc(base("private"))}）</span></div>
+        <span class="mut">（参考：可见性名单当前 群聊 ${esc(base("group"))} · 私聊 ${esc(base("private"))}）</span><br>
+        <span class="mut">名单的编辑保持在原处：主动页「候选人名单」折叠卡 / 「设置 · 名单与可见性」—— 参数中心不重复渲染裸 id 输入。</span></div>
        <div class="row" style="gap:6px;margin-top:10px;flex-wrap:wrap">
          <button class="btn s" onclick="goPage('settings','contacts')">改名名单</button>
-         <button class="btn s" onclick="goPage(\"messages\", \"proactive\")">看审计</button>
-         <button class="btn s" onclick="goPage(\"messages\", \"proactive\")">候选池</button>
+         <button class="btn s" onclick="goPage('messages','proactive')">回主动页（审计 ↓ / 候选池 ↓）</button>
        </div>`,
       { title: "名单现状" }
     ),
+    // 第 2 层提示词编辑器：沉在参数页最底下，可展开（用户 2026-10-15 指定位置：主动最底下那栏）
+    bottom: (values, dom) => layer2EditorHtml(values, ((dom || {}).builtin || {}).proactive_instruction || ""),
   });
+}
+
+/* ---------------- 主动消息 · 第 2 层提示词（本轮情境） ---------------- */
+
+/** 折叠段落式编辑器；「内置默认」全文由后端 config/domains.builtin 带过来（不再前端复制一份） */
+export function layer2EditorHtml(values, builtin) {
+  const cur = String(((values || {}).proactive_instruction) || "");
+  const def = String(builtin || "");
+  const state = cur.trim() ? "当前：自定义" : "当前：插件内置";
+  return `<details class="hf-l2">
+    <summary style="cursor:pointer"><b>✎ 主动消息 · 第 2 层提示词（本轮情境）</b>
+      <span class="mut" style="font-size:11.5px;margin-left:8px">${state} · 点这里展开看 / 改</span></summary>
+    <div class="mut" style="font-size:11.5px;line-height:1.85;margin:8px 0 6px">
+      这是主动开口时贴给模型的「系统级任务指令」，接在 AstrBot 完整提示词之后（撤回重发那条通道不吃这份，只走自己的通知块）。
+      留空 = 用插件内置。占位符：<span class="mono">{zone}</span> 关系区间 · <span class="mono">{tone}</span> 语气线 · <span class="mono">{idle}</span> 距对方上次说话的分钟数。<br>
+      ⚠ 建议至少保留「只输出一句话、不加引号 / 括号动作」这类硬要求，否则模型可能把思考过程也发出去。
+    </div>
+    <textarea id="hfL2ta" data-hf-cfg="proactive_instruction" rows="9"
+      style="width:100%;font-family:ui-monospace,Consolas,monospace;font-size:12px;line-height:1.7;box-sizing:border-box"
+      placeholder="留空 = 用插件内置（点下面「载入内置默认」可以看看它长什么样）">${esc(cur)}</textarea>
+    <div class="row" style="gap:6px;margin-top:8px;flex-wrap:wrap;align-items:center">
+      <button class="btn xs" onclick="hfL2LoadDefault()">载入内置默认</button>
+      <button class="btn xs" onclick="hfL2Reset()">恢复默认（清空）</button>
+      <button class="btn xs p" onclick="hfL2Save(this)">保存第 2 层</button>
+      <span class="mut" style="font-size:11px" id="hfL2msg"></span>
+    </div>
+    <details style="margin-top:8px"><summary class="mut" style="cursor:pointer;font-size:11px">看一眼内置默认全文（只读；改了这里不会保存）</summary>
+      <div class="chip" style="white-space:pre-wrap;font-size:11px;line-height:1.7;margin-top:6px;opacity:.8" id="hfL2def">${esc(def)}</div>
+    </details>
+  </details>`;
+}
+
+export function hfL2LoadDefault() {
+  const ta = document.getElementById("hfL2ta");
+  const defEl = document.getElementById("hfL2def");
+  if (!ta) return;
+  ta.value = defEl ? (defEl.textContent || "") : "";
+  toast("已载入内置默认，改完记得点「保存第 2 层」", "ok");
+}
+
+export function hfL2Reset() {
+  const ta = document.getElementById("hfL2ta");
+  if (!ta) return;
+  ta.value = "";
+  toast("已清空：点「保存第 2 层」后生效（回到插件内置）", "ok");
+}
+
+export async function hfL2Save(btn) {
+  const ta = document.getElementById("hfL2ta");
+  const msg = document.getElementById("hfL2msg");
+  if (!ta) return;
+  if (btn) { btn.classList.add("loading"); btn.disabled = true; }
+  const res = await apiPostSafe("config/save", { patch: { proactive_instruction: String(ta.value || "") } });
+  if (btn) { btn.classList.remove("loading"); btn.disabled = false; }
+  const ok = !!(res && res.ok);
+  const errTxt = (res && res.error) || "保存失败";
+  const nw = ok ? nativeWriteError(res) : "";
+  if (ok) noteConfigTouched(takeConfigDirty(["proactive_instruction"]));   // 参数中心「最近改过置顶」：只记手改过的
+  if (msg) msg.textContent = ok ? (nw ? "已写入插件库，但原生配置写回失败：" + nw : "已保存 ✓（留空 = 内置默认）") : "保存失败：" + errTxt;
+  toast(nw ? "已写入插件库，但原生配置写回失败：" + nw : (ok ? "第 2 层提示词已保存" : "保存失败：" + errTxt),
+        (ok && !nw) ? "ok" : "err");
 }
 
 /* ==================================================================
@@ -1535,7 +1797,7 @@ export async function renderFavourList() {
     "好感 · 人 × 14 天",
     "行 = 人，列 = 最近 14 天的每日增减：<b>绿=当天变暖、红=当天变冷、灰=那天没有记账</b>；点行看这个人的结算依据与人工校准",
     `${segmentHtml([{ value: "daily", label: "按今日" }, { value: "lifetime", label: "按累计" }], favSort, "favsort")}
-     <button class="btn s" onclick="goPage('messages','favour')">结算参数 →</button>`,
+     <button class="btn s" onclick="hfGoParams('favour')" title="去「设置 · 模块与参数」好感域（结算模式 / 上限 / 半衰期），带域锚点">参数 →</button>`,
     "♥",
     concl
   )}
@@ -1682,7 +1944,7 @@ export async function renderFavourInsight() {
   const ins = await apiSafe("favour/insight", {}, { total: 0, zones: {}, avg_daily: 0, top: [], events: [] });
   const zones = ins.zones || {};
   const html = `
-  ${pageHead("关系洞察", "谁在你这里最亲、关系都在什么档、结算系统最近改过什么", `<button class="btn s" onclick="goPage('messages','favour')">好感列表 →</button>`, "◎")}
+  ${pageHead("关系洞察", "谁在你这里最亲、关系都在什么档、结算系统最近改过什么", `<button class="btn s" onclick="hfFoldJump('top')">回好感列表 ↑</button>`, "◎")}
   ${kpis(
     kpiCard("fiAll", fmtNum(ins.total), "跟踪用户")
     + kpiCard("fiAvg", fmt1(ins.avg_daily), "平均今日分")
@@ -1724,13 +1986,16 @@ export async function renderFavourInsight() {
   };
 }
 
-export async function renderFavourConf() {
+export async function renderFavourConf(opts = {}) {
   return renderDomainConf("favour", {
+    bare: !!opts.bare,
+    recentFirst: !!opts.recentFirst,
+    chartId: "dcChart_favour",
     side: card(
       `<div class="mut" style="font-size:11.5px;line-height:1.8">
         · 结算模式 <b>tag</b>：由模型在回复里打标（close/neutral/cold…）—— 目前唯一实现的模式<br>
         · 人工校准可在「好感列表」里对单个人加/减分，审计流水会记下来源</div>
-       <div class="row" style="gap:6px;margin-top:10px"><button class="btn s" onclick="goPage('messages','favour')">去校准</button></div>`,
+       <div class="row" style="gap:6px;margin-top:10px"><button class="btn s" onclick="goPage('messages','favour')">去好感列表 →</button></div>`,
       { title: "结算模式怎么选" }
     ),
   });
@@ -1884,8 +2149,9 @@ function mhDetail(ev) {
    用户反复强调两条：①不要把子菜单藏在子菜单里（也不要在页顶再挂一条 chips/锚点栏）
    ②界面别太复杂。所以这里：
      · 主导航 = rail 的「消息事件」→ 5 个平级子页签（总览 / 门控 / 主动 / 撤回 / 好感）
-     · 域页内部**没有**第二层页签、没有分段栏；「名单」「参数」这类东西收进**页底一张默认折叠的卡**
-       （点开才见，不占首屏、不产生导航层级）
+     · 域页内部**没有**第二层页签、没有分段栏；「名单 / 审计 / 洞察」收进**页底一张默认折叠的卡**
+       （点开才见，不占首屏、不产生导航层级）；**参数已收口到「设置 · 模块与参数」**，
+       这里只留「参数 →」跳转（带域锚点 #settings/params/<域>）
    ========================================================================== */
 
 /** 域 → 主体渲染函数（域页的主体内容） */
@@ -1896,14 +2162,15 @@ const DOMAIN_RENDERERS = {
   favour: () => renderFavourList(),
 };
 
-/** 域 → 页底折叠区（名单 / 洞察 / 参数都在这里，按顺序折叠，不占首屏） */
+/** 域 → 页底折叠区（名单 / 审计 / 洞察都在这里，按顺序折叠，不占首屏）
+ *  收尾批：四个域的参数折叠区已收口到「设置 · 模块与参数」——这里不再渲染参数，
+ *  功能页只留页头/卡片里的「参数 →」跳转（带域锚点 #settings/params/<域>）。 */
 const DOMAIN_EXTRAS = {
-  gate: [["参数（阈值 / 窗口 / 影子模式）", renderGateConf]],
+  gate: [],
   proactive: [["候选人名单（谁会收到主动消息）", renderProactivePool],
-              ["投递审计（节律 / 时间轴）", renderProactiveAudit],
-              ["参数（额度 / 静默 / 间隔）", renderProactiveConf]],
-  recall: [["参数（三档处理 / 降权系数）", renderRecallConf]],
-  favour: [["关系洞察", renderFavourInsight], ["参数（结算模式 / 上限 / 半衰期）", renderFavourConf]],
+              ["投递审计（节律 / 时间轴）", renderProactiveAudit]],
+  recall: [],
+  favour: [["关系洞察", renderFavourInsight]],
 };
 
 export function msgDomainKey(sub) {

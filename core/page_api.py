@@ -46,6 +46,7 @@ class PageApi:
             ("memory", self.memory_detail, "GET"),
             ("memory/update", self.memory_update, "POST"),
             ("memory/delete", self.memory_delete, "POST"),
+            ("memory/restore", self.memory_restore, "POST"),
             ("graph", self.graph, "GET"),
             ("graph/stats", self.graph_stats, "GET"),
             ("graph/build", self.graph_build, "POST"),
@@ -90,6 +91,10 @@ class PageApi:
             ("persona/propose", self.persona_propose, "POST"),
             ("persona/decide", self.persona_decide, "POST"),
             ("config/domains", self.config_domains, "GET"),
+            ("config/snapshots", self.config_snapshots, "GET"),
+            ("config/snapshot", self.config_snapshot_save, "POST"),
+            ("config/rollback", self.config_rollback, "POST"),
+            ("gate/verdict", self.gate_verdict, "POST"),
             ("memory/maintenance", self.memory_maintenance, "POST"),
             ("expression/extract", self.expression_extract, "POST"),
             ("memory/purge_stale", self.memory_purge_stale, "POST"),
@@ -108,6 +113,22 @@ class PageApi:
             ("stats", self.stats, "GET"),
             ("purge/gate", self.purge_gate, "POST"),
             ("purge/learning", self.purge_learning, "POST"),
+            # S4 表达重建：审核队列（GET 待审 + POST 通过/驳回）、不再学名单、学习诊断、只清表达
+            ("expr/review", self.expr_review_get, "GET"),
+            ("expr/review", self.expr_review_post, "POST"),
+            ("expr/bans", self.expr_bans, "GET"),
+            ("expr/ban/remove", self.expr_ban_remove, "POST"),
+            ("expr/runs", self.expr_runs, "GET"),
+            ("purge/expressions", self.purge_expressions, "POST"),
+            # S5 黑话（从零建）：清单 / 人工闸门 / 改释义 / 删除 / 命中日志 / 试解读 /「未进入回复库」检查行
+            ("jargon", self.jargon_list, "GET"),
+            ("jargon/decide", self.jargon_decide, "POST"),
+            ("jargon/save", self.jargon_save, "POST"),
+            ("jargon/delete", self.jargon_delete, "POST"),
+            ("jargon/hits", self.jargon_hits, "GET"),
+            ("jargon/try", self.jargon_try, "POST"),
+            ("jargon/check", self.jargon_check, "GET"),
+
             ("purge/session", self.purge_session, "POST"),
             # 记忆库管理表 + 混合召回 + 详细对话（这一批是"后端早就该给界面"的东西）
             ("memory/search", self.memory_search, "GET"),
@@ -126,6 +147,8 @@ class PageApi:
             ("memory/reactivate", self.memory_reactivate, "POST"),
             ("memory/lifecycle", self.memory_lifecycle, "GET"),
             ("memory/lifecycle/run", self.memory_lifecycle_run, "POST"),
+            # 拟人指标（六指标 + 长度分布 + 门控因子分布；每项带 n 与 state）
+            ("metrics", self.metrics, "GET"),
         ]
         for path, handler, method in routes:
             register(f"{PAGE_PREFIX}/{path}", self._guard(path, handler), [method], f"StarHeart page {path}")
@@ -189,6 +212,12 @@ class PageApi:
         if not payload.get("id"):
             return error_response("missing id")
         return json_response(await self.service.memory_delete(payload["id"]))
+
+    async def memory_restore(self):
+        payload = await request.json(default={})
+        if not payload.get("id"):
+            return error_response("missing id")
+        return json_response(await self.service.memory_restore(payload["id"]))
 
     async def recalls(self):
         limit = _int_q("limit", 200, 1, 2000)
@@ -375,8 +404,11 @@ class PageApi:
 
     async def proactive_preview(self):
         payload = await request.json(default={})
+        # zone 缺省不要在这里填 "NEUTRAL"：service 收到空串会按会话真实关系档解析；
+        # 在这层硬填一个默认值，等于把「真实档」挡在门外 —— 试看和真发就会两张皮
+        # （真机实测：库里是 FAMILIAR，试看却按 NEUTRAL 出词）。
         return json_response(await self.service.proactive_preview(
-            str(payload.get("session_id") or ""), str(payload.get("zone") or "NEUTRAL")
+            str(payload.get("session_id") or ""), str(payload.get("zone") or "")
         ))
 
     async def proactive_rule_bulk(self):
@@ -464,7 +496,86 @@ class PageApi:
         return json_response(out)
 
     async def habits(self):
-        return json_response(await self.service.habits())
+        # persona_id 由页面带上（视角人格）：可用性求值 / 隔离徽标按它算（E1 fail-closed）
+        persona_id = request.query.get("persona_id", "") or ""
+        return json_response(await self.service.habits(persona_id))
+
+    async def expr_review_get(self):
+        return json_response(await self.service.expr_review_queue(_int_q("limit", 200, 1, 500)))
+
+    async def expr_review_post(self):
+        payload = await request.json(default={})
+        raw = payload.get("ids")
+        ids = raw if isinstance(raw, list) else ([raw] if raw is not None else [])
+        action = str(payload.get("action") or "").strip()
+        if action not in ("approve", "reject"):
+            return error_response("action must be approve|reject")
+        return json_response(await self.service.expr_review(ids, action, str(payload.get("reason") or "")))
+
+    async def expr_bans(self):
+        return json_response(await self.service.expr_bans(_int_q("limit", 200, 1, 500)))
+
+    async def expr_ban_remove(self):
+        payload = await request.json(default={})
+        nk = str(payload.get("norm_key") or "").strip()
+        if not nk:
+            return error_response("missing norm_key")
+        return json_response(await self.service.expr_ban_remove(nk))
+
+    async def expr_runs(self):
+        return json_response(await self.service.expr_runs(_int_q("limit", 20, 1, 200)))
+
+    async def purge_expressions(self):
+        return json_response(await self.service.purge("expressions"))
+
+    # ---------------- S5 黑话（hf_jargon） ----------------
+    async def jargon_list(self):
+        status = request.query.get("status", "") or ""
+        q = request.query.get("q", "") or ""
+        scope = request.query.get("scope", "") or ""
+        return json_response(await self.service.jargon_list(status=status, q=q, scope=scope))
+
+    async def jargon_decide(self):
+        payload = await request.json(default={})
+        try:
+            return json_response(await self.service.jargon_decide(
+                int(payload.get("id") or 0), str(payload.get("action") or "")))
+        except (TypeError, ValueError) as exc:
+            return error_response(str(exc))
+
+    async def jargon_save(self):
+        payload = await request.json(default={})
+        try:
+            return json_response(await self.service.jargon_save(
+                int(payload.get("id") or 0),
+                str(payload.get("term") or ""),
+                str(payload.get("meaning") or ""),
+                payload.get("enabled")))
+        except (TypeError, ValueError) as exc:
+            return error_response(str(exc))
+
+    async def jargon_delete(self):
+        payload = await request.json(default={})
+        try:
+            return json_response(await self.service.jargon_delete(int(payload.get("id") or 0)))
+        except (TypeError, ValueError) as exc:
+            return error_response(str(exc))
+
+    async def jargon_hits(self):
+        tid = _int_q("term_id", 0, 0, 10 ** 9)
+        if tid <= 0:
+            return error_response("missing term_id")
+        return json_response(await self.service.jargon_hits(tid, _int_q("limit", 20, 1, 200)))
+
+    async def jargon_try(self):
+        payload = await request.json(default={})
+        try:
+            return json_response(await self.service.jargon_try(str(payload.get("text") or "")))
+        except (TypeError, ValueError) as exc:
+            return error_response(str(exc))
+
+    async def jargon_check(self):
+        return json_response(await self.service.jargon_check())
 
     async def habit_save(self):
         payload = await request.json(default={})
@@ -514,7 +625,11 @@ class PageApi:
 
     async def config_save(self):
         payload = await request.json(default={})
-        out = await self.service.save_config(payload.get("patch") or payload or {})
+        try:
+            out = await self.service.save_config(payload.get("patch") or payload or {})
+        except ValueError as exc:
+            # 参数护栏拦下：整批一个字都没写，把原因原样交给面板（前端 toast 直接显示）
+            return error_response(str(exc))
         # 换了向量模型 → 自动切到对应维度的向量库
         # （原先这行写在 return 之后，属不可达代码，等于从没执行过）
         sync = await self.service.config_save_sync()
@@ -522,6 +637,29 @@ class PageApi:
             logger.info(f"[starheart] 向量库已自动切代：{sync.get('active')}")
         return json_response(out)
 
+
+    async def config_snapshots(self):
+        return json_response(await self.service.config_snapshots(_int_q("limit", 25, 1, 100)))
+
+    async def config_snapshot_save(self):
+        payload = await request.json(default={})
+        return json_response(await self.service.config_snapshot_save(name=str(payload.get("name") or "")))
+
+    async def config_rollback(self):
+        payload = await request.json(default={})
+        try:
+            return json_response(await self.service.config_rollback(payload.get("id") or 0))
+        except (TypeError, ValueError) as exc:
+            return error_response(str(exc))
+
+    async def gate_verdict(self):
+        """门控行内改判（该回 / 判定正确 / 撤销）：只记账，写 hf_decision_log.user_verdict。"""
+        payload = await request.json(default={})
+        try:
+            return json_response(await self.service.gate_verdict(
+                payload.get("id") or 0, str(payload.get("verdict") or "")))
+        except (TypeError, ValueError) as exc:
+            return error_response(str(exc))
 
     async def import_detect(self):
         return json_response(await self.service.import_detect())
@@ -639,6 +777,11 @@ class PageApi:
         payload = await request.json(default={})
         limit = int(payload.get("limit") or 0) or None
         return json_response(await self.service.lifecycle_tick(limit=limit, dry=bool(payload.get("dry"))))
+
+    async def metrics(self):
+        """拟人指标：只读聚合；空表/样本不足/读失败如实报态（ok / INSUFFICIENT_DATA / NOT_IMPLEMENTED / ERROR）。"""
+        days = _int_q("days", 30, 1, 3650)
+        return json_response(await self.service.metrics(days))
 
     async def vector_gens(self):
         """多代向量库清单（换模型不删旧代、按当前模型选库）。"""

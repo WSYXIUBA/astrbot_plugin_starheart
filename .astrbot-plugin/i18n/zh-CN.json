@@ -48,7 +48,7 @@
       "description": "影子模式：只记录评分不拦截（建议先开几天看数据）"
     },
     "gate_threshold": {
-      "description": "触发阈值（0-100，越高越矜持）"
+      "description": "触发阈值（允许 1–100，越高越矜持；超过 100 会永久沉默，保存时被拦下）"
     },
     "memory_inject_enabled": {
       "description": "LLM 请求前注入相关记忆"
@@ -101,7 +101,7 @@
       "description": "归档周期（天）：多久没被提及就归档"
     },
     "forget_after_days": {
-      "description": "遗忘周期（天）：归档后再多久没被提及且不重要就遗忘"
+      "description": "遗忘周期（天）：归档后再多久没被提及且不重要就遗忘（允许 1–365）"
     },
     "forget_min_strength": {
       "description": "遗忘强度下限：低于它才可能被遗忘（重要记忆受保护）"
@@ -116,16 +116,16 @@
       "description": "自动识别并转换未导入的 livingmemory 记忆"
     },
     "output_split_messages": {
-      "description": "长回复拆成多条发送（按语义边界切，短句不拆）"
+      "description": "长回复拆成多条发送（按语义边界切，短句不拆；bot 自己用空行也能决定分几条）"
     },
     "output_typing_delay": {
-      "description": "补发的后续条目按打字时长延迟（首条立即发）"
+      "description": "补发的后续条目按打字时长延迟（首条立即发）；新装默认关，库里已有值不受影响"
     },
     "output_typing_per_char": {
-      "description": "每个字的打字秒数"
+      "description": "每个字的打字秒数（允许 0.2–2.0，越小越快）"
     },
     "output_typing_max": {
-      "description": "单条打字延迟上限（秒）"
+      "description": "单条打字延迟上限（秒，允许 3–30）"
     },
     "sticker_slot": {
       "description": "表情包目录（本地路径）；回复里出现 [表情] 标记时随机发一张；off=关闭"
@@ -134,16 +134,19 @@
       "description": "语音：TTS provider id，或 session=跟随会话；off=关闭"
     },
     "favour_daily_cap": {
-      "description": "好感日上限：当天正增量累计到此封顶（0=不限）"
+      "description": "好感日上限：当天正增量累计到此封顶（0=不限，上限 100）"
     },
     "favour_daily_half_life_days": {
-      "description": "好感 daily 的半衰期天数（0=关闭衰减）"
+      "description": "好感 daily 的半衰期天数（0=关闭衰减；允许 0–60）"
     },
     "favour_tag_required": {
       "description": "是否必须带好感标签才结算（关闭则无标签也 +1）"
     },
     "expression_min_uses": {
       "description": "表达习惯至少生效过 N 次才算已验证"
+    },
+    "expression_auto_min_corpus": {
+      "description": "未学语料自动提取门槛（攒够 N 条自动学一次；0 = 只手动）"
     },
     "memory_summary_prompt": {
       "description": "记忆总结自定义提示词（空=内置；支持 {transcript} 占位）"
@@ -160,10 +163,10 @@
       ]
     },
     "track_platforms": {
-      "description": "允许记录的平台实例 id（留空=自动只认 OneBot/QQ；本插件只服务 QQ）"
+      "description": "额外允许记录的平台实例 id（留空 = 自动识别 OneBot 实例 + AstrBot WebChat；本插件面向 QQ）"
     },
     "person_exclude_platforms": {
-      "description": "永不记录的平台（webchat/webui 写死拦截），这些平台的会话不进记忆/人物/名单"
+      "description": "永不记录的平台实例 id（默认只排除 webui —— AstrBot WebChat 会被正常记录）"
     },
     "sys_prompt_memory_summary": {
       "description": "【记忆总结】任务的系统提示词（留空=用内置默认；面板「模型分配」里可展开编辑）"
@@ -187,16 +190,16 @@
       "description": "待审提案超过这么多小时自动作废（避免忘点一次就永久不再进化的阻塞）"
     },
     "model_persona_evolve": {
-      "description": "人格进化提案用哪个模型（留空 = 跟随会话当前模型；建议锁便宜模型）"
+      "description": "人格进化提案用哪个模型（留空 = 跟随会话当前模型；建议锁个便宜模型）"
     },
     "gate_window_seconds": {
       "description": "门控统计窗口（秒）：这个窗口内的消息一起算"
     },
     "gate_backoff_base": {
-      "description": "被拦下后最小静默间隔（秒）"
+      "description": "被拦下后最小静默间隔（秒，允许 1–60）"
     },
     "gate_backoff_max": {
-      "description": "被拦下后最大静默间隔（秒）"
+      "description": "被拦下后最大静默间隔（秒，允许 15–600，且必须 ≥ 起步值）"
     },
     "session_context_enabled": {
       "description": "会话上下文：把同会话最近消息一起给模型"
@@ -208,10 +211,10 @@
       "description": "记忆捕获：攒够几轮对话总结一次"
     },
     "memory_capture_min_interval": {
-      "description": "记忆捕获：两次总结的最短间隔（秒）"
+      "description": "记忆捕获：两次总结的最短间隔（秒，允许 0–3600）"
     },
     "memory_capture_max_per_run": {
-      "description": "记忆捕获：单轮最多写入几条记忆"
+      "description": "记忆捕获：单轮最多写入几条记忆（允许 1–20）"
     },
     "memory_decay_half_life_days": {
       "description": "记忆强度半衰期（天）：越久没被提及越弱"
@@ -253,7 +256,7 @@
       "description": "主动开口：到点还没人聊就自己开一句"
     },
     "proactive_shadow": {
-      "description": "主动开口影子模式：只记录候选不真发（建议先跑几天）"
+      "description": "影子模式：只记录候选，不真的发送"
     },
     "proactive_idle_min": {
       "description": "多久没人说话才考虑开口（分钟）"
@@ -262,16 +265,16 @@
       "description": "两次主动开口的最短间隔（分钟）"
     },
     "proactive_daily_cap": {
-      "description": "每天最多主动开口几次"
+      "description": "每个会话每天最多主动几条；多会话按会话数放大"
     },
     "proactive_quiet_start": {
-      "description": "免打扰开始时间（HH:MM）"
+      "description": "免打扰开始时间（HH:MM；默认 01:30）"
     },
     "proactive_quiet_end": {
-      "description": "免打扰结束时间（HH:MM）"
+      "description": "免打扰结束时间（HH:MM；默认 07:30）"
     },
     "proactive_min_zone": {
-      "description": "至少到哪个关系区间才开口（NEUTRAL/FAMILIAR/CLOSE）"
+      "description": "最低关系档位；留空 = 不设门槛（不依赖好感系统）"
     },
     "proactive_last_only": {
       "description": "只发给最后一个说话的人"
@@ -280,19 +283,19 @@
       "description": "开口时带上 AstrBot 人格与上下文（关掉=裸发一句，不建议）"
     },
     "proactive_style": {
-      "description": "开口风格提示词（短句、不追问最好用）"
+      "description": "开口风格参考（软提示，不合适会被忽略）"
     },
     "proactive_context_memories": {
       "description": "开口前注入几条记忆"
     },
     "proactive_auto_wl": {
-      "description": "自动把聊过的人加进主动名单（off=必须手填）"
+      "description": "自动把聊过的人加进主动名单：off=关 / close=亲近的人 / familiar=熟人及以上"
     },
     "proactive_mode_private": {
-      "description": "私聊开口名单模式：white / black / off"
+      "description": "私聊主动名单：white=只对名单内 / black=只对名单内不主动 / off=不主动"
     },
     "proactive_mode_group": {
-      "description": "群聊开口名单模式：white=只发白名单 / black=只排除黑名单 / off=不开口"
+      "description": "群聊主动名单：white=只对名单内 / black=只对名单内不主动 / off=不主动"
     },
     "proactive_wl_private": {
       "description": "主动开口·私聊白名单（QQ 号）"
@@ -310,7 +313,7 @@
       "description": "命中撤回时记忆强度打的折（0-1，越小罚得越狠）"
     },
     "recall_keep_days": {
-      "description": "被撤回消息的留档天数（面板撤回页可查）"
+      "description": "被撤回消息的留档天数（允许 1–365）"
     },
     "recall_interrupt_reply": {
       "description": "撤回时打断还在生成中的那条回复（内容已作废，说完也白说）"
@@ -327,12 +330,87 @@
     },
     "recall_react_extra": {
       "description": "撤回反应：追加在撤回通知后面的自定义指示（留空=不加）"
+    },
+    "output_typo_rate": {
+      "description": "错字率（允许 0–0.03；错字机制档位见 output_typo_mode）"
+    },
+    "cross_session_enabled": {
+      "description": "跨会话动作留痕：bot 借工具（AstrBot 自带或第三方工具类插件）在别的会话里发了消息时，留台账 + 在相关会话注入知会，避免被问「谁让你发的」时答不知道（关掉则不留痕、不注入）"
+    },
+    "cross_session_ttl_min": {
+      "description": "跨会话动作知会有效期（分钟）：超过这个时间的动作不再注入（长期回忆走记忆库）"
+    },
+    "cross_session_memory": {
+      "description": "跨会话动作写入记忆库（关掉则只在有效期内注入知会，不写记忆）"
+    },
+    "output_expr_max_inject": {
+      "description": "单轮最多注入几条表达习惯（允许 0–10）"
+    },
+    "expression_review_first": {
+      "description": "先审后用：学到的新表达先等你过目才进注入池（默认关 = 自动通过，学到就能用）"
+    },
+    "jargon_enabled": {
+      "description": "黑话理解：听懂群友的特殊用语/梗（只做理解，不进回复库）"
+    },
+    "jargon_name_filter": {
+      "description": "黑话人名过滤：候选挖掘时滤掉已知昵称/群名（防止把某人昵称学成黑话）"
+    },
+    "jargon_candidate_min_sessions": {
+      "description": "黑话机械候选门槛：跨几个会话才送推断（默认 2；参数中心可调）"
+    },
+    "jargon_candidate_min_hits": {
+      "description": "黑话机械候选门槛：出现几次才送推断（默认 4；参数中心可调）"
+    },
+    "jargon_infer_daily_batches": {
+      "description": "黑话含义推断每日批数（默认 1；0 = 关自动推断）"
+    },
+    "jargon_try_daily_quota": {
+      "description": "试解读每日配额（默认 20；单次 1 条短请求、输出 ≤200 tokens；0 = 不限）"
+    },
+    "proactive_instruction": {
+      "description": "主动消息第 2 层提示词（本轮情境）：留空=用插件内置；面板「主动 → 参数」页底部可展开编辑；支持 {zone}/{tone}/{idle} 占位符"
+    },
+    "proactive_writeback": {
+      "description": "把主动消息写回 AstrBot 对话历史（用原生 content parts，bot 能记得自己说过什么）"
+    },
+    "proactive_note_enabled": {
+      "description": "写回失败/空历史时的兜底：下一轮注入「你最近主动发过」"
+    },
+    "proactive_note_hours": {
+      "description": "主动消息知会回看窗口（小时）"
+    },
+    "proactive_note_max": {
+      "description": "主动消息知会最多带几条"
+    },
+    "proactive_prompt_max_age_min": {
+      "description": "主动开口复用 AstrBot 完整提示词的缓存时效（分钟），超时降级为只吃人格并在流水标注"
+    },
+    "conn_mode_group": {
+      "description": "群聊可见性：black=黑名单（空=谁都不回）/ white=白名单（空=谁都不回）"
+    },
+    "conn_mode_private": {
+      "description": "私聊可见性：black=黑名单（空=谁都不回）/ white=白名单（空=谁都不回）"
+    },
+    "conn_black_group": {
+      "description": "群聊可见性黑名单（群号）"
+    },
+    "conn_white_group": {
+      "description": "群聊可见性白名单（群号；空白名单=谁都不回）"
+    },
+    "conn_black_private": {
+      "description": "私聊可见性黑名单（QQ 号）"
+    },
+    "conn_white_private": {
+      "description": "私聊可见性白名单（QQ 号；空白名单=谁都不回）"
+    },
+    "persona_active_id": {
+      "description": "当前人格 id；留空=跟随 AstrBot 原生当前人格"
     }
   },
   "pages": {
     "dashboard": {
       "title": "StarHeart · 控制面板",
-      "description": "记忆图谱 / 记忆库 / 人物画像 / 表达学习 / 消息事件 / 人格管理 / 设置"
+      "description": "记忆图谱 / 记忆库 / 人物画像 / 语言学习 / 消息事件 / 人格管理 / 设置"
     }
   }
 }

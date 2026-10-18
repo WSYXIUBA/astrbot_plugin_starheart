@@ -189,6 +189,10 @@
       "description": "Verified-use threshold",
       "hint": "A habit must have been used N times before it counts as verified."
     },
+    "expression_auto_min_corpus": {
+      "description": "Auto-extract threshold (corpus lines)",
+      "hint": "Learn expressions automatically once N unlearned corpus lines pile up; 0 = manual only."
+    },
     "memory_summary_prompt": {
       "description": "Summary prompt override",
       "hint": "Custom prompt for memory summarisation (empty = built-in; supports the {transcript} placeholder)."
@@ -384,6 +388,81 @@
     },
     "recall_react_extra": {
       "description": "Recall reaction: extra instruction appended to the recall notice (empty = none)"
+    },
+    "output_typo_rate": {
+      "description": "Output Typo Rate"
+    },
+    "cross_session_enabled": {
+      "description": "Cross Session Enabled"
+    },
+    "cross_session_ttl_min": {
+      "description": "Cross Session Ttl Min"
+    },
+    "cross_session_memory": {
+      "description": "Cross Session Memory"
+    },
+    "output_expr_max_inject": {
+      "description": "Output Expr Max Inject"
+    },
+    "expression_review_first": {
+      "description": "Expression Review First"
+    },
+    "jargon_enabled": {
+      "description": "Jargon Enabled"
+    },
+    "jargon_name_filter": {
+      "description": "Jargon Name Filter"
+    },
+    "jargon_candidate_min_sessions": {
+      "description": "Jargon Candidate Min Sessions"
+    },
+    "jargon_candidate_min_hits": {
+      "description": "Jargon Candidate Min Hits"
+    },
+    "jargon_infer_daily_batches": {
+      "description": "Jargon Infer Daily Batches"
+    },
+    "jargon_try_daily_quota": {
+      "description": "Jargon Try Daily Quota"
+    },
+    "proactive_instruction": {
+      "description": "Proactive Instruction"
+    },
+    "proactive_writeback": {
+      "description": "Proactive Writeback"
+    },
+    "proactive_note_enabled": {
+      "description": "Proactive Note Enabled"
+    },
+    "proactive_note_hours": {
+      "description": "Proactive Note Hours"
+    },
+    "proactive_note_max": {
+      "description": "Proactive Note Max"
+    },
+    "proactive_prompt_max_age_min": {
+      "description": "Proactive Prompt Max Age Min"
+    },
+    "conn_mode_group": {
+      "description": "Conn Mode Group"
+    },
+    "conn_mode_private": {
+      "description": "Conn Mode Private"
+    },
+    "conn_black_group": {
+      "description": "Conn Black Group"
+    },
+    "conn_white_group": {
+      "description": "Conn White Group"
+    },
+    "conn_black_private": {
+      "description": "Conn Black Private"
+    },
+    "conn_white_private": {
+      "description": "Conn White Private"
+    },
+    "persona_active_id": {
+      "description": "Persona Active Id"
     }
   },
   "pages": {

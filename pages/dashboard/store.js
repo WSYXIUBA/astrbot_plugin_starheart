@@ -36,6 +36,8 @@ export const STATE = {
   tokens: null,
   theme: "light",
   ready: false,
+  /** 参数中心域深链锚点（#settings/params/<domain>）：app.js 的 parseHash 投递，settings 页消费 */
+  paramsAnchor: "",
 };
 
 export const $ = (sel) => document.querySelector(sel);
@@ -77,7 +79,7 @@ function badResponse(res, label, strict) {
 
 export async function api(path, params) {
   const p = { ...(params || {}) };
-  // 显式传 persona_id:"" 表示「要全量」，别被查看视角覆盖（危险区计数需要全库数）
+  // 显式传 persona_id:"" 表示「要全量」，别被查看视角覆盖（数据治理的计数需要全库数）
   if (STATE.personaView && p.persona_id === undefined) p.persona_id = STATE.personaView;
   const res = await withTimeout(bridge.apiGet(EP(path), p), 30000, path);
   const bad = badResponse(res, path, false);
@@ -115,6 +117,13 @@ export async function apiPostSafe(path, body) {
   } catch (err) {
     return { ok: false, error: (err && err.message) || String(err) };
   }
+}
+
+/** 保存成功但原生配置写回失败时的提示文案；没有失败返回空串。 */
+export function nativeWriteError(res) {
+  const nw = res && res.ok && res.data && res.data._native_write;
+  if (nw && nw.ok === false) return String(nw.error || "未知原因");
+  return "";
 }
 
 /**
@@ -180,6 +189,51 @@ export function normList(value) {
     .split(/[,，\s]+/)
     .map((x) => x.trim())
     .filter(Boolean);
+}
+
+/* ---------------- 参数中心：「最近改过」跟踪（收尾批） ----------------
+   面板跑在 sandbox iframe 里（没有 localStorage/sessionStorage），只能记在这次会话的内存里。
+   只在**服务端确认保存成功**后登记 —— 输入框里改了还没保存的不算「改过」，那会是假信息。
+   「改过」= 用户手改过（input 事件）且这次保存真的写进去的键；保存会把所有行原样回写，
+   所以**不能**把整批 patch 都算成改过（那样每个域一保存、全表都置顶，等于没置顶）。 */
+const CONFIG_TOUCHED = new Map(); // key -> 时间戳（秒）
+const CONFIG_DIRTY = new Set();   // 用户手改过、还没保存成功的键
+
+export function noteConfigTouched(keys) {
+  const now = Date.now() / 1000;
+  (Array.isArray(keys) ? keys : [keys]).forEach((k) => {
+    if (k) CONFIG_TOUCHED.set(String(k), now);
+  });
+}
+
+/** 用户手改了某个键（由 #pagehost 上的委托 input 监听调用；程序性赋值不算） */
+export function noteConfigDirty(key) {
+  if (key) CONFIG_DIRTY.add(String(key));
+}
+
+/** 保存成功后：把这批键里**真的被手改过**的取出来登记为「最近改过」，并清掉它们的脏标记 */
+export function takeConfigDirty(keys) {
+  const out = [];
+  (Array.isArray(keys) ? keys : [keys]).forEach((k) => {
+    if (CONFIG_DIRTY.has(k)) {
+      out.push(k);
+      CONFIG_DIRTY.delete(k);
+    }
+  });
+  return out;
+}
+
+export function configTouchedAt(key) {
+  return CONFIG_TOUCHED.get(String(key)) || 0;
+}
+
+/** 「最近改过置顶」：本次会话改过的键按改动时间倒序排到最前，其余保持原来的顺序 */
+export function recentFirstKeys(keys) {
+  const arr = Array.from(keys || []);
+  const touched = arr
+    .filter((k) => CONFIG_TOUCHED.has(k))
+    .sort((a, b) => CONFIG_TOUCHED.get(b) - CONFIG_TOUCHED.get(a));
+  return touched.length ? touched.concat(arr.filter((k) => !CONFIG_TOUCHED.has(k))) : arr;
 }
 
 /* ---------------- 主题 ---------------- */
@@ -514,6 +568,49 @@ export function goPage(page, sub) {
   const next = `#${page}${sub ? "/" + sub : ""}`;
   if (location.hash === next) return;
   location.hash = next;
+}
+
+/* ---------------- 参数中心域深链（收尾批） ----------------
+   #settings/params/<domain>：跳到「设置 · 模块与参数」的对应域分区（带锚点滚动 + 高亮）。
+   已在参数中心时直接滚动，不整页重渲染 —— 不会把用户输入到一半的值冲掉。 */
+
+export function hfGoParams(domain) {
+  const d = String(domain || "").replace(/[^a-z_]/g, "");
+  if (!d) return;
+  if (STATE.page === "settings" && STATE.sub === "main") {
+    scrollParamsDomain(d);
+    try {
+      const target = "#settings/params/" + d;
+      if (location.hash !== target) history.replaceState(null, "", target);
+    } catch (err) { /* 沙箱里可能不允许改 URL；锚点已经滚到位，不影响使用 */ }
+    return;
+  }
+  location.hash = "#settings/params/" + d;
+}
+
+/** 滚到某个参数域分区并短暂高亮描边（找不到就如实说，不假装跳了） */
+export function scrollParamsDomain(domain) {
+  const d = String(domain || "").replace(/[^a-z_]/g, "");
+  const el = document.querySelector(`[data-pdom="${d}"]`);
+  if (!el) {
+    toast("没找到「" + d + "」参数区（页面可能还在加载）");
+    return false;
+  }
+  // 顶栏是 sticky（约 48px 高）——给锚点留出这一段的让位，别把分区卡头压在顶栏底下
+  el.style.scrollMarginTop = "58px";
+  try { el.scrollIntoView({ block: "start", behavior: "smooth" }); } catch (err) { el.scrollIntoView(); }
+  el.style.outline = "2px solid var(--primary,#3c96ca)";
+  setTimeout(() => { el.style.outline = ""; }, 1600);
+  return true;
+}
+
+/** 消费 app.js 路由投递过来的域锚点；同一次投放只滚一次（软刷新不会反复跳）。
+ *  返回是否真的滚了 —— 路由的「还原滚动位置」逻辑据此让位，不把这次跳转顶掉。 */
+export function consumeParamsAnchor() {
+  const dom = STATE.paramsAnchor;
+  if (!dom) return false;
+  STATE.paramsAnchor = "";
+  return scrollParamsDomain(dom);
 }
 
 let _refreshHook = null;

@@ -71,7 +71,7 @@ def _len_nows(text: Any) -> int:
 # 库结构版本档位。以前没有任何版本机制，全靠下面一长串 `if 列 not in cols: ALTER` 幂等探测 ——
 # 能跑，但无法回答「这个库升到哪一档了」，也写不出「只跑一次」的迁移。
 # 新库直接盖当前档；旧库原地升档（上面的 ALTER 都是幂等的，不需要重跑）。
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 6
 
 # 审查补的三条索引：高频查询列此前完全没索引 → 全表扫描。
 # 必须**在列升级（ALTER TABLE）之后**执行，因为它们引用的 last_used_at 是由 ALTER 补上的列，
@@ -351,6 +351,9 @@ SCHEMA = (
         tries INTEGER NOT NULL DEFAULT 0,
         next_try_at REAL NOT NULL DEFAULT 0,
         last_error TEXT DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'retry',
+        locked_by TEXT NOT NULL DEFAULT '',
+        locked_until REAL NOT NULL DEFAULT 0,
         created_at REAL NOT NULL DEFAULT 0
     )""",
     """CREATE TABLE IF NOT EXISTS hf_memory_src (
@@ -362,6 +365,17 @@ SCHEMA = (
         ts REAL NOT NULL DEFAULT 0,
         PRIMARY KEY (memory_id, seq)
     )""",
+    # 记忆 ↔ 消息 id 侧车：撤回精确命中「自动总结」的记忆只能靠它。
+    # 自动总结写入的 source_ref 是 `capture:{session}`，永远不等于 message_id；
+    # 捕获时把批内每条消息的 id 记在这里，撤回按 message_id 反查（P1-3）。
+    # 老记忆没有这批数据，撤回只对新记忆生效 —— 这一点写进 CHANGELOG。
+    """CREATE TABLE IF NOT EXISTS hf_memory_msg (
+        memory_id INTEGER NOT NULL,
+        message_id TEXT NOT NULL DEFAULT '',
+        ts REAL NOT NULL DEFAULT 0,
+        PRIMARY KEY (memory_id, message_id)
+    )""",
+    """CREATE INDEX IF NOT EXISTS idx_hf_memmsg_mid ON hf_memory_msg(message_id)""",
     # ---------------- 流水四表（只记不拦；全部 additive，不动任何已有表与列） ----------------
     # 建表纪律：仅 CREATE TABLE/INDEX IF NOT EXISTS，不动任何已有表与列。
     # 保留期：hf_sent_log 30 天 / hf_decision_log 30 天 / hf_expr_use_log 90 天 / hf_send_plan 30 天（终态行），
@@ -587,6 +601,270 @@ SCHEMA = (
     """,
     "CREATE INDEX IF NOT EXISTS idx_hf_jargon_hit ON hf_jargon_hit(term_id, ts DESC)",
 
+    # ================= v2 记忆（批 A：只建表 + 只写不读） =================
+    # 设计见 _refs/记忆系统调研-20261020/v2-完整方案-v1.6.md。
+    # 纪律：全部 additive；不删不改任何 v1 表；v2_enabled 默认 false，读路径完全不变。
+    """CREATE TABLE IF NOT EXISTS episodes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL DEFAULT '',
+        persona_id TEXT NOT NULL DEFAULT '',
+        subject_id TEXT NOT NULL DEFAULT '',
+        started_at REAL NOT NULL DEFAULT 0,
+        ended_at REAL NOT NULL DEFAULT 0,
+        raw_json TEXT NOT NULL DEFAULT '[]',
+        message_ids TEXT NOT NULL DEFAULT '[]',
+        msg_hash TEXT NOT NULL DEFAULT '',
+        summary TEXT DEFAULT '',
+        extract_state TEXT NOT NULL DEFAULT 'pending',
+        attempts INTEGER NOT NULL DEFAULT 0,
+        lock_until REAL DEFAULT 0,
+        retry_at REAL DEFAULT 0,
+        created_at REAL NOT NULL DEFAULT 0
+    )""",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_ep_hash ON episodes(session_id, msg_hash)",
+    "CREATE INDEX IF NOT EXISTS idx_ep_extract ON episodes(extract_state, retry_at)",
+
+    """CREATE TABLE IF NOT EXISTS memories (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        legacy_id INTEGER,
+        episode_id INTEGER,
+        persona_id TEXT NOT NULL DEFAULT '',
+        subject_id TEXT NOT NULL DEFAULT '',
+        session_id TEXT NOT NULL DEFAULT '',
+        kind TEXT NOT NULL DEFAULT 'fact',
+        text TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        gist TEXT DEFAULT '',
+        occurred_start REAL,
+        occurred_end REAL,
+        mentioned_at REAL NOT NULL DEFAULT 0,
+        time_phrase TEXT DEFAULT '',
+        time_granularity TEXT DEFAULT '',
+        anchor_memory_id INTEGER,
+        anchor_state TEXT DEFAULT '',
+        valid_from REAL,
+        valid_to REAL,
+        is_current INTEGER NOT NULL DEFAULT 1,
+        superseded_by INTEGER,
+        source_msg_ids TEXT NOT NULL DEFAULT '[]',
+        evidence_quote TEXT DEFAULT '',
+        evidence_kind TEXT NOT NULL DEFAULT 'verbatim',
+        stance TEXT DEFAULT 'unknown',
+        origin TEXT NOT NULL DEFAULT 'user_explicit',
+        confidence REAL NOT NULL DEFAULT 0.5,
+        intimacy INTEGER NOT NULL DEFAULT 0,
+        due_at REAL,
+        importance INTEGER NOT NULL DEFAULT 3,
+        arousal REAL NOT NULL DEFAULT 0.0,
+        valence REAL NOT NULL DEFAULT 0.0,
+        access_count INTEGER NOT NULL DEFAULT 0,
+        last_access_at REAL,
+        used_count INTEGER NOT NULL DEFAULT 0,
+        mention_count INTEGER NOT NULL DEFAULT 0,
+        last_mention_at REAL,
+        muted INTEGER NOT NULL DEFAULT 0,
+        proof_count INTEGER NOT NULL DEFAULT 0,
+        source_ids TEXT NOT NULL DEFAULT '[]',
+        consolidated INTEGER NOT NULL DEFAULT 0,
+        migrated INTEGER NOT NULL DEFAULT 0,
+        needs_review INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'active',
+        tags TEXT NOT NULL DEFAULT '[]',
+        entities TEXT NOT NULL DEFAULT '[]',
+        created_at REAL NOT NULL DEFAULT 0,
+        updated_at REAL NOT NULL DEFAULT 0
+    )""",
+    """CREATE UNIQUE INDEX IF NOT EXISTS ux_mem_hash ON memories(subject_id, content_hash)
+        WHERE status='active' AND is_current=1""",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_mem_legacy ON memories(legacy_id) WHERE legacy_id IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS idx_mem_recall ON memories(persona_id, status, is_current, mentioned_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_mem_time ON memories(status, is_current, occurred_start)",
+    "CREATE INDEX IF NOT EXISTS idx_mem_consol ON memories(consolidated, importance DESC) WHERE consolidated=0",
+    "CREATE INDEX IF NOT EXISTS idx_mem_due ON memories(due_at) WHERE kind='commitment' AND status='active'",
+
+    # FTS 必须在 memories/episodes 之后建（external content 要求宿主表存在）
+    """CREATE VIRTUAL TABLE IF NOT EXISTS fts_mem USING fts5(
+        text, gist, entities, content='memories', content_rowid='id', tokenize='trigram')""",
+    """CREATE VIRTUAL TABLE IF NOT EXISTS fts_ep USING fts5(
+        raw_json, content='episodes', content_rowid='id', tokenize='trigram')""",
+    """CREATE TRIGGER IF NOT EXISTS trg_mem_ai AFTER INSERT ON memories BEGIN
+        INSERT INTO fts_mem(rowid,text,gist,entities) VALUES (new.id,new.text,new.gist,new.entities);
+    END""",
+    """CREATE TRIGGER IF NOT EXISTS trg_mem_ad AFTER DELETE ON memories BEGIN
+        INSERT INTO fts_mem(fts_mem,rowid,text,gist,entities) VALUES('delete',old.id,old.text,old.gist,old.entities);
+    END""",
+    """CREATE TRIGGER IF NOT EXISTS trg_mem_au AFTER UPDATE OF text,gist,entities ON memories BEGIN
+        INSERT INTO fts_mem(fts_mem,rowid,text,gist,entities) VALUES('delete',old.id,old.text,old.gist,old.entities);
+        INSERT INTO fts_mem(rowid,text,gist,entities) VALUES (new.id,new.text,new.gist,new.entities);
+    END""",
+    """CREATE TRIGGER IF NOT EXISTS trg_ep_ai AFTER INSERT ON episodes BEGIN
+        INSERT INTO fts_ep(rowid,raw_json) VALUES (new.id,new.raw_json);
+    END""",
+    """CREATE TRIGGER IF NOT EXISTS trg_ep_ad AFTER DELETE ON episodes BEGIN
+        INSERT INTO fts_ep(fts_ep,rowid,raw_json) VALUES('delete',old.id,old.raw_json);
+    END""",
+    """CREATE TRIGGER IF NOT EXISTS trg_ep_au AFTER UPDATE OF raw_json ON episodes BEGIN
+        INSERT INTO fts_ep(fts_ep,rowid,raw_json) VALUES('delete',old.id,old.raw_json);
+        INSERT INTO fts_ep(rowid,raw_json) VALUES (new.id,new.raw_json);
+    END""",
+
+    """CREATE TABLE IF NOT EXISTS mem_bigram (
+        gram TEXT NOT NULL, memory_id INTEGER NOT NULL,
+        PRIMARY KEY (gram, memory_id)
+    ) WITHOUT ROWID""",
+
+    """CREATE TABLE IF NOT EXISTS mem_vectors (
+        owner_type TEXT NOT NULL, owner_id INTEGER NOT NULL, gen_key TEXT NOT NULL,
+        model TEXT NOT NULL DEFAULT '', dim INTEGER NOT NULL DEFAULT 0, vec BLOB NOT NULL,
+        PRIMARY KEY (owner_type, owner_id, gen_key)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_memvec_gen ON mem_vectors(gen_key, owner_id)",
+
+    """CREATE TABLE IF NOT EXISTS access_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        turn_id TEXT NOT NULL DEFAULT '',
+        session_id TEXT NOT NULL DEFAULT '',
+        subject_id TEXT DEFAULT '',
+        memory_id INTEGER NOT NULL,
+        ts REAL NOT NULL DEFAULT 0,
+        used_in_reply INTEGER NOT NULL DEFAULT 0,
+        shown INTEGER NOT NULL DEFAULT 0,
+        channel TEXT NOT NULL DEFAULT 'recall'
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_acc_turn ON access_log(turn_id)",
+    "CREATE INDEX IF NOT EXISTS idx_acc_mem ON access_log(memory_id, ts, channel)",
+
+    """CREATE TABLE IF NOT EXISTS mem_trace (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts REAL, session_id TEXT, zone TEXT, query TEXT,
+        memory_id INTEGER, rank INTEGER,
+        rrf_norm REAL, recency REAL, importance REAL, used REAL, mention REAL, entity REAL,
+        final REAL, injected INTEGER, drop_reason TEXT DEFAULT '',
+        rendered TEXT DEFAULT '', channel TEXT DEFAULT 'recall'
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_trace_ts ON mem_trace(ts DESC)",
+
+    """CREATE TABLE IF NOT EXISTS recall_event (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts REAL, session_id TEXT, query TEXT,
+        cand_lex INTEGER, cand_vec INTEGER, cand_ent INTEGER, cand_time INTEGER, cand_ep INTEGER,
+        hit INTEGER, injected INTEGER, ms REAL
+    )""",
+
+    """CREATE TABLE IF NOT EXISTS quarantine (
+        memory_id INTEGER PRIMARY KEY,
+        reason TEXT,
+        state TEXT NOT NULL DEFAULT 'pending',
+        reviewed_at REAL, note TEXT, created_at REAL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_quar_state ON quarantine(state, created_at)",
+
+    """CREATE TABLE IF NOT EXISTS consolidation_run (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        started_at REAL, finished_at REAL, batch INTEGER,
+        created INTEGER, merged INTEGER, superseded INTEGER, error TEXT
+    )""",
+
+    """CREATE TABLE IF NOT EXISTS mem_write_ledger (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        new_id INTEGER, legacy_id INTEGER,
+        old_ok INTEGER DEFAULT 0, new_ok INTEGER DEFAULT 0,
+        err TEXT DEFAULT '', ts REAL
+    )""",
+
+    """CREATE TABLE IF NOT EXISTS person_address (
+        person_id TEXT NOT NULL, persona_id TEXT NOT NULL DEFAULT '',
+        term TEXT NOT NULL, priority INTEGER DEFAULT 0, zone_floor TEXT DEFAULT '',
+        dropped_at REAL, created_at REAL,
+        PRIMARY KEY (person_id, persona_id, term)
+    )""",
+
+    """CREATE TABLE IF NOT EXISTS anchor_queue (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        memory_id INTEGER NOT NULL, created_at REAL, resolved_at REAL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_anchor_open ON anchor_queue(resolved_at) WHERE resolved_at IS NULL",
+
+    # ================= 语言学习（MVP：原话样本 + 词表） =================
+    # 设计见 _refs/语言学习蒸馏-20261020/方案-v1.3-MVP.md。
+    # 纪律：不删不改 hf_expr；旧链路原样保留，靠 expression_style_inject_mode 切换。
+    """CREATE TABLE IF NOT EXISTS hf_style_samples (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        persona_id    TEXT NOT NULL DEFAULT '',
+        kind          TEXT NOT NULL DEFAULT 'bot',      -- bot | human
+        register      TEXT NOT NULL DEFAULT 'private',  -- group | private
+        trigger_text  TEXT NOT NULL DEFAULT '',         -- human 也存（否则去重压成一行）
+        reply_text    TEXT NOT NULL DEFAULT '',         -- 单气泡 canon 文本
+        structure_json TEXT NOT NULL DEFAULT '{}',
+        norm_key      TEXT NOT NULL DEFAULT '',
+        source_ids    TEXT NOT NULL DEFAULT '[]',
+        sensitivity   TEXT NOT NULL DEFAULT 'normal',   -- normal | intimate | pii
+        shown         INTEGER NOT NULL DEFAULT 0,
+        last_shown_at REAL NOT NULL DEFAULT 0,
+        status        TEXT NOT NULL DEFAULT 'active',   -- active | retired | archived
+        created_at    REAL NOT NULL DEFAULT 0,
+        updated_at    REAL NOT NULL DEFAULT 0
+    )""",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_style_sample ON hf_style_samples(persona_id, kind, norm_key)",
+    "CREATE INDEX IF NOT EXISTS idx_style_pick ON hf_style_samples(persona_id, status, kind, register, last_shown_at)",
+
+    """CREATE TABLE IF NOT EXISTS hf_style_terms (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        persona_id    TEXT NOT NULL DEFAULT '',
+        term          TEXT NOT NULL,
+        term_norm     TEXT NOT NULL DEFAULT '',
+        kind          TEXT NOT NULL DEFAULT 'tic',      -- tic | slang | address
+        meaning       TEXT NOT NULL DEFAULT '',
+        usage         TEXT NOT NULL DEFAULT '',
+        scope         TEXT NOT NULL DEFAULT '全局',
+        enabled       INTEGER NOT NULL DEFAULT 1,
+        status        TEXT NOT NULL DEFAULT 'confirmed',-- pending | confirmed | denied
+        hits          INTEGER NOT NULL DEFAULT 0,
+        evidence_json TEXT NOT NULL DEFAULT '[]',
+        source_ids    TEXT NOT NULL DEFAULT '[]',
+        created_at    REAL NOT NULL DEFAULT 0,
+        updated_at    REAL NOT NULL DEFAULT 0
+    )""",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_style_term ON hf_style_terms(persona_id, term_norm, scope)",
+    "CREATE INDEX IF NOT EXISTS idx_style_term_match ON hf_style_terms(scope, enabled, status)",
+
+    # ================= 语言学习 v2：回复方式 / 原话（带记忆出处） =================
+    # 设计见 int/data/语言学习v2-设计稿-20261021/设计稿说明.md（v7）。
+    # 口径：一种回复方式 = 一个组件；组件里存逐字原话，每条原话挂「来自哪条记忆」；
+    # 学习输入 = hf_memories.evidence 里的原对话（用户：… / 助手：…），不靠模型复述。
+    """CREATE TABLE IF NOT EXISTS hf_style_styles (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        persona_id  TEXT NOT NULL DEFAULT '',
+        name        TEXT NOT NULL,
+        status      TEXT NOT NULL DEFAULT 'active',   -- active | paused
+        hits        INTEGER NOT NULL DEFAULT 0,
+        corrections INTEGER NOT NULL DEFAULT 0,
+        created_at  REAL NOT NULL DEFAULT 0,
+        updated_at  REAL NOT NULL DEFAULT 0
+    )""",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_style_style ON hf_style_styles(persona_id, name)",
+
+    """CREATE TABLE IF NOT EXISTS hf_style_quotes (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        style_id    INTEGER NOT NULL DEFAULT 0,
+        persona_id  TEXT NOT NULL DEFAULT '',
+        quote       TEXT NOT NULL,
+        trigger_text TEXT NOT NULL DEFAULT '',
+        memory_id   INTEGER NOT NULL DEFAULT 0,
+        session_id  TEXT NOT NULL DEFAULT '',
+        user_id     TEXT NOT NULL DEFAULT '',
+        user_name   TEXT NOT NULL DEFAULT '',
+        register    TEXT NOT NULL DEFAULT 'private',
+        hits        INTEGER NOT NULL DEFAULT 0,
+        corrections INTEGER NOT NULL DEFAULT 0,
+        status      TEXT NOT NULL DEFAULT 'active',   -- active | dropped（不准的丢弃）
+        last_used_at REAL NOT NULL DEFAULT 0,
+        created_at  REAL NOT NULL DEFAULT 0,
+        updated_at  REAL NOT NULL DEFAULT 0
+    )""",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_style_quote ON hf_style_quotes(memory_id, quote)",
+    "CREATE INDEX IF NOT EXISTS idx_style_quote_pick ON hf_style_quotes(persona_id, status, style_id)",
+
 )
 
 
@@ -775,6 +1053,24 @@ class Store:
             await self._db.commit()
         except Exception as exc:                            # noqa: BLE001 列升级失败不该挡住启动
             logger.warning(f"[StarHeart] 决策流水改判列升级跳过：{exc}")
+        # 捕获队列升级（库结构 3）：status / locked_by / locked_until 三列。
+        # 为什么：① 三态 outcome 要区分「待重试」和「已停摆（parked）」；② capture_take 原来只
+        # SELECT 不占位，同一批超过一个 tick（120s）会被第二个 worker 再总结一遍 —— 重复记忆 + 重复烧 token。
+        # 纯 additive：PRAGMA 探测 + ALTER，老库升级与新建库走同一条路（新库此时已带这三列）。
+        try:
+            cp_cols = {str(r[1]) for r in await (await self._db.execute(
+                "PRAGMA table_info(hf_capture_pending)")).fetchall()}
+            for col, ddl in (("status", "TEXT NOT NULL DEFAULT 'retry'"),
+                             ("locked_by", "TEXT NOT NULL DEFAULT ''"),
+                             ("locked_until", "REAL NOT NULL DEFAULT 0")):
+                if cp_cols and col not in cp_cols:
+                    await self._db.execute(f"ALTER TABLE hf_capture_pending ADD COLUMN {col} {ddl}")
+            # 老库里的行都是「待处理」：默认值已对上；这里只防呆空值，不猜测语义。
+            await self._db.execute(
+                "UPDATE hf_capture_pending SET status='retry' WHERE COALESCE(status,'')=''")
+            await self._db.commit()
+        except Exception as exc:                            # noqa: BLE001 列升级失败不该挡住启动
+            logger.warning(f"[StarHeart] 捕获队列列升级跳过：{exc}")
         # 向量列（旧库平滑升级）
         cols = [r[1] for r in await (await self._db.execute("PRAGMA table_info(hf_memories)")).fetchall()]
         if "embedding" not in cols:
@@ -795,6 +1091,11 @@ class Store:
         # 旧库一律空串 = 未标注，召回时按「不惩罚」处理（不做猜测回填）。
         if "subject_id" not in cols:
             await self._db.execute("ALTER TABLE hf_memories ADD COLUMN subject_id TEXT DEFAULT ''")
+        # 「别再提」冷处理：muted=1 的记忆不进召回、不进主动池，但保留在库里可随时恢复。
+        # 为什么要这一列：用户对某条旧记忆说「我从没提过这个」时，除了删掉没有别的动作 ——
+        # 删就丢了，留着又会一直被注入。这是负反馈的唯一落点。
+        if "muted" not in cols:
+            await self._db.execute("ALTER TABLE hf_memories ADD COLUMN muted INTEGER NOT NULL DEFAULT 0")
         # 主动流水升级：记下这条开口当时的「提示词来源（astrbot=完整 / persona=降级只吃人格）」与
         # 「参考记忆编号」——以前只能翻 completion 原文才知道有没有降级，出问题无从核对。
         pl_cols = [r[1] for r in await (await self._db.execute("PRAGMA table_info(hf_proactive_log)")).fetchall()]
@@ -850,6 +1151,22 @@ class Store:
         except Exception:                                   # noqa: BLE001
             cur_ver = 0
         if cur_ver < SCHEMA_VERSION:
+            # v5 数据迁移：强度上限由重要度（poignancy）决定。
+            # 旧实现「注入一次 +0.06」把测试句一路推到 0.99（真机 #906 被注入 62 次），
+            # 于是一句「早上八点半到岗」比真实偏好还重。这里把存量一次性夹回上限：
+            # cap = 0.55 + 0.04 × poignancy（poi 3 → 0.67，poi 10 → 0.95）。
+            if cur_ver < 5:
+                try:
+                    cur = await self._db.execute(
+                        "UPDATE hf_memories SET strength = MIN(strength, 0.55 + 0.04 * COALESCE(poignancy, 5)) "
+                        "WHERE strength > 0.55 + 0.04 * COALESCE(poignancy, 5)")
+                    await self._db.commit()
+                    clamped = int(cur.rowcount or 0)
+                    if clamped:
+                        logger.info(f"[StarHeart] 强度上限迁移：{clamped} 条按重要度夹回（0.55+0.04×poignancy）")
+                        await self.audit("memory.strength_cap", f"clamped={clamped}")
+                except Exception as exc:                    # noqa: BLE001 迁移失败不该挡住启动
+                    logger.warning(f"[StarHeart] 强度上限迁移跳过：{exc}")
             await self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             await self._db.commit()
             if cur_ver:
@@ -882,8 +1199,8 @@ class Store:
                     (summary, content, atom_type, strength, poignancy, source_mode, source_ref,
                      session_id, persona_id, tags, entities, cues, evidence, recalls, status,
                      occurred_at, created_at, updated_at, external_source, external_id, import_batch,
-                     last_used_at, subject_id)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                     last_used_at, strength_updated_at, subject_id)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     mem.get("summary", ""),
@@ -910,6 +1227,9 @@ class Store:
                     # 入库即视为「刚被提起」：导入的历史记忆若按原始发生日期算龄，
                     # 第一个生命周期 tick 就会被归档、再一轮被遗忘（P0-13）。
                     float(mem.get("last_used_at") or ts),
+                    # 衰减基线必须入库时就写好：留 0 会让这条记忆「永不衰减」，
+                    # 直到下一次启动 repair_memory_timebase 才补上（真机每次启动 base_filled>0）。
+                    float(mem.get("strength_updated_at") or ts),
                     str(mem.get("subject_id") or ""),
                 ),
             )
@@ -917,6 +1237,283 @@ class Store:
             return int(cur.lastrowid or 0)
         except aiosqlite.IntegrityError:
             return None
+
+    # ================= v2 记忆（批 A：只写不读） =================
+
+    @staticmethod
+    def resolve_mid(value: Any) -> tuple[str, int] | None:
+        """把 'm12' / 12 / 'v2m12' 解析成 (命名空间, id)。
+
+        命名空间：legacy = hf_memories；v2 = memories。
+        返回 None 表示非法。**调用方必须按 ns 分流**，不能只取 id
+        （'v2m12' 取 12 会打到 hf_memories 第 12 行 —— 删错行）。
+        """
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        if raw.startswith("v2m"):
+            try:
+                return ("v2", int(raw[3:]))
+            except (TypeError, ValueError):
+                return None
+        if raw.startswith("m"):
+            raw = raw[1:]
+        try:
+            return ("legacy", int(raw))
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def norm_text(text: Any) -> str:
+        """content_hash 归一化：小写、去空白、去标点、全半角归一。"""
+        import unicodedata
+
+        t = unicodedata.normalize("NFKC", str(text or "")).lower()
+        t = re.sub(r"[\s\u3000]+", "", t)
+        t = re.sub(r"[^\w\u4e00-\u9fff]+", "", t)
+        return t
+
+    @classmethod
+    def content_hash_v2(cls, subject_id: str, text: str) -> str:
+        return hashlib.sha1(f"{subject_id}|{cls.norm_text(text)}".encode("utf-8")).hexdigest()[:32]
+
+    async def upsert_episode(self, ep: dict[str, Any]) -> int | None:
+        """影子写：按 (session_id, msg_hash) 幂等落 episode，返回 id。"""
+        session_id = str(ep.get("session_id") or "")
+        raw_json = str(ep.get("raw_json") or "[]")
+        msg_hash = str(ep.get("msg_hash") or _hash16(raw_json))
+        if not session_id or not raw_json or raw_json == "[]":
+            return None
+        ts = now()
+        try:
+            await self.db.execute(
+                "INSERT INTO episodes (session_id, persona_id, subject_id, started_at, ended_at, "
+                "raw_json, message_ids, msg_hash, summary, extract_state, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,'pending',?) "
+                "ON CONFLICT(session_id, msg_hash) DO NOTHING",
+                (
+                    session_id,
+                    str(ep.get("persona_id") or ""),
+                    str(ep.get("subject_id") or ""),
+                    float(ep.get("started_at") or ts),
+                    float(ep.get("ended_at") or ts),
+                    raw_json,
+                    json.dumps(ep.get("message_ids") or [], ensure_ascii=False),
+                    msg_hash,
+                    str(ep.get("summary") or ""),
+                    ts,
+                ),
+            )
+            await self.db.commit()
+        except Exception as exc:                            # noqa: BLE001 影子写失败不影响主链路
+            logger.debug(f"[StarHeart] v2 episode 写入跳过：{exc}")
+            return None
+        row = await (await self.db.execute(
+            "SELECT id FROM episodes WHERE session_id=? AND msg_hash=?", (session_id, msg_hash)
+        )).fetchone()
+        return int(row["id"]) if row else None
+
+    async def claim_episode(self, ep_id: int, ttl: float = 300.0) -> bool:
+        """认领一条 episode 做抽取；frozen 永不认领（回滚保护）。"""
+        ts = now()
+        cur = await self.db.execute(
+            "UPDATE episodes SET extract_state='running', attempts=attempts+1, lock_until=? "
+            "WHERE id=? AND extract_state NOT IN ('frozen','done') "
+            "AND (lock_until IS NULL OR lock_until < ?)",
+            (ts + ttl, int(ep_id), ts),
+        )
+        await self.db.commit()
+        return int(cur.rowcount or 0) == 1
+
+    async def insert_memory_v2(self, mem: dict[str, Any]) -> int | None:
+        """写一条 v2 记忆；content_hash 冲突（同 subject 活跃行）返回 None。"""
+        ts = now()
+        text = str(mem.get("text") or "").strip()
+        if not text:
+            return None
+        subject = str(mem.get("subject_id") or "")
+        chash = str(mem.get("content_hash") or self.content_hash_v2(subject, text))
+        try:
+            cur = await self.db.execute(
+                "INSERT INTO memories (episode_id, persona_id, subject_id, session_id, kind, text, "
+                "content_hash, gist, occurred_start, occurred_end, mentioned_at, time_phrase, "
+                "time_granularity, anchor_memory_id, anchor_state, valid_from, is_current, "
+                "source_msg_ids, evidence_quote, evidence_kind, stance, origin, confidence, intimacy, due_at, "
+                "importance, arousal, valence, proof_count, source_ids, consolidated, migrated, "
+                "needs_review, status, tags, entities, created_at, updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    mem.get("episode_id"),
+                    str(mem.get("persona_id") or ""),
+                    subject,
+                    str(mem.get("session_id") or ""),
+                    str(mem.get("kind") or "fact"),
+                    text,
+                    chash,
+                    str(mem.get("gist") or ""),
+                    mem.get("occurred_start"),
+                    mem.get("occurred_end"),
+                    float(mem.get("mentioned_at") or ts),
+                    str(mem.get("time_phrase") or ""),
+                    str(mem.get("time_granularity") or ""),
+                    mem.get("anchor_memory_id"),
+                    str(mem.get("anchor_state") or ""),
+                    mem.get("valid_from"),
+                    json.dumps(mem.get("source_msg_ids") or [], ensure_ascii=False),
+                    str(mem.get("evidence_quote") or ""),
+                    str(mem.get("evidence_kind") or "verbatim"),
+                    str(mem.get("stance") or "unknown"),
+                    str(mem.get("origin") or "user_explicit"),
+                    float(mem.get("confidence") or 0.5),
+                    int(mem.get("intimacy") or 0),
+                    mem.get("due_at"),
+                    int(mem.get("importance") or 3),
+                    float(mem.get("arousal") or 0.0),
+                    float(mem.get("valence") or 0.0),
+                    int(mem.get("proof_count") or 0),
+                    json.dumps(mem.get("source_ids") or [], ensure_ascii=False),
+                    int(mem.get("consolidated") or 0),
+                    int(mem.get("migrated") or 0),
+                    int(mem.get("needs_review") or 0),
+                    str(mem.get("status") or "active"),
+                    json.dumps(mem.get("tags") or [], ensure_ascii=False),
+                    json.dumps(mem.get("entities") or [], ensure_ascii=False),
+                    ts,
+                    ts,
+                ),
+            )
+            await self.db.commit()
+            return int(cur.lastrowid or 0)
+        except aiosqlite.IntegrityError:
+            await self.db.commit()
+            return None
+
+    async def migrate_v1_to_v2(self) -> dict[str, Any]:
+        """批 A 迁移：hf_memories → memories（幂等，可重跑）。
+
+        映射见 v1.6 §13.1：
+          summary→text；content→gist（不同才写）；occurred_at→occurred_start；
+          created_at→mentioned_at；evidence→evidence_quote（优先 source_text）；
+          poignancy→importance；legacy_import 标记；consolidated=1 不占巩固队列。
+        向量从 hf_vectors 复制并转 f16；实体边复制为 v2m{newid}（旧边保留）。
+        """
+        import array
+
+        rows = await (await self.db.execute(
+            "SELECT * FROM hf_memories WHERE status != 'deleted' ORDER BY id"
+        )).fetchall()
+        ts = now()
+        stat = {"total": len(rows), "inserted": 0, "skipped": 0, "vectors": 0, "edges": 0, "errors": 0}
+        for row in rows:
+            d = dict(row)
+            legacy_id = int(d["id"])
+            summary = str(d.get("summary") or "").strip()
+            if not summary:
+                stat["skipped"] += 1
+                continue
+            exists = await (await self.db.execute(
+                "SELECT id FROM memories WHERE legacy_id=?", (legacy_id,)
+            )).fetchone()
+            if exists:
+                stat["skipped"] += 1
+                continue
+            content = str(d.get("content") or "").strip()
+            gist = content if content and content != summary else ""
+            subject = str(d.get("subject_id") or "")
+            quote = str(d.get("source_text") or d.get("evidence") or "")[:250]
+            try:
+                poi = int(d.get("poignancy") or 5)
+            except (TypeError, ValueError):
+                poi = 5
+            try:
+                strength = float(d.get("strength") or 0.5)
+            except (TypeError, ValueError):
+                strength = 0.5
+            importance = max(1, min(5, int(round(1 + strength * 4))))
+            cur = await self.db.execute(
+                "INSERT INTO memories (legacy_id, persona_id, subject_id, session_id, kind, text, "
+                "content_hash, gist, occurred_start, mentioned_at, evidence_quote, evidence_kind, "
+                "origin, confidence, time_granularity, importance, proof_count, source_ids, "
+                "consolidated, migrated, status, tags, entities, created_at, updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,'paraphrase','legacy_import',0.6,'month',?,?, "
+                "'[]',1,1,?,?,?,?,?)",
+                (
+                    legacy_id,
+                    str(d.get("persona_id") or ""),
+                    subject,
+                    str(d.get("session_id") or ""),
+                    str(d.get("atom_type") or "fact"),
+                    summary,
+                    self.content_hash_v2(subject, summary),
+                    gist,
+                    d.get("occurred_at"),
+                    float(d.get("created_at") or ts),
+                    quote,
+                    importance,
+                    poi,
+                    str(d.get("status") or "active"),
+                    str(d.get("tags") or "[]"),
+                    str(d.get("entities") or "[]"),
+                    float(d.get("created_at") or ts),
+                    ts,
+                ),
+            )
+            new_id = int(cur.lastrowid)
+            stat["inserted"] += 1
+            await self.db.execute(
+                "INSERT INTO mem_write_ledger (new_id, legacy_id, old_ok, new_ok, ts) VALUES (?,?,1,1,?)",
+                (new_id, legacy_id, ts),
+            )
+            # 向量：hf_vectors → mem_vectors（f32 → f16）
+            vr = await (await self.db.execute(
+                "SELECT model, dim, vec FROM hf_vectors WHERE memory_id=? ORDER BY created_at DESC LIMIT 1",
+                (legacy_id,),
+            )).fetchone()
+            if vr and vr["vec"]:
+                try:
+                    arr = array.array("f")
+                    arr.frombytes(vr["vec"])
+                    # Windows 的 array 不支持 'e'（半精度），用 struct 打包
+                    import struct
+
+                    half = struct.pack("<%de" % len(arr), *[float(x) for x in arr])
+                    await self.db.execute(
+                        "INSERT OR REPLACE INTO mem_vectors (owner_type, owner_id, gen_key, model, dim, vec) "
+                        "VALUES ('memory',?,?,?,?,?)",
+                        (new_id, self.gen_key(str(vr["model"] or ""), int(vr["dim"] or 0)),
+                         str(vr["model"] or ""), int(vr["dim"] or 0), half),
+                    )
+                    stat["vectors"] += 1
+                except Exception as exc:                    # noqa: BLE001 单条向量失败不影响迁移
+                    logger.debug(f"[StarHeart] v2 迁移向量跳过 #{legacy_id}：{exc}")
+            # 实体边：m{id} → v2m{new_id}（旧边保留，回滚需要）
+            er = await (await self.db.execute(
+                "SELECT dst_id, etype, weight FROM hf_edges "
+                "WHERE src_type='memory' AND src_id=? AND dst_type='entity' AND status!='deleted'",
+                (f"m{legacy_id}",),
+            )).fetchall()
+            for e in er:
+                try:
+                    await self.add_edge("memory", f"v2m{new_id}", "entity", str(e["dst_id"]),
+                                        str(e["etype"] or "entity"), float(e["weight"] or 1.0))
+                    stat["edges"] += 1
+                except Exception:                           # noqa: BLE001
+                    stat["errors"] += 1
+        await self.db.commit()
+        logger.info(f"[StarHeart] v2 迁移：{stat}")
+        return stat
+
+    async def v2_counts(self) -> dict[str, int]:
+        """v2 各表行数（/hf v2 status 用）。"""
+        out: dict[str, int] = {}
+        for tbl in ("episodes", "memories", "mem_vectors", "mem_bigram", "access_log",
+                    "mem_trace", "recall_event", "quarantine", "person_address", "anchor_queue"):
+            try:
+                row = await (await self.db.execute(f"SELECT COUNT(*) c FROM {tbl}")).fetchone()
+                out[tbl] = int(row["c"] if row else 0)
+            except Exception:                               # noqa: BLE001 表不存在时给 -1
+                out[tbl] = -1
+        return out
 
     @staticmethod
     def _mem_row(row: aiosqlite.Row) -> dict[str, Any]:
@@ -1093,7 +1690,7 @@ class Store:
                 "DELETE FROM hf_edges WHERE (src_type='memory' AND src_id=?) OR (dst_type='memory' AND dst_id=?)",
                 (f"m{raw}", f"m{raw}"),
             )
-            for tbl in ("hf_vectors", "hf_memory_src"):
+            for tbl in ("hf_vectors", "hf_memory_src", "hf_memory_msg"):
                 try:
                     await self.db.execute(f"DELETE FROM {tbl} WHERE memory_id=?", (raw,))
                 except Exception:                        # noqa: BLE001 老库可能没这张表
@@ -1109,59 +1706,194 @@ class Store:
     async def capture_enqueue(self, turns: list[dict[str, Any]], *, session_id: str = "",
                               persona_id: str = "", user_id: str = "", user_name: str = "",
                               delay: float = 0.0) -> int | None:
+        """入队（**不占位**）：只插入、返回 id。
+
+        生产链路不要用这条 —— 「插入后再去 claim」中间有窗口（P2-1），用 capture_enqueue_row。
+        保留它是因为它也是「手动放一批进队列」的最小原语（测试/工具用）。
+        """
+        return await self._capture_insert(
+            turns, session_id=session_id, persona_id=persona_id, user_id=user_id,
+            user_name=user_name, delay=delay, claim=False)
+
+    async def capture_enqueue_row(self, turns: list[dict[str, Any]], *, session_id: str = "",
+                                  persona_id: str = "", user_id: str = "", user_name: str = "",
+                                  delay: float = 0.0, lease: float = 0.0) -> dict[str, Any] | None:
+        """入队**即占位**：INSERT 里一次写死 locked_by + 租约，返回整行。
+
+        旧路径是「INSERT 再 capture_claim」两条语句：两步之间 retry tick 的 capture_take 能把新行
+        抢走（新行 status=retry、next_try_at<=now、locked_until=0 全满足）；被抢走后本次 worker
+        拿到的是没有 token 的 row，done/fail 都变成无条件操作 —— 正好是本批要消灭的双跑（P2-1）。
+        """
+        pid = await self._capture_insert(
+            turns, session_id=session_id, persona_id=persona_id, user_id=user_id,
+            user_name=user_name, delay=delay, claim=True, lease=lease)
+        if not pid:
+            return None
+        row = await (await self.db.execute(
+            "SELECT * FROM hf_capture_pending WHERE id=?", (pid,))).fetchone()
+        return self._capture_row(row) if row else None
+
+    async def _capture_insert(self, turns: list[dict[str, Any]], *, session_id: str = "",
+                              persona_id: str = "", user_id: str = "", user_name: str = "",
+                              delay: float = 0.0, claim: bool = False,
+                              lease: float = 0.0) -> int | None:
         if not turns:
             return None
         try:
             payload = json.dumps(list(turns), ensure_ascii=False)
         except Exception:
             return None
-        cur = await self.db.execute(
-            "INSERT INTO hf_capture_pending "
-            "(session_id, persona_id, user_id, user_name, payload, tries, next_try_at, created_at) "
-            "VALUES (?,?,?,?,?,0,?,?)",
-            (str(session_id or ""), str(persona_id or ""), str(user_id or ""), str(user_name or ""),
-             payload, now() + max(0.0, float(delay or 0)), now()),
+        t_now = now()
+        due = t_now + max(0.0, float(delay or 0))
+        if claim:
+            token = uuid.uuid4().hex
+            cur = await self.db.execute(
+                "INSERT INTO hf_capture_pending "
+                "(session_id, persona_id, user_id, user_name, payload, tries, next_try_at, "
+                " status, locked_by, locked_until, created_at) "
+                "VALUES (?,?,?,?,?,0,?,'retry',?,?,?)",
+                (str(session_id or ""), str(persona_id or ""), str(user_id or ""), str(user_name or ""),
+                 payload, due, token, t_now + float(lease or self.CAPTURE_LEASE_SECONDS), t_now),
+            )
+        else:
+            cur = await self.db.execute(
+                "INSERT INTO hf_capture_pending "
+                "(session_id, persona_id, user_id, user_name, payload, tries, next_try_at, "
+                " status, locked_by, locked_until, created_at) "
+                "VALUES (?,?,?,?,?,0,?,'retry','',0,?)",
+                (str(session_id or ""), str(persona_id or ""), str(user_id or ""), str(user_name or ""),
+                 payload, due, t_now),
+            )
+        await self.db.commit()
+        return int(cur.lastrowid or 0) or None
+
+    # 租约 10 分钟：worker 被 kill / 容器重启时锁不会永久不还，到期自动可被再次领取。
+    CAPTURE_LEASE_SECONDS = 600.0
+
+    @staticmethod
+    def _capture_row(r: Any) -> dict[str, Any]:
+        """行 → dict，并把 payload 解成 turns（面板/worker 共用）。"""
+        d = dict(r)
+        try:
+            d["turns"] = json.loads(d.get("payload") or "[]")
+        except Exception:
+            d["turns"] = []
+        return d
+
+    async def capture_take(self, limit: int = 3, *, lease: float = 0.0) -> list[dict[str, Any]]:
+        """原子领取到期可跑的待处理批（按到期时间先进先出）。
+
+        旧实现只 SELECT 不改状态：一批总结超过一个 tick（120s）就会被第二个 worker 再取一次，
+        两个 worker 同时总结、同时写记忆 —— 重复记忆 + 重复烧 token（P1-4）。
+        现在先 UPDATE 抢锁（locked_by 唯一 token + locked_until 租约），再按 token 回读自己的行。
+        到期租约（locked_until <= now）自动可再领取，不需要额外回收任务。
+        """
+        n = max(1, int(limit))
+        t_now = now()
+        token = uuid.uuid4().hex
+        lease_s = float(lease or self.CAPTURE_LEASE_SECONDS)
+        await self.db.execute(
+            "UPDATE hf_capture_pending SET locked_by=?, locked_until=? "
+            "WHERE id IN ("
+            "  SELECT id FROM hf_capture_pending "
+            "   WHERE COALESCE(status,'retry')='retry' AND next_try_at <= ? "
+            "     AND COALESCE(locked_until,0) <= ? "
+            "   ORDER BY next_try_at ASC, id ASC LIMIT ?)",
+            (token, t_now + lease_s, t_now, t_now, n),
         )
         await self.db.commit()
-        return int(cur.lastrowid or 0)
-
-    async def capture_take(self, limit: int = 3) -> list[dict[str, Any]]:
-        """取到期可跑的待处理批（按到期时间先进先出）。"""
         rows = await (await self.db.execute(
-            "SELECT * FROM hf_capture_pending WHERE next_try_at <= ? ORDER BY next_try_at ASC, id ASC LIMIT ?",
-            (now(), max(1, int(limit))),
+            "SELECT * FROM hf_capture_pending WHERE locked_by=? ORDER BY next_try_at ASC, id ASC",
+            (token,),
         )).fetchall()
-        out: list[dict[str, Any]] = []
-        for r in rows:
-            d = dict(r)
-            try:
-                d["turns"] = json.loads(d.get("payload") or "[]")
-            except Exception:
-                d["turns"] = []
-            out.append(d)
-        return out
+        return [self._capture_row(r) for r in rows]
 
     async def capture_count(self) -> int:
         row = await (await self.db.execute("SELECT COUNT(*) AS n FROM hf_capture_pending")).fetchone()
         return int((row or {})["n"] or 0) if row else 0
 
-    async def capture_done(self, pid: int) -> None:
-        await self.db.execute("DELETE FROM hf_capture_pending WHERE id=?", (int(pid),))
-        await self.db.commit()
+    async def capture_stats(self) -> dict[str, int]:
+        """按状态统计（retry / parked / …）：停摆的行要能被看见，不再靠 next_try_at 猜。"""
+        rows = await (await self.db.execute(
+            "SELECT COALESCE(status,'retry') AS st, COUNT(*) AS n FROM hf_capture_pending GROUP BY st"
+        )).fetchall()
+        return {str(r["st"] or "retry"): int(r["n"] or 0) for r in rows}
 
-    async def capture_fail(self, pid: int, err: str, max_tries: int = 5) -> int:
-        """失败退避：30s → 60 → 120 → 240 → 480，超上限留档不再重试（不静默丢数据）。"""
-        row = await (await self.db.execute("SELECT tries FROM hf_capture_pending WHERE id=?", (int(pid),))).fetchone()
-        tries = int((row or {"tries": 0})["tries"] or 0) + 1
-        if tries >= max_tries:
-            nxt = now() + 365 * 86400.0          # 不再自动重试，但语义上仍保留（面板可查）
-        else:
-            nxt = now() + min(3600.0, 30.0 * (2 ** (tries - 1)))
-        await self.db.execute(
-            "UPDATE hf_capture_pending SET tries=?, next_try_at=?, last_error=? WHERE id=?",
-            (tries, nxt, str(err or "")[:300], int(pid)),
+    async def capture_pending_list(self, limit: int = 20) -> list[dict[str, Any]]:
+        """面板用的队列视图：**不返回 payload**（里面是对话正文），只给可判断状态需要的列。"""
+        rows = await (await self.db.execute(
+            "SELECT id, session_id, tries, next_try_at, last_error, status, created_at "
+            "FROM hf_capture_pending ORDER BY id DESC LIMIT ?", (max(1, int(limit)),)
+        )).fetchall()
+        return [dict(r) for r in rows]
+
+    async def capture_hold(self, pid: int, reason: str, *, token: str = "",
+                           delay: float = 3600.0) -> bool:
+        """暂停处理（典型场景：用户关掉了「记忆捕获」）——**不删行**，把到期时间推后。
+
+        旧实现把「捕获已关闭」当成「这批无需处理」直接删行：用户只是想暂停，队列里已捕获的
+        对话被静默丢掉。现在行留着，开关重新打开后由 retry tick 自动续跑。
+        """
+        sql = ("UPDATE hf_capture_pending SET status='retry', next_try_at=?, last_error=?, "
+               "locked_by='', locked_until=0 WHERE id=?")
+        args: tuple[Any, ...] = (now() + max(60.0, float(delay)), f"paused: {reason}"[:300], int(pid))
+        if token:
+            sql += " AND locked_by=?"
+            args = args + (str(token),)
+        cur = await self.db.execute(sql, args)
+        await self.db.commit()
+        return bool(getattr(cur, "rowcount", 0))
+
+    async def capture_parked_for_retry(self, limit: int = 5) -> int:
+        """给停摆的批一次机会：tries 归 1、到期时间归现在，重新进入退避链。
+
+        退避链是 0→30→90→210→450s（约 7.5 分钟）：模型/网关故障超过这个时长，队列会整批
+        parked。没有出口的话，模型修好了也永远不会自动恢复，只能人工翻库。
+        """
+        cur = await self.db.execute(
+            "UPDATE hf_capture_pending SET status='retry', tries=1, next_try_at=?, "
+            "locked_by='', locked_until=0 WHERE id IN "
+            "(SELECT id FROM hf_capture_pending WHERE status='parked' ORDER BY id ASC LIMIT ?)",
+            (now(), max(1, int(limit))),
         )
         await self.db.commit()
+        return int(getattr(cur, "rowcount", 0) or 0)
+
+    async def capture_done(self, pid: int, token: str = "") -> None:
+        """成功 / 明确无需处理 → 删行。带 token 时只删自己锁住的那条（防误删别人正在跑的批）。"""
+        if token:
+            await self.db.execute(
+                "DELETE FROM hf_capture_pending WHERE id=? AND locked_by=?", (int(pid), str(token)))
+        else:
+            await self.db.execute("DELETE FROM hf_capture_pending WHERE id=?", (int(pid),))
+        await self.db.commit()
+
+    async def capture_fail(self, pid: int, err: str, max_tries: int = 5, token: str = "") -> int:
+        """失败退避：30s → 60 → 120 → 240；到上限转 parked（保留整行可查，不再自动重试）。
+
+        旧实现第 5 次直接把 next_try_at 推到 365 天后：既不会真重试，又伪装成「还会跑」，
+        面板和日志都看不出这行已经停摆。现在用 status 明说，next_try_at 归零。
+        """
+        sql = "SELECT tries FROM hf_capture_pending WHERE id=?"
+        args: tuple[Any, ...] = (int(pid),)
+        if token:
+            sql += " AND locked_by=?"
+            args = (int(pid), str(token))
+        row = await (await self.db.execute(sql, args)).fetchone()
+        if not row:                                   # 锁已被回收/行已被删 → 不覆盖别人的状态
+            return 0
+        tries = int((row or {"tries": 0})["tries"] or 0) + 1
+        parked = tries >= max_tries
+        nxt = 0.0 if parked else now() + min(3600.0, 30.0 * (2 ** (tries - 1)))
+        status = "parked" if parked else "retry"
+        await self.db.execute(
+            "UPDATE hf_capture_pending SET tries=?, next_try_at=?, last_error=?, status=?, "
+            "locked_by='', locked_until=0 WHERE id=?" + (" AND locked_by=?" if token else ""),
+            (tries, nxt, str(err or "")[:300], status, int(pid)) + ((str(token),) if token else ()),
+        )
+        await self.db.commit()
+        if parked:
+            await self.audit("memory.capture.parked", f"id={pid} tries={tries}", str(err or "")[:200])
         return tries
 
     async def purge_stale_memories(self, persona_id: str | None = None) -> int:
@@ -1192,7 +1924,7 @@ class Store:
         mids = [f"m{i}" for i in ids]
         mmarks = ",".join("?" for _ in mids)
         await self.db.execute(f"UPDATE hf_memories SET status='deleted' WHERE id IN ({marks})", tuple(ids))
-        for tbl in ("hf_vectors", "hf_memory_src"):
+        for tbl in ("hf_vectors", "hf_memory_src", "hf_memory_msg"):
             try:
                 await self.db.execute(f"DELETE FROM {tbl} WHERE memory_id IN ({marks})", tuple(ids))
             except Exception as exc:                        # noqa: BLE001 老库可能没这张表
@@ -1204,7 +1936,12 @@ class Store:
         )
         await self.db.commit()
         # 兜底：扫掉历史遗留的孤儿边（保留原实现这一步的语义）
-        await self.db.execute("DELETE FROM hf_edges WHERE src_type='memory' AND src_id NOT IN (SELECT 'm'||id FROM hf_memories)")
+        # v2 的边用 'v2m<id>' 命名空间，显式排除：它们不在 hf_memories 里，
+        # 不排除会被这条清理整批误删（v2 方案 G20）。
+        await self.db.execute(
+            "DELETE FROM hf_edges WHERE src_type='memory' AND src_id NOT LIKE 'v2m%' "
+            "AND src_id NOT IN (SELECT 'm'||id FROM hf_memories)"
+        )
         await self.db.commit()
         logger.info(f"[StarHeart] 清理非活跃记忆：{len(ids)} 条软删（status='deleted'，可回滚）")
         return len(ids)
@@ -3412,7 +4149,8 @@ class Store:
         名字沿用旧的，避免改散调用点；语义已改：存档记忆必须能参与召回，否则
         「归档被提及自动拉回」永远走不到 —— 先有召回才可能复活，而复活又是召回的前提。
         """
-        sql = "SELECT id, embedding FROM hf_memories WHERE status NOT IN ('deleted','forgotten') AND embedding IS NOT NULL"
+        sql = ("SELECT id, embedding FROM hf_memories "
+               "WHERE status NOT IN ('deleted','forgotten') AND COALESCE(muted,0)=0 AND embedding IS NOT NULL")
         if not include_archived:
             sql += " AND status!='archived'"
         args: list[Any] = []
@@ -3574,6 +4312,53 @@ class Store:
                 item["detail"] = {}
             out.append(item)
         return out
+
+    async def link_memory_messages(self, memory_id: Any, message_ids: list[str]) -> int:
+        """把一批消息 id 挂到一条记忆上（侧车表 hf_memory_msg）。返回新写入条数。"""
+        raw = str(memory_id or "").lstrip("m")
+        if not raw.isdigit():
+            return 0
+        ts_now = now()
+        n = 0
+        seen: set[str] = set()
+        for mid in message_ids or []:
+            mid = str(mid or "").strip()
+            if not mid or mid in seen:
+                continue
+            seen.add(mid)
+            try:
+                cur = await self.db.execute(
+                    "INSERT OR IGNORE INTO hf_memory_msg (memory_id, message_id, ts) VALUES (?, ?, ?)",
+                    (int(raw), mid, ts_now),
+                )
+                n += int(cur.rowcount or 0)
+            except Exception as exc:                        # noqa: BLE001 老库没有这张表时不影响记忆本身
+                logger.debug(f"[StarHeart] 记忆-消息侧车写入跳过：{exc}")
+                break
+        if n:
+            await self.db.commit()
+        return n
+
+    async def memory_ids_by_message_id(self, message_id: str) -> list[str]:
+        """按消息 id 反查记忆（撤回命中），返回 `m<id>` 形式，与面板/服务层口径一致。
+
+        只返回「还能被处置」的记忆：已遗忘/已删除的必须排除，否则撤回一条旧消息会把
+        `forgotten` 翻成 `archived`（复活已遗忘的记忆，P2-A）。
+        """
+        ref = str(message_id or "").strip()
+        if not ref:
+            return []
+        try:
+            rows = await (await self.db.execute(
+                "SELECT DISTINCT s.memory_id FROM hf_memory_msg s "
+                "JOIN hf_memories m ON m.id = s.memory_id "
+                "WHERE s.message_id=? AND m.status NOT IN ('forgotten','deleted')",
+                (ref,),
+            )).fetchall()
+        except Exception as exc:                            # noqa: BLE001 老库没有这张表
+            logger.debug(f"[StarHeart] 记忆-消息侧车查询跳过：{exc}")
+            return []
+        return [f"m{int(r['memory_id'])}" for r in rows if r["memory_id"] is not None]
 
     async def memories_by_source_ref(self, ref: str, session_id: str = "") -> list[dict[str, Any]]:
         """按 source_ref 精确匹配（不再 LIKE '%mid%'：message_id 是短数字，会命中无关会话）。"""
@@ -5351,27 +6136,58 @@ class Store:
     async def touch_memory(self, mid: Any) -> bool:
         """被提及：刷新计时；归档/遗忘中的直接拉回正常（用户要求"归档里被提及就自动拉回"）。
 
-        注意：调用方拿到的 id 可能是 "m123"（记忆对象统一带 m 前缀）也可能是 123，
-        所以必须走 _split_mid —— 直接 int(mid) 会抛 ValueError 并被外层 except 吞掉，
-        表现就是「被提及 → 拉回/刷计时」这条链从来没真正生效过。
+        加固改成「递减 + 重要度封顶」：
+          ① 增量 = 0.06 × (1 - strength/cap)，越接近上限涨得越慢（旧实现每次 +0.06，
+             真机 7 次就锁死 1.0，#906 被注入 62 次）；
+          ② 上限 cap = 0.55 + 0.04 × poignancy（poi 3 → 0.67，poi 10 → 0.95）——
+             一句话值不值得被反复提起，由写入时模型给的重要度决定，不由「被注入过几次」决定。
+        注意：调用方拿到的 id 可能是 "m123" 也可能是 123，统一走 _split_mid。
         """
         sid = self._split_mid(mid)
         if sid is None:
             return False
-        row = await (await self._db.execute("SELECT id, status FROM hf_memories WHERE id=?", (sid,))).fetchone()
+        row = await (await self._db.execute(
+            "SELECT id, status, strength, poignancy FROM hf_memories WHERE id=?", (sid,))).fetchone()
         if row is None:
             return False
         back = str(row["status"]) in ("archived", "forgotten", "stale", "decayed")
+        cap = 0.55 + 0.04 * float(row["poignancy"] if row["poignancy"] is not None else 5)
+        cur = float(row["strength"] or 0.0)
+        if back:
+            new_strength = max(cur, min(0.45, cap))
+        elif cur < cap:
+            new_strength = min(cap, cur + 0.06 * (1.0 - cur / cap))
+        else:
+            new_strength = cur                      # 已在上限之上：不硬压，交给衰减
         await self.ensure_strength_updated_at()
-        # 被提及 → 加固：不只是「拉回」，活着的记忆也要涨权重（用户明确要求的行为）
         await self._db.execute(
             "UPDATE hf_memories SET last_used_at=?, strength_updated_at=?, recalls=COALESCE(recalls,0)+1,"
-            + (" status='active', strength=MAX(strength, 0.45)," if back else " strength=MIN(1.0, COALESCE(strength,0)+0.06),")
-            + " updated_at=? WHERE id=?",
-            (now(), now(), now(), sid),
+            + (" status='active'," if back else "")
+            + " strength=?, updated_at=? WHERE id=?",
+            (now(), now(), new_strength, now(), sid),
         )
         await self._db.commit()
         return back
+
+    async def set_muted(self, mid: Any, muted: bool = True, source_mode: str = "") -> bool:
+        """「别再提」：muted=1 的记忆不进召回、不进主动池（仍留在库里，可随时恢复）。
+
+        source_mode 非空时顺手改来源标签（"test" = 测试残留），方便面板筛出来；
+        它只是标签，真正的开关仍是 muted。
+        """
+        sid = self._split_mid(mid)
+        if sid is None:
+            return False
+        if source_mode:
+            cur = await self._db.execute(
+                "UPDATE hf_memories SET muted=?, source_mode=?, updated_at=? WHERE id=?",
+                (1 if muted else 0, str(source_mode), now(), sid))
+        else:
+            cur = await self._db.execute(
+                "UPDATE hf_memories SET muted=?, updated_at=? WHERE id=?",
+                (1 if muted else 0, now(), sid))
+        await self._db.commit()
+        return bool(cur.rowcount)
 
     async def lifecycle_counts(self) -> dict[str, Any]:
         rows = await (
@@ -5548,5 +6364,391 @@ class Store:
 
     async def drop_gen(self, gen_key: str) -> int:
         cur = await self._db.execute("DELETE FROM hf_vectors WHERE gen_key=?", (str(gen_key),))
+        await self._db.commit()
+        return int(cur.rowcount or 0)
+
+    # ---------------- 语言学习：原话样本 + 词表（MVP） ----------------
+
+    async def save_style_sample(self, rec: dict[str, Any]) -> int | None:
+        """写一条表达样本；同 (persona, kind, norm_key) 幂等更新，不回退 status。"""
+        persona_id = str(rec.get("persona_id") or "")
+        kind = str(rec.get("kind") or "bot")
+        trigger = str(rec.get("trigger_text") or "").strip()
+        reply = str(rec.get("reply_text") or "").strip()
+        if not reply:
+            return None
+        from .style_canon import norm_key, structure
+
+        key = str(rec.get("norm_key") or norm_key(trigger, reply))
+        ts = now()
+        try:
+            await self._db.execute(
+                "INSERT INTO hf_style_samples (persona_id, kind, register, trigger_text, reply_text,"
+                " structure_json, norm_key, source_ids, sensitivity, status, created_at, updated_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,'active',?,?)"
+                " ON CONFLICT(persona_id, kind, norm_key) DO UPDATE SET"
+                "  source_ids=excluded.source_ids, updated_at=excluded.updated_at",
+                (
+                    persona_id, kind, str(rec.get("register") or "private"), trigger, reply,
+                    json.dumps(rec.get("structure") or structure(reply), ensure_ascii=False),
+                    key, json.dumps(rec.get("source_ids") or [], ensure_ascii=False),
+                    str(rec.get("sensitivity") or "normal"), ts, ts,
+                ),
+            )
+            await self._db.commit()
+        except Exception as exc:                                # noqa: BLE001
+            logger.debug(f"[StarHeart] 表达样本写入跳过：{exc}")
+            return None
+        row = await (await self._db.execute(
+            "SELECT id FROM hf_style_samples WHERE persona_id=? AND kind=? AND norm_key=?",
+            (persona_id, kind, key),
+        )).fetchone()
+        return int(row["id"]) if row else None
+
+    async def pick_style_samples(self, persona_id: str, kind: str, register: str,
+                                 limit: int = 2, *, cooldown: float = 7200.0) -> list[dict[str, Any]]:
+        """取 1-2 条可注入样本：太久没投的优先，冷却期内不投。"""
+        ts = now()
+        rows = await (await self._db.execute(
+            "SELECT * FROM hf_style_samples WHERE persona_id=? AND kind=? AND status='active'"
+            " AND sensitivity='normal' AND (register=? OR ?='')"
+            " AND (last_shown_at=0 OR last_shown_at < ?)"
+            " ORDER BY last_shown_at ASC, id DESC LIMIT ?",
+            (str(persona_id), str(kind), str(register), str(register), ts - float(cooldown),
+             max(1, int(limit))),
+        )).fetchall()
+        return [dict(r) for r in rows]
+
+    async def touch_style_sample(self, sid: int) -> None:
+        try:
+            await self._db.execute(
+                "UPDATE hf_style_samples SET shown=shown+1, last_shown_at=?, updated_at=? WHERE id=?",
+                (now(), now(), int(sid)),
+            )
+            await self._db.commit()
+        except Exception:                                       # noqa: BLE001
+            pass
+
+    async def list_style_samples(self, persona_id: str = "", kind: str = "",
+                                 status: str = "active", limit: int = 50) -> list[dict[str, Any]]:
+        where = ["1=1"]
+        args: list[Any] = []
+        if persona_id:
+            where.append("persona_id=?")
+            args.append(str(persona_id))
+        if kind:
+            where.append("kind=?")
+            args.append(str(kind))
+        if status:
+            where.append("status=?")
+            args.append(str(status))
+        rows = await (await self._db.execute(
+            "SELECT * FROM hf_style_samples WHERE " + " AND ".join(where)
+            + " ORDER BY id DESC LIMIT ?", args + [max(1, min(limit, 500))],
+        )).fetchall()
+        return [dict(r) for r in rows]
+
+    async def save_style_term(self, rec: dict[str, Any]) -> int | None:
+        """写词条（口癖/黑话/称呼）；同 (persona, term_norm, scope) 幂等。"""
+        from .style_canon import norm
+
+        term = str(rec.get("term") or "").strip()
+        tnorm = str(rec.get("term_norm") or norm(term))
+        if not term or not tnorm:
+            return None
+        ts = now()
+        try:
+            await self._db.execute(
+                "INSERT INTO hf_style_terms (persona_id, term, term_norm, kind, meaning, usage,"
+                " scope, enabled, status, evidence_json, source_ids, created_at, updated_at)"
+                " VALUES (?,?,?,?,?,?,?,1,?,?,?,?,?)"
+                " ON CONFLICT(persona_id, term_norm, scope) DO UPDATE SET"
+                "  meaning=CASE WHEN excluded.meaning<>'' THEN excluded.meaning ELSE hf_style_terms.meaning END,"
+                "  usage=CASE WHEN excluded.usage<>'' THEN excluded.usage ELSE hf_style_terms.usage END,"
+                "  updated_at=excluded.updated_at",
+                (
+                    str(rec.get("persona_id") or ""), term, tnorm,
+                    str(rec.get("kind") or "tic"), str(rec.get("meaning") or ""),
+                    str(rec.get("usage") or ""), str(rec.get("scope") or "全局"),
+                    str(rec.get("status") or "confirmed"),
+                    json.dumps(rec.get("evidence") or [], ensure_ascii=False),
+                    json.dumps(rec.get("source_ids") or [], ensure_ascii=False),
+                    ts, ts,
+                ),
+            )
+            await self._db.commit()
+        except Exception as exc:                                # noqa: BLE001
+            logger.debug(f"[StarHeart] 词条写入跳过：{exc}")
+            return None
+        row = await (await self._db.execute(
+            "SELECT id FROM hf_style_terms WHERE persona_id=? AND term_norm=? AND scope=?",
+            (str(rec.get("persona_id") or ""), tnorm, str(rec.get("scope") or "全局")),
+        )).fetchone()
+        return int(row["id"]) if row else None
+
+    async def list_style_terms(self, persona_id: str = "", scope: str = "",
+                               limit: int = 50) -> list[dict[str, Any]]:
+        where = ["enabled=1", "status!='denied'"]
+        args: list[Any] = []
+        if persona_id:
+            where.append("(persona_id=? OR persona_id='')")
+            args.append(str(persona_id))
+        if scope:
+            where.append("(scope=? OR scope='全局')")
+            args.append(str(scope))
+        rows = await (await self._db.execute(
+            "SELECT * FROM hf_style_terms WHERE " + " AND ".join(where)
+            + " ORDER BY hits DESC, id DESC LIMIT ?", args + [max(1, min(limit, 200))],
+        )).fetchall()
+        return [dict(r) for r in rows]
+
+    async def style_counts(self, persona_id: str = "") -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for label, sql in (
+            ("bot", "SELECT COUNT(*) c FROM hf_style_samples WHERE kind='bot' AND status='active'"),
+            ("human", "SELECT COUNT(*) c FROM hf_style_samples WHERE kind='human' AND status='active'"),
+            ("terms", "SELECT COUNT(*) c FROM hf_style_terms WHERE enabled=1 AND status!='denied'"),
+        ):
+            try:
+                row = await (await self._db.execute(sql)).fetchone()
+                out[label] = int(row["c"] if row else 0)
+            except Exception:                                   # noqa: BLE001
+                out[label] = -1
+        return out
+
+    async def hide_style_sample(self, sid: int) -> int:
+        """面板「×」：不再用这条（软删，可查不可注入）。"""
+        cur = await self._db.execute(
+            "UPDATE hf_style_samples SET status='archived', updated_at=? WHERE id=?",
+            (now(), int(sid)))
+        await self._db.commit()
+        return int(cur.rowcount or 0)
+
+    # ---------------- 语言学习 v2：记忆 → 回复方式 / 原话 ----------------
+    async def list_memories_with_evidence(self, since_id: int = 0, limit: int = 40,
+                                          persona_id: str = "") -> list[dict[str, Any]]:
+        """按 id 升序取带原对话的记忆（学习输入）。evidence 里是 `用户：… / 助手：…`。"""
+        where = ["id > ?", "evidence <> ''", "status != 'deleted'"]
+        args: list[Any] = [int(since_id)]
+        if persona_id:
+            where.append("persona_id=?")
+            args.append(str(persona_id))
+        rows = await (await self._db.execute(
+            "SELECT id, session_id, persona_id, subject_id, entities, evidence, occurred_at, created_at"
+            " FROM hf_memories WHERE " + " AND ".join(where) + " ORDER BY id DESC LIMIT ?",
+            args + [max(1, min(int(limit), 200))],
+        )).fetchall()
+        return [dict(r) for r in rows]
+
+    async def list_memories_before(self, before_id: int = 0, limit: int = 12,
+                                   persona_id: str = "") -> list[dict[str, Any]]:
+        """按 id 倒序取 before_id 之前带原对话的记忆（往前回填学习）。"""
+        where = ["id < ?", "evidence <> ''", "status != 'deleted'"]
+        args: list[Any] = [int(before_id or 0)]
+        if persona_id:
+            where.append("persona_id=?")
+            args.append(str(persona_id))
+        rows = await (await self._db.execute(
+            "SELECT id, session_id, persona_id, subject_id, entities, evidence, occurred_at, created_at"
+            " FROM hf_memories WHERE " + " AND ".join(where) + " ORDER BY id DESC LIMIT ?",
+            args + [max(1, min(int(limit), 200))],
+        )).fetchall()
+        return [dict(r) for r in rows]
+
+    async def max_memory_id(self) -> int:
+        row = await (await self._db.execute(
+            "SELECT MAX(id) AS m FROM hf_memories WHERE evidence <> '' AND status != 'deleted'"
+        )).fetchone()
+        return int(row["m"] or 0) if row else 0
+
+    async def upsert_style(self, persona_id: str, name: str) -> int:
+        name = str(name or "").strip()[:24]
+        if not name:
+            return 0
+        ts = now()
+        await self._db.execute(
+            "INSERT INTO hf_style_styles (persona_id, name, status, created_at, updated_at)"
+            " VALUES (?,?,'active',?,?)"
+            " ON CONFLICT(persona_id, name) DO UPDATE SET updated_at=excluded.updated_at",
+            (str(persona_id or ""), name, ts, ts),
+        )
+        await self._db.commit()
+        row = await (await self._db.execute(
+            "SELECT id FROM hf_style_styles WHERE persona_id=? AND name=?",
+            (str(persona_id or ""), name),
+        )).fetchone()
+        return int(row["id"]) if row else 0
+
+    async def upsert_quote(self, rec: dict[str, Any]) -> int | None:
+        """写一条原话；同 (memory_id, quote) 幂等，重复学习不会重复入库。"""
+        quote = str(rec.get("quote") or "").strip()[:300]
+        if not quote:
+            return None
+        ts = now()
+        cur = await self._db.execute(
+            "INSERT OR IGNORE INTO hf_style_quotes (style_id, persona_id, quote, trigger_text,"
+            " memory_id, session_id, user_id, user_name, register, hits, corrections, status,"
+            " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                int(rec.get("style_id") or 0), str(rec.get("persona_id") or ""), quote,
+                str(rec.get("trigger_text") or "")[:200], int(rec.get("memory_id") or 0),
+                str(rec.get("session_id") or ""), str(rec.get("user_id") or ""),
+                str(rec.get("user_name") or ""), str(rec.get("register") or "private"),
+                int(rec.get("hits") or 0), int(rec.get("corrections") or 0),
+                str(rec.get("status") or "active"), ts, ts,
+            ),
+        )
+        await self._db.commit()
+        if int(cur.rowcount or 0):
+            return int(cur.lastrowid or 0)
+        row = await (await self._db.execute(
+            "SELECT id FROM hf_style_quotes WHERE memory_id=? AND quote=?",
+            (int(rec.get("memory_id") or 0), quote),
+        )).fetchone()
+        return int(row["id"]) if row else None
+
+    async def bump_style(self, style_id: int, *, hits: int = 0, corrections: int = 0) -> None:
+        if not style_id:
+            return
+        await self._db.execute(
+            "UPDATE hf_style_styles SET hits=hits+?, corrections=corrections+?, updated_at=?"
+            " WHERE id=?",
+            (int(hits), int(corrections), now(), int(style_id)),
+        )
+        await self._db.commit()
+
+    async def list_styles(self, persona_id: str = "") -> list[dict[str, Any]]:
+        where, args = ["1=1"], []
+        if persona_id:
+            where.append("persona_id=?")
+            args.append(str(persona_id))
+        rows = await (await self._db.execute(
+            "SELECT * FROM hf_style_styles WHERE " + " AND ".join(where)
+            + " ORDER BY (hits+corrections) DESC, id DESC", args,
+        )).fetchall()
+        return [dict(r) for r in rows]
+
+    async def list_quotes(self, persona_id: str = "", style_id: int = 0,
+                          status: str = "") -> list[dict[str, Any]]:
+        where, args = ["1=1"], []
+        if persona_id:
+            where.append("persona_id=?")
+            args.append(str(persona_id))
+        if style_id:
+            where.append("style_id=?")
+            args.append(int(style_id))
+        if status:
+            where.append("status=?")
+            args.append(str(status))
+        rows = await (await self._db.execute(
+            "SELECT * FROM hf_style_quotes WHERE " + " AND ".join(where)
+            + " ORDER BY id DESC", args,
+        )).fetchall()
+        return [dict(r) for r in rows]
+
+    async def set_quote_status(self, qid: int, status: str) -> int:
+        cur = await self._db.execute(
+            "UPDATE hf_style_quotes SET status=?, updated_at=? WHERE id=?",
+            (str(status or "active"), now(), int(qid)),
+        )
+        await self._db.commit()
+        return int(cur.rowcount or 0)
+
+    async def bump_quote(self, qid: int, *, hits: int = 0, corrections: int = 0) -> None:
+        await self._db.execute(
+            "UPDATE hf_style_quotes SET hits=hits+?, corrections=corrections+?,"
+            " last_used_at=?, updated_at=? WHERE id=?",
+            (int(hits), int(corrections), now(), now(), int(qid)),
+        )
+        await self._db.commit()
+
+    async def prune_empty_styles(self, persona_id: str = "") -> int:
+        """删掉没有任何原话的回复方式（学习中途失败会留下空壳）。"""
+        where = " AND persona_id=?" if persona_id else ""
+        args = (str(persona_id),) if persona_id else ()
+        cur = await self._db.execute(
+            "DELETE FROM hf_style_styles WHERE NOT EXISTS"
+            " (SELECT 1 FROM hf_style_quotes q WHERE q.style_id = hf_style_styles.id)"
+            + where, args,
+        )
+        await self._db.commit()
+        return int(cur.rowcount or 0)
+
+    async def set_style_status(self, sid: int, status: str) -> int:
+        status = "paused" if str(status or "") == "paused" else "active"
+        cur = await self._db.execute(
+            "UPDATE hf_style_styles SET status=?, updated_at=? WHERE id=?",
+            (status, now(), int(sid)),
+        )
+        await self._db.commit()
+        return int(cur.rowcount or 0)
+
+    async def delete_style(self, sid: int) -> int:
+        """删掉一种回复方式，连同它的原话一起删（硬删，不可恢复）。"""
+        await self._db.execute("DELETE FROM hf_style_quotes WHERE style_id=?", (int(sid),))
+        cur = await self._db.execute("DELETE FROM hf_style_styles WHERE id=?", (int(sid),))
+        await self._db.commit()
+        return int(cur.rowcount or 0)
+
+    async def update_quote(self, qid: int, quote: str) -> int:
+        quote = str(quote or "").strip()[:300]
+        if not quote:
+            return 0
+        cur = await self._db.execute(
+            "UPDATE hf_style_quotes SET quote=?, updated_at=? WHERE id=?",
+            (quote, now(), int(qid)),
+        )
+        await self._db.commit()
+        return int(cur.rowcount or 0)
+
+    async def delete_quote(self, qid: int) -> int:
+        cur = await self._db.execute("DELETE FROM hf_style_quotes WHERE id=?", (int(qid),))
+        await self._db.commit()
+        return int(cur.rowcount or 0)
+
+    async def update_style_term(self, tid: int, *, term: str | None = None,
+                                meaning: str | None = None, usage: str | None = None,
+                                scope: str | None = None, enabled: bool | None = None) -> int:
+        sets, args = ["updated_at=?"], [now()]
+        if term is not None:
+            t = str(term or "").strip()[:24]
+            if not t:
+                return 0
+            sets += ["term=?", "term_norm=?"]
+            args += [t, t.lower()]
+        if meaning is not None:
+            sets.append("meaning=?")
+            args.append(str(meaning or "").strip()[:200])
+        if usage is not None:
+            sets.append("usage=?")
+            args.append(str(usage or "").strip()[:200])
+        if scope is not None:
+            sets.append("scope=?")
+            args.append(str(scope or "全局")[:24])
+        if enabled is not None:
+            sets.append("enabled=?")
+            args.append(1 if enabled else 0)
+        if len(sets) == 1:
+            return 0
+        args.append(int(tid))
+        cur = await self._db.execute(
+            "UPDATE hf_style_terms SET " + ", ".join(sets) + " WHERE id=?", args,
+        )
+        await self._db.commit()
+        return int(cur.rowcount or 0)
+
+    async def delete_style_term(self, tid: int) -> int:
+        cur = await self._db.execute("DELETE FROM hf_style_terms WHERE id=?", (int(tid),))
+        await self._db.commit()
+        return int(cur.rowcount or 0)
+
+    async def rename_style(self, sid: int, name: str) -> int:
+        name = str(name or "").strip()[:24]
+        if not name:
+            return 0
+        cur = await self._db.execute(
+            "UPDATE hf_style_styles SET name=?, updated_at=? WHERE id=?",
+            (name, now(), int(sid)),
+        )
         await self._db.commit()
         return int(cur.rowcount or 0)

@@ -7,18 +7,17 @@
  * 「先读到数据再画」，不会出现图表画在空容器上的空白页。
  */
 
-import * as charts from "./charts.js?v=1.0.2";
-import { MemoryGraph } from "./graph.js?v=1.0.2";
-import { Graph3D } from "./graph3d.js?v=1.0.2";
+import * as charts from "./charts.js?v=1.0.3";
+import { MemoryGraph } from "./graph.js?v=1.0.3";
+import { Graph3D } from "./graph3d.js?v=1.0.3";
 import {
   $, $$, STATE, initBridge, setLive, setRefreshHook, goPage, toggleTheme, toast, openDrawer, closeDrawer, esc,
    syncSeg, jsStr, emptyBlock, refreshCurrent, hfGoParams, consumeParamsAnchor, noteConfigDirty,
-} from "./store.js?v=1.0.2";
-import * as mem from "./views-memory.js?v=1.0.2";
-import * as evt from "./views-events.js?v=1.0.2";
-import * as sys from "./views-system.js?v=1.0.2";
-import * as mt from "./views-metrics.js?v=1.0.2";
-import { hfSaveDomain } from "./views-conf.js?v=1.0.2";
+} from "./store.js?v=1.0.3";
+import * as mem from "./views-memory.js?v=1.0.3";
+import * as evt from "./views-events.js?v=1.0.3";
+import * as sys from "./views-system.js?v=1.0.3";
+import { hfSaveDomain } from "./views-conf.js?v=1.0.3";
 
 /* ---------------- 页面表 ---------------- */
 const PAGES = {
@@ -61,14 +60,6 @@ const PAGES = {
       { id: "favour", label: "好感", hint: "关系结算列表 + 页底折叠洞察与参数" },
     ],
     render: (sub) => evt.renderMsgDomain(sub || "hub"),
-  },
-  metrics: {
-    title: "拟人指标",
-    icon: "◔",
-    nav: "metrics",
-    // 一页到底的聚合页（六张 KPI 卡 + 两组分布），没有子页 → subs 留空，页头下不摆子页签
-    subs: [],
-    render: () => mt.renderMetrics(),
   },
   persona: {
     title: "人格管理",
@@ -435,6 +426,18 @@ function bindActions() {
     hfPersonsRefresh: mem.hfPersonsRefresh,
     hfMemDelete: mem.hfMemDelete,
     hfMemRestore: mem.hfMemRestore,
+    hfStyleLearn: sys.hfStyleLearn,
+    hfStyleToggle: sys.hfStyleToggle,
+    hfStyleRename: sys.hfStyleRename,
+    hfStyleStatus: sys.hfStyleStatus,
+    hfStyleDel: sys.hfStyleDel,
+    hfQuoteEdit: sys.hfQuoteEdit,
+    hfQuoteDel: sys.hfQuoteDel,
+    hfTermEdit: sys.hfTermEdit,
+    hfTermDel: sys.hfTermDel,
+    hfStyleTip: sys.hfStyleTip,
+    hfStyleTipHide: sys.hfStyleTipHide,
+    hfMemMute: mem.hfMemMute,
     hfMemFilter: mem.hfMemFilter,
     hfMemMaintain: mem.hfMemMaintain,
     hfPurgeStale: mem.hfPurgeStale,
@@ -529,6 +532,7 @@ function bindActions() {
     hfConnSeedAll: sys.hfConnSeedAll,
     hfContactsRefresh: sys.hfContactsRefresh,
     hfRefreshOverview: sys.hfRefreshOverview,
+    hfCaptureRetry: sys.hfCaptureRetry,
     // 调试口（自动化断言用，不影响界面）
     __hf: {
       graphEngine: () => mem.graphEngine(),

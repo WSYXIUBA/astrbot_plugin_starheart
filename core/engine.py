@@ -8,8 +8,10 @@ base 由内容特征与相关性组成，state/relation 是乘性系数，penalt
 from __future__ import annotations
 
 import difflib
+import json
 import re
 import time
+from collections.abc import Callable
 from typing import Any
 
 # 内容特征权重（可被面板配置覆盖的部分留在 service 层）
@@ -189,11 +191,16 @@ def ago_label(ts: float | Any, now: float | None = None) -> str:
 
 
 def build_memory_context(memories: list[dict[str, Any]], budget_chars: int = 900, *,
-                         now: float | None = None, extra_note: str = "") -> str:
+                         now: float | None = None, extra_note: str = "",
+                         stamp_fn: Callable[[float], str] | None = None,
+                         today_label: str = "") -> str:
     """把召回结果拼成给模型的自然语言片段（不含任何分数）。
 
-    每条记忆带一个「大约多久以前」的方括号标记：模型本来对记忆完全没有时间感，
-    分不清「这是三天前的事还是刚才的事」—— 时间锚是它能接住「上次」「前几天」这类话的前提。
+    每条记忆带「大约多久以前 · 发生时间」：只有相对量时，模型会把 2 天前的事说成
+    「昨儿」（真机事故：m987 排在 10-17 的定时提醒，10-20 被说成「昨儿不是说去杭州了」）。
+    绝对日期由调用方按 AstrBot 时区格式化后传进来（``stamp_fn``），这里不引时区配置，
+    避免注入路径上再出现一个 naive 时间源。
+
     extra_note：附加在块尾的一句提醒（主动开口链路用它标注「都是旧事/注意主语」等）。
     """
     if not memories:
@@ -204,8 +211,16 @@ def build_memory_context(memories: list[dict[str, Any]], budget_chars: int = 900
         summary = (mem.get("summary") or "").strip()
         if not summary:
             continue
-        when = ago_label(mem.get("occurred_at") or mem.get("created_at"), now)
-        line = f"- [{when}] {summary}" if when else f"- [时间未知] {summary}"
+        ts = mem.get("occurred_at") or mem.get("created_at")
+        when = ago_label(ts, now)
+        stamp = ""
+        if callable(stamp_fn):
+            try:
+                stamp = str(stamp_fn(float(ts or 0)) or "")
+            except (TypeError, ValueError):
+                stamp = ""
+        when_s = f"{when} · {stamp}" if when and stamp else (when or "时间未知")
+        line = f"- [{when_s}] {_memory_subject_note(mem)}{summary}"
         if used + len(line) > budget_chars:
             # 超预算：跳过这条继续装下一条（旧实现 break —— 第一条超长就把整块变成空，
             # 等于「有记忆但一条都不给模型看」）。第一条就超长时截断也要给出一条。
@@ -217,13 +232,34 @@ def build_memory_context(memories: list[dict[str, Any]], budget_chars: int = 900
     if not lines:
         return ""
     tail = f"\n{extra_note}" if extra_note else ""
-    return (
-        "（你记得这些事（方括号里是「大约多久以前」，是我记忆里的粗略时间 —— "
-        "它是参考不是证据，不要拿它去质疑对方「刚才在哪说过什么」）：\n"
-        + "\n".join(lines)
-        + tail
-        + "\n）"
-    )
+    head = "（你记得这些事（方括号里是「大约多久以前 · 发生时间」"
+    if today_label:
+        head += f"；今天是 {today_label}"
+    head += ("—— 它是参考不是证据，不要拿它去质疑对方「刚才在哪说过什么」。"
+             "引用旧事按方括号里的时间说：超过一天的事不许说成「今天/昨天/刚才」；"
+             "同一件事有多个说法时以时间较新的为准；记忆里没写的地点、计划、约定一律不许补，"
+             "拿不准就不提）：\n")
+    return head + "\n".join(lines) + tail + "\n）"
+
+
+def _memory_subject_note(mem: dict[str, Any]) -> str:
+    """给「动作留痕」记忆加主语标注。
+
+    这类记忆（跨会话排定时消息等）的 summary 里带着目标消息原文，模型读到的
+    只有「到杭州家门口了吧 电费别忘了交」，会当成对方说过的话。真机事故：
+    10-20 主动开口把它说成「昨儿不是说去杭州了 到家没」。
+    """
+    tags = mem.get("tags") or []
+    if isinstance(tags, str):
+        try:
+            tags = json.loads(tags)
+        except (TypeError, ValueError):
+            tags = [tags]
+    if not isinstance(tags, (list, tuple)):
+        tags = []
+    if any(str(t) in ("跨会话", "动作留痕") for t in tags) or str(mem.get("source_mode") or "") == "action":
+        return "（这是我做过的事，不是 TA 说的）"
+    return ""
 
 
 def _norm_for_similarity(text: str) -> str:
@@ -261,6 +297,24 @@ def text_similarity(a: str, b: str) -> float:
     if len_ratio < 0.75:
         score = min(score, 0.6)   # 只允许「整句包含」在调用方单独处理，不在这里判成复读
     return round(score, 4)
+
+
+# 句子的「脚手架」：时间词、疑问词、客套词。
+# 只蹭到这些词不算「这条记忆被问到」—— 真机案例：一句「今天上班好累」，
+# 靠「今天」两个字就把「家里猫叫团子」拖进了注入块（用户反馈「从没提过这猫」）。
+# 不做词性标注：一张小表 + 1 个兜底规则，比引入分词器便宜，也够用。
+QUERY_STOPWORDS = frozenset("""
+今天 明天 昨天 前天 现在 刚才 刚刚 最近 以后 以前 今晚 早上 中午 下午 晚上 半夜 凌晨
+什么 怎么 怎样 为什么 是不是 有没有 能不能 可以 帮我 给我 我们 你们 他们 自己 一下 一点
+这个 那个 这些 那些 这样 那样 就是 不是 还是 已经 因为 所以 但是 如果 没有 知道 觉得
+记得 告诉 说说 看看 真的 有点 好像 感觉 时候 东西 事情 问题
+""".split())
+
+
+def content_tokens(tokens: list[str]) -> list[str]:
+    """去掉脚手架后的「实词 token」；全是脚手架时退回原 tokens（短问句别被清空）。"""
+    kept = [t for t in (tokens or []) if t not in QUERY_STOPWORDS]
+    return kept or list(tokens or [])
 
 
 def cosine_vec(a: list[float] | None, b: list[float] | None) -> float:
@@ -327,7 +381,9 @@ async def retrieve_memories(
     不算「被提及」，调用方不能再给它加固 —— 旧实现两者共用出口，最新几条会永久霸榜。
     """
     tokens = tokenize(query)
-    base = "SELECT * FROM hf_memories WHERE status NOT IN ('deleted','forgotten')"
+    # 实词 token：只命中「今天/什么/记得」这类脚手架的记忆不算被问到（见 QUERY_STOPWORDS）
+    ctokens = content_tokens(tokens)
+    base = "SELECT * FROM hf_memories WHERE status NOT IN ('deleted','forgotten') AND COALESCE(muted,0)=0"
     if not include_archived:
         base += " AND status!='archived'"
 
@@ -364,23 +420,30 @@ async def retrieve_memories(
         args.append(max(1, int(limit)))
         return await (await store.db.execute(sql, args)).fetchall()
 
-    # 1) 本会话 200 条 + 全库 200 条（并集，去重）
-    rows_all: list[Any] = []
-    if session_id:
-        rows_all.extend(await _fetch(200, sess=session_id))
-    rows_all.extend(await _fetch(200))
-    seen_ids: set[str] = set()
-    rows: list[Any] = []
-    for r in rows_all:
-        rid = str(dict(r).get("id") or "")
-        if rid and rid not in seen_ids:
-            seen_ids.add(rid)
-            rows.append(r)
+    # 1) 关键词预筛走全库（LIKE），不再按强度预切。
+    #    旧实现只取「本会话 200 + 全库 200（ORDER BY strength DESC）」再匹配 —— 1017 条的库里，
+    #    强度 400 名之后即使关键词完全命中也不进候选，召回测试同样漏（P1-6）。
+    #    1017 行全表 LIKE 成本可忽略；5 万条以内不需要 FTS5（容器内 sqlite 是否编 fts5 未验证）。
+    def _like_pattern(tk: str) -> str:
+        return "%" + tk.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+
+    async def _prefetch(persona_sql: str, persona_args: list[Any]) -> list[Any]:
+        names = ("summary", "content", "tags", "cues")
+        clauses: list[str] = []
+        args2: list[Any] = list(persona_args)
+        for tk in tokens[:8]:
+            clauses.append("(" + " OR ".join(f"{c} LIKE ? ESCAPE '\\'" for c in names) + ")")
+            args2.extend([_like_pattern(tk)] * len(names))
+        if not clauses:
+            return []
+        sql2 = base + persona_sql + " AND (" + " OR ".join(clauses) + ")"
+        sql2 += " ORDER BY strength DESC LIMIT 4000"
+        return await (await store.db.execute(sql2, args2)).fetchall()
+
+    rows: list[Any] = await _prefetch(*_persona_sql(False))
     # 2) 人格过滤后一条都没有 → 只退回「未打人格标签」的记忆，绝不拿别的人格
     if not rows and persona_id not in ("", "__none__"):
-        rows = await _fetch(200, untagged=True)
-        if session_id:
-            rows = list(rows) + list(await _fetch(200, untagged=True, sess=session_id))
+        rows = await _prefetch(*_persona_sql(True))
 
     scored: list[tuple[float, dict[str, Any]]] = []
     for row in rows:
@@ -389,8 +452,14 @@ async def retrieve_memories(
         hits = sum(1 for tk in tokens if tk in haystack)
         if hits == 0:
             continue
-        # 归一到 0~1：长问句不该靠「命中词数多」天然压过短问句
-        cover = hits / max(1, len(tokens))
+        hit_ct = sum(1 for tk in ctokens if tk in haystack)
+        # 只蹭到脚手架词（今天 / 什么 / 记得……）不算「这条被问到」：
+        # 真机上「今天上班好累」靠一个「今天」就能把「家里猫叫团子」塞进注入块。
+        # 单词问句（如「团子」）放宽，避免把精确查询也拦掉。
+        if hit_ct == 0 and len(tokens) > 1:
+            continue
+        # 归一到 0~1：长问句不该靠「命中词数多」天然压过短问句；分母只算实词
+        cover = hit_ct / max(1, len(ctokens))
         score = (cover * 0.7 + float(mem.get("strength") or 0) * 0.3) * status_weight(mem.get("status"))
         if session_id and mem.get("session_id") == session_id:
             score *= 1.15

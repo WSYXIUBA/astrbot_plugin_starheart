@@ -8,17 +8,17 @@
  * - 设置：模块开关 + 数据治理（破坏性操作集中卡），模块卡带状态灯。
  */
 
-import * as C from "./charts.js?v=1.0.2";
+import * as C from "./charts.js?v=1.0.3";
 import {
   $, $$, api, apiSafe, apiPostSafe, esc, fmtNum, fmtPct, fmt1, fmtTime, timeAgo, toast, openDrawer, closeDrawer,
   confirmModal, formModal, pageHead, card, kpiCard, kpis, secTitle, mount, emptyBlock, skelBlock, jsStr, STATE, segmentHtml,
   syncSeg, bridge, EP, refreshCurrent, goPage, countUp, configTouchedAt, noteConfigTouched, recentFirstKeys, takeConfigDirty, nativeWriteError,
-} from "./store.js?v=1.0.2";
-import { renderDomainConf, domainRowsHtml, CONFIG_META } from "./views-conf.js?v=1.0.2";
+} from "./store.js?v=1.0.3";
+import { renderDomainConf, domainRowsHtml, CONFIG_META } from "./views-conf.js?v=1.0.3";
 // 收尾批：四个消息域的参数渲染器（原页底折叠区）——原样迁进本文件的「设置 · 模块与参数」页
-import { renderGateConf, renderProactiveConf, renderRecallConf, renderFavourConf } from "./views-events.js?v=1.0.2";
-import { ATOM_LABEL } from "./views-memory.js?v=1.0.2";
-import { GRAPH_PALETTE } from "./graph.js?v=1.0.2";
+import { renderGateConf, renderProactiveConf, renderRecallConf, renderFavourConf } from "./views-events.js?v=1.0.3";
+import { ATOM_LABEL } from "./views-memory.js?v=1.0.3";
+import { GRAPH_PALETTE } from "./graph.js?v=1.0.3";
 
 // S4-2：「先审后用」开关挂语言学习域。CONFIG_META 由 views-conf.js 定义并被域页过滤读取，
 // 新键必须登记在这里，否则参数页不渲染、保存也会被 CONFIG_META 过滤掉（静默丢键）。
@@ -49,6 +49,7 @@ export async function renderOverview() {
   STATE.graphStats = gstats;
   const c = ov.config || {};
   const lm = ov.livingmemory || {};
+  const cap = ov.capture || {};
   const gateItems = gate.items || [];
   const trigger = gateItems.filter((g) => g.decision === "reply").length;
 
@@ -64,6 +65,11 @@ export async function renderOverview() {
 
   const health = [
     { n: "记忆系统", ok: c.master_switch !== false, d: `${fmtNum(ov.memories)} 条 · 平均强度 ${fmt1(ov.memory_avg_strength)}` },
+    { n: "捕获队列", ok: ov.capture ? !(cap.parked > 0) : true, d: ov.capture
+        ? (cap.parked
+            ? `停摆 ${fmtNum(cap.parked)} 批（可重试）· 待重试 ${fmtNum(cap.retry || 0)} 批`
+            : `待重试 ${fmtNum(cap.retry || 0)} 批 · 无停摆`)
+        : "—（后端未提供队列状态，不当作 0）" },
     { n: "门控" + (c.gate_shadow ? "（影子）" : ""), ok: !!c.gate_enabled, d: c.gate_shadow ? "只记录不拦截" : "低于阈值会沉默" },
     { n: "关系链", ok: !gstatsErr && (gstats.avg_degree || 0) > 0.3, d: chainSub },
     { n: "语言学习", ok: !!c.output_enabled, d: `习惯 ${fmtNum(ov.habits)} 条` },
@@ -102,8 +108,8 @@ export async function renderOverview() {
           .join("")}
       </div>
       <div class="row bt wrap" style="gap:9px;margin-top:11px;padding-top:9px;border-top:1px solid var(--bd)">
-        <button class="btn xs" onclick="goPage('metrics')">去拟人指标 →</button>
-        <span class="mut" style="font-size:10.5px">行为质量不在这一页 —— 总览只说「存了多少」；说得像不像人，去「拟人指标」看</span>
+        ${cap.parked ? `<button class="btn xs" onclick="hfCaptureRetry(this)">重试停摆队列（${fmtNum(cap.parked)}）</button>` : ""}
+        <button class="btn xs" onclick="goPage('expression')">去语言学习 →</button>
       </div>`,
       { title: "模块状态", sub: "按当前配置实时判定" }
     )}
@@ -200,6 +206,17 @@ export async function hfRefreshOverview(btn) {
   refreshCurrent();
   setTimeout(() => btn && btn.classList.remove("loading"), 400);
   toast("已刷新");
+}
+
+/** 把停摆（parked）的捕获批放回重试链——模型/网关修好后不用等下一轮 6h 回暖。 */
+export async function hfCaptureRetry(btn) {
+  if (btn) btn.classList.add("loading");
+  const r = await apiPostSafe("capture/retry", {});
+  if (btn) btn.classList.remove("loading");
+  if (!r.ok) { toast("重试失败：" + r.error, "err"); return; }
+  const n = (r.data && r.data.requeued) || 0;
+  toast(n ? `已放回重试：${n} 批` : "没有需要重试的批", "ok");
+  refreshCurrent();
 }
 
 /* ==================================================================
@@ -566,7 +583,7 @@ async function jgTry(btn) {
     ${matched ? `<div class="row" style="gap:5px;flex-wrap:wrap;margin-top:5px">命中的词条：${matched}</div>` : ""}`;
 }
 
-export async function renderExpressionLib() {
+export async function _renderExpressionLibOld() {
   const [res, log, dom, rev, bans, runs, jg, jgck] = await Promise.all([
     apiSafe("habits", {}, { items: [], counts: {}, banned: [] }),
     apiSafe("habits/log", {}, { items: [], events: [], corpus: {}, runs: [] }),
@@ -2558,4 +2575,285 @@ export function hfPersonaPickView(pid) {
   toast(`查看视角：${STATE.personaView === "__none__" ? "未归属" : STATE.personaView || "全部人格"}`);
   refreshCurrent();
   refreshPersonaSwitch();
+}
+
+
+/* ================= 语言学习：回复方式（带记忆出处） =================
+   一个组件 = 一种回复方式；组件里是逐字原话，每条挂「记忆 #id · 时间」，点开看原对话。
+   学习输入 = 记忆里的原对话；不准的原话可丢弃（掉出池子），变旧的方式仍然会被触发。 */
+
+function _qRows(st) {
+  const qs = (st.quotes || []).filter((q) => q.status === "active").slice(0, 6);
+  if (!qs.length) return '<div class="pd" style="padding:10px 0">（这种方式还没有原话）</div>';
+  return qs.map((q) => {
+    const t = C.fmtTs(q.created_at);
+    const who = q.user_name ? `${esc(q.user_name)}（${esc(String(q.user_id || ""))}）` : "用户";
+    const dlg = (q.trigger_text || q.quote)
+      ? `<div class="dlg"><div class="u">${esc(who)}：${esc(q.trigger_text || "（原话缺失）")}</div>
+           <div class="a">bot：${esc(q.quote)}</div></div>`
+      : "";
+    return `<div class="smp" onclick="this.classList.toggle('open')">
+      <div class="srow"><span class="qt" title="${esc(q.quote)}">「${esc(q.quote)}」</span>
+        <span class="mem">记忆 #${fmtNum(q.memory_id)} · ${t}</span><span class="cv">▸</span></div>
+      ${dlg}
+      <div class="sact">
+        <button class="btn xs" data-q="${esc(q.quote)}" onclick="event.stopPropagation();hfQuoteEdit(${Number(q.id)},this)">改</button>
+        <button class="btn xs" onclick="event.stopPropagation();hfQuoteDel(${Number(q.id)})">删</button>
+      </div>
+    </div>`;
+  }).join("");
+}
+
+function _styleCard(st) {
+  const active = Number(st.active || 0);
+  const paused = st.status === "paused";
+  const tag = paused ? '<span class="tag">已停用</span>' : '<span class="tag ok">在用</span>';
+  return `<div class="card sty">
+    <div class="hd"><b>${esc(st.name)}</b><span style="flex:1"></span>${tag}</div>
+    <div class="meta">${fmtNum(active)} 条原话 · 命中 ${fmtNum(st.hits || 0)} · 纠正 ${fmtNum(st.corrections || 0)}</div>
+    <div class="smps">${_qRows(st)}</div>
+    <div class="ft">
+      <button class="btn xs" onclick="hfStyleRename(${Number(st.id)},this)">改名</button>
+      <button class="btn xs" onclick="hfStyleStatus(${Number(st.id)},'${paused ? "active" : "paused"}')">${paused ? "启用" : "停用"}</button>
+      <button class="btn xs" onclick="hfStyleDel(${Number(st.id)},this)">删除</button>
+    </div>
+  </div>`;
+}
+
+function _stylePage(sty) {
+  const on = !!sty.enabled;
+  const c = sty.counts || {};
+  const styles = sty.styles || [];
+  const terms = sty.terms || [];
+  const chip = on ? '<span class="tag ok">生效中</span>' : '<span class="tag">已关闭</span>';
+  return `<style>
+.ec-wrap{display:flex;flex-direction:column;gap:12px;width:100%;margin:0}
+.ec-styles{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:12px;align-items:start}
+.sty{padding:13px 15px}
+.sty .hd{display:flex;align-items:center;gap:8px}
+.sty .hd b{font-size:13.5px;font-weight:650}
+.sty .meta{font-size:10.5px;color:var(--tx3);margin-top:3px}
+.smps{margin:9px 0 2px;display:flex;flex-direction:column;gap:6px}
+.smp{border:1px solid var(--bd);border-radius:8px;overflow:hidden;background:var(--surface2)}
+.srow{display:flex;align-items:center;gap:8px;padding:7px 9px;cursor:pointer}
+.srow .qt{flex:1;min-width:0;font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.srow .mem{font-size:10px;color:var(--tx3);white-space:nowrap}
+.srow .cv{font-size:10px;color:var(--tx3);transition:transform .15s}
+.smp.open .srow .cv{transform:rotate(90deg)}
+.dlg{display:none;padding:0 9px 6px;font-size:11.5px;line-height:1.7}
+.smp.open .dlg{display:block}
+.dlg .u{color:var(--tx3)} .dlg .a{color:var(--tx1)}
+.sact{display:none;padding:0 9px 8px;gap:6px}
+.smp.open .sact{display:flex}
+.sty .ft{display:flex;gap:6px;margin-top:8px;flex-wrap:wrap}
+.ask-mask{position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.45)}
+.ask-box{width:min(520px,90vw);background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:16px;box-shadow:0 24px 60px rgba(0,0,0,.5)}
+.ask-box .t{font-size:13px;font-weight:650;margin-bottom:10px}
+.ask-box textarea{width:100%;box-sizing:border-box;min-height:40px;background:var(--surface2);color:var(--tx1);border:1px solid var(--bd);border-radius:8px;padding:8px 10px;font:inherit;font-size:13px;resize:vertical}
+.ask-box .b{display:flex;gap:8px;justify-content:flex-end;margin-top:12px}
+</style>
+<div class="ec-wrap">
+  <div class="card sec" style="padding:14px 16px">
+    <div class="row bt wrap" style="gap:10px">
+      <div style="min-width:0">
+        <div class="pn" style="font-size:16px">语言学习</div>
+        <div class="pd">对话先落成记忆，再从记忆里的原对话学怎么回；每条原话都能点回那条记忆</div>
+      </div>
+      <div class="row" style="gap:6px;flex-wrap:wrap">
+        ${chip}
+        <button class="btn xs" onclick="hfStyleLearn(this)">立即学一批</button>
+        <button class="btn xs${on ? " on" : ""}" onclick="hfStyleToggle(${on ? "false" : "true"})">${on ? "学习已开启" : "学习已关闭"}</button>
+      </div>
+    </div>
+    <div class="pd" style="margin-top:8px">${fmtNum(c.styles)} 种回复方式 · ${fmtNum(c.quotes)} 条原话 · 黑话 ${fmtNum(c.terms)} 条</div>
+  </div>
+
+  <div class="ec-styles">${styles.map(_styleCard).join("") || '<div class="card sec" style="padding:20px"><div class="pd">还没有学到的回复方式。点「立即学一批」从记忆里的原对话学。</div></div>'}</div>
+
+  <div class="card sec" style="padding:14px 16px">
+    <div class="row bt"><div><div class="pn">黑话</div><div class="pd">命中才进提示词；词、释义、范围随时能改，也能删</div></div></div>
+    <div style="margin-top:6px">
+      ${(terms || []).map((t) => `<div class="row" style="gap:8px;padding:6px 0;border-bottom:1px solid var(--bd)">
+        <b style="min-width:80px">${esc(String(t.term || ""))}</b>
+        <span class="pd" style="flex:1;min-width:0">${esc(String(t.usage || t.meaning || "—"))}</span>
+        <span class="tag">${esc(String(t.scope || "全局"))}</span>
+        <span class="mono mut" title="命中次数">${fmtNum(t.hits || 0)}</span>
+        <button class="btn xs" data-term="${esc(String(t.term || ""))}" data-usage="${esc(String(t.usage || ""))}" onclick="hfTermEdit(${Number(t.id)},this)">改</button>
+        <button class="btn xs" onclick="hfTermDel(${Number(t.id)})">删</button></div>`).join("") || '<div class="pd" style="padding:10px 0">还没有词条</div>'}
+    </div>
+  </div>
+
+  ${sty.preview ? `<div class="card sec" style="padding:14px 16px">
+    <div class="row bt"><div class="pn">这一轮会注入什么</div><span class="pd mono">${fmtNum(sty.preview.length)} / 300 字</span></div>
+    <pre class="pd" style="white-space:pre-wrap;margin:8px 0 0;line-height:1.75">${esc(sty.preview)}</pre>
+  </div>` : ""}
+</div>`;
+}
+
+export async function renderExpressionLib() {
+  try {
+    const sty = await apiSafe("style/samples", {}, {
+      enabled: false, counts: {}, styles: [], terms: [], preview: "",
+    });
+    return { html: _stylePage(sty) };
+  } catch (e) {
+    return {
+      html: `<div class="card sec" style="padding:14px"><div class="pn">语言学习渲染失败</div>
+        <pre class="pd" style="white-space:pre-wrap">${esc(String((e && (e.stack || e.message)) || e))}</pre></div>`,
+    };
+  }
+}
+
+/* 面板在沙箱 iframe 里，window.prompt/confirm 被浏览器屏蔽（返回 null），所以自己画一个。 */
+function _askText(title, value, multiline) {
+  return new Promise((resolve) => {
+    const mask = document.createElement("div");
+    mask.className = "ask-mask";
+    mask.innerHTML = `<div class="ask-box"><div class="t"></div>
+      <textarea></textarea>
+      <div class="b"><button class="btn xs" data-k="c">取消</button><button class="btn xs on" data-k="o">确定</button></div></div>`;
+    mask.querySelector(".t").textContent = title;
+    const ta = mask.querySelector("textarea");
+    ta.value = value || "";
+    if (multiline) ta.style.minHeight = "92px";
+    const done = (v) => { mask.remove(); resolve(v); };
+    mask.querySelector('[data-k="c"]').onclick = () => done(null);
+    mask.querySelector('[data-k="o"]').onclick = () => done(ta.value.trim() || null);
+    mask.onclick = (ev) => { if (ev.target === mask) done(null); };
+    ta.onkeydown = (ev) => { if (ev.key === "Enter" && !ev.shiftKey) { ev.preventDefault(); done(ta.value.trim() || null); } };
+    document.body.appendChild(mask);
+    ta.focus();
+    ta.select();
+  });
+}
+
+function _askConfirm(title) {
+  return new Promise((resolve) => {
+    const mask = document.createElement("div");
+    mask.className = "ask-mask";
+    mask.innerHTML = `<div class="ask-box"><div class="t"></div>
+      <div class="pd">删掉就找不回来了。</div>
+      <div class="b"><button class="btn xs" data-k="c">取消</button><button class="btn xs on" data-k="o">删除</button></div></div>`;
+    mask.querySelector(".t").textContent = title;
+    const done = (v) => { mask.remove(); resolve(v); };
+    mask.querySelector('[data-k="c"]').onclick = () => done(false);
+    mask.querySelector('[data-k="o"]').onclick = () => done(true);
+    mask.onclick = (ev) => { if (ev.target === mask) done(false); };
+    document.body.appendChild(mask);
+  });
+}
+
+export async function hfStyleLearn(btn) {
+  if (btn) { btn.classList.add("loading"); btn.disabled = true; }
+  const res = await apiPostSafe("style/learn", {});
+  if (btn) { btn.classList.remove("loading"); btn.disabled = false; }
+  const d = res.data || {};
+  if (res.ok && d.ok) {
+    toast(`学完了：${fmtNum(d.saved || 0)} 条原话 / ${fmtNum(d.styles || 0)} 种回复方式`, "ok");
+  } else {
+    toast(`这轮没学到：${d.reason || res.error || "未知原因"}（新记忆 ${fmtNum(d.fresh || 0)} 条）`, "err");
+  }
+  refreshCurrent();
+}
+
+export async function hfStyleToggle(on) {
+  const res = await apiPostSafe("style/toggle", { enabled: !!on });
+  toast(res.ok ? (on ? "学习已开启" : "学习已关闭") : "操作失败：" + (res.error || ""), res.ok ? "ok" : "err");
+  if (res.ok) refreshCurrent();
+}
+
+export async function hfStyleRename(id) {
+  const name = await _askText("这种回复方式叫什么？", "");
+  if (!name) return;
+  const res = await apiPostSafe("style/rename", { id: Number(id), name });
+  toast(res.ok ? "改好了" : "操作失败：" + (res.error || ""), res.ok ? "ok" : "err");
+  if (res.ok) refreshCurrent();
+}
+
+export async function hfStyleStatus(id, status) {
+  const res = await apiPostSafe("style/status", { id: Number(id), status });
+  toast(res.ok ? (status === "paused" ? "已停用" : "已启用") : "操作失败：" + (res.error || ""), res.ok ? "ok" : "err");
+  if (res.ok) refreshCurrent();
+}
+
+export async function hfStyleDel(id) {
+  const yes = await _askConfirm("删掉这种回复方式？");
+  if (!yes) return;
+  const res = await apiPostSafe("style/delete", { id: Number(id) });
+  toast(res.ok ? "已删除" : "操作失败：" + (res.error || ""), res.ok ? "ok" : "err");
+  if (res.ok) refreshCurrent();
+}
+
+export async function hfQuoteEdit(id, btn) {
+  const old = btn && btn.dataset ? (btn.dataset.q || "") : "";
+  const quote = await _askText("改这句原话", old);
+  if (!quote || quote === old) return;
+  const res = await apiPostSafe("style/quote_edit", { id: Number(id), quote });
+  toast(res.ok ? "改好了" : "操作失败：" + (res.error || ""), res.ok ? "ok" : "err");
+  if (res.ok) refreshCurrent();
+}
+
+export async function hfQuoteDel(id) {
+  const yes = await _askConfirm("删掉这句原话？");
+  if (!yes) return;
+  const res = await apiPostSafe("style/quote_del", { id: Number(id) });
+  toast(res.ok ? "已删除" : "操作失败：" + (res.error || ""), res.ok ? "ok" : "err");
+  if (res.ok) refreshCurrent();
+}
+
+export async function hfTermEdit(id, btn) {
+  const cur = btn && btn.dataset ? (btn.dataset.usage || "") : "";
+  const usage = await _askText("这条黑话什么情况下用？", cur, true);
+  if (usage === null) return;
+  const res = await apiPostSafe("style/term_save", { id: Number(id), usage });
+  toast(res.ok ? "改好了" : "操作失败：" + (res.error || ""), res.ok ? "ok" : "err");
+  if (res.ok) refreshCurrent();
+}
+
+export async function hfTermDel(id) {
+  const yes = await _askConfirm("删掉这条黑话？");
+  if (!yes) return;
+  const res = await apiPostSafe("style/term_del", { id: Number(id) });
+  toast(res.ok ? "已删除" : "操作失败：" + (res.error || ""), res.ok ? "ok" : "err");
+  if (res.ok) refreshCurrent();
+}
+
+/* 悬停看全文：单行省略，鼠标靠近在下方弹一个小浮窗（fixed 定位，不被滚动区裁掉） */
+let _styleTipEl = null;
+
+export function hfStyleTip(el) {
+  try {
+    const text = el && el.getAttribute ? (el.getAttribute("data-full") || "") : "";
+    if (!text) return;
+    if (!_styleTipEl) {
+      _styleTipEl = document.createElement("div");
+      _styleTipEl.style.cssText = [
+        "position:fixed", "z-index:9999", "display:none", "pointer-events:none",
+        "background:var(--card,#1c1c1e)", "color:var(--fg,#e8e8ea)",
+        "border:1px solid var(--bd,#3a3a3c)", "border-radius:9px",
+        "padding:8px 10px", "font-size:12px", "line-height:1.6",
+        "box-shadow:0 8px 24px rgba(0,0,0,.45)", "white-space:normal", "word-break:break-word",
+      ].join(";");
+      document.body.appendChild(_styleTipEl);
+    }
+    const maxW = Math.min(440, Math.max(200, window.innerWidth * 0.42));
+    _styleTipEl.style.maxWidth = maxW + "px";
+    _styleTipEl.style.width = "max-content";
+    _styleTipEl.textContent = text;
+    _styleTipEl.style.display = "block";
+    const r = el.getBoundingClientRect();
+    const th = _styleTipEl.offsetHeight || 40;
+    let left = r.left;
+    if (left + _styleTipEl.offsetWidth + 12 > window.innerWidth) {
+      left = Math.max(8, window.innerWidth - _styleTipEl.offsetWidth - 12);
+    }
+    let top = r.bottom + 6;
+    if (top + th + 8 > window.innerHeight) top = Math.max(8, r.top - th - 6);
+    _styleTipEl.style.left = left + "px";
+    _styleTipEl.style.top = top + "px";
+  } catch (e) { /* 浮层失败不影响列表 */ }
+}
+
+export function hfStyleTipHide() {
+  if (_styleTipEl) _styleTipEl.style.display = "none";
 }

@@ -268,6 +268,11 @@
     "description": "长回复拆成多条发送（按语义边界切，短句不拆；bot 自己用空行也能决定分几条）",
     "default": true
   },
+  "output_split_max": {
+    "type": "int",
+    "description": "一轮最多拆成几条（空行/一行一条/语义切分共用；超出并进最后一条，2–8）",
+    "default": 4
+  },
   "output_typing_delay": {
     "type": "bool",
     "description": "补发的后续条目按打字时长延迟（首条立即发）；新装默认关，库里已有值不受影响",

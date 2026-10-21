@@ -6,17 +6,17 @@
  * memory↔memory 的关系链（实体/时序/语义）。
  */
 
-import * as C from "./charts.js?v=1.0.2";
-import { GRAPH_PALETTE } from "./graph.js?v=1.0.2";
+import * as C from "./charts.js?v=1.0.3";
+import { GRAPH_PALETTE } from "./graph.js?v=1.0.3";
 import {
   createGraph3D, webglAvailable, LAYOUT_DEFS, LAYOUT_HOTKEYS, CAM_DEFS, PALETTE_DEFS, TIER_DEFS,
   PARA_DEFS, LEVEL_DEFS, ATOM_LABEL as ATOM_LABEL_3D,
-} from "./graph3d.js?v=1.0.2";
+} from "./graph3d.js?v=1.0.3";
 import {
   $, api, apiPost, apiPostSafe, apiSafe, esc, fmtNum, fmtPct, fmt1, fmtTime, timeAgo, toast, openDrawer, closeDrawer,
   confirmModal, formModal, pageHead, tabBar, card, kpiCard, kpis, secTitle, mount, emptyBlock, skelBlock, jsStr, STATE,
   segmentHtml, syncSeg, countUp, goPage, refreshCurrent,
-} from "./store.js?v=1.0.2";
+} from "./store.js?v=1.0.3";
 
 export const ATOM_LABEL = {
   factual: "事实", episodic: "经历", relational: "关系", preference: "偏好",
@@ -752,6 +752,9 @@ async function memDetailHtml(m, edges, sid) {
       <button class="btn xs" onclick="hfMemEdit(${jsStr(rawId)})">改</button>
       <button class="btn xs" onclick="hfMemBoost(${jsStr(mid)})">↑ 加权</button>
       <button class="btn xs" onclick="hfMemDemote(${jsStr(mid)})">↓ 降权</button>
+      ${Number(M.muted || 0) === 1
+        ? `<button class="btn xs" onclick="hfMemMute(${jsStr(rawId)}, 0)">恢复提及</button>`
+        : `<button class="btn xs" onclick="hfMemMute(${jsStr(rawId)}, 1)">别再提</button>`}
       <button class="btn xs" onclick="hfGraphOpen(${jsStr(mid)})">在图谱里看</button>
       ${String(M.status || m.status || "") === "deleted" || String(M.status || m.status || "") === "forgotten"
         ? `<button class="btn xs" onclick="hfMemRestore(${jsStr(rawId)})">从回收站恢复</button>`
@@ -1488,6 +1491,20 @@ export async function hfMemDemote(id) {
   if (ok) hfRerenderHook();
 }
 
+/** 别再提 / 恢复提及：muted 只影响召回与主动开口，不进注入池；记忆本身保留在库里 */
+export async function hfMemMute(mid, muted) {
+  const raw = String(mid).replace(/^m/, "");
+  const on = Number(muted) === 1;
+  const res = await apiPostSafe("memory/mute", {
+    id: raw,
+    muted: on,
+    source_mode: on ? "test" : "",
+  });
+  const ok = res && res.ok !== false;
+  toast(ok ? (on ? "已冷处理：不再进召回与主动开口" : "已恢复：重新参与召回") : "操作失败：" + ((res && res.error) || ""), ok ? "ok" : "err");
+  if (ok) hfRerenderHook();
+}
+
 /** 老入口：打开某条记忆的详细（等价 hfMemDetail，保留兼容） */
 export async function hfMemOpen(id, sid) {
   return hfCardDet(sid || (String(id).startsWith("m") ? "g" : "p"), String(id));
@@ -2100,6 +2117,7 @@ export async function renderMemoryList() {
               <td><span class="mb-bar"><i style="width:${Math.max(3, Math.min(100, Math.round((m.strength || 0) * 100)))}%"></i></span>
                   <span class="mut" style="font-size:10.5px;margin-left:5px">${fmt1(m.strength)}</span></td>
               <td><span class="tag ${m.status === "active" ? "ok" : (m.status === "archived" || m.status === "deleted") ? "dg" : "gy"}">${esc(STATUS_LABEL[m.status] || m.status || "—")}</span>
+                  ${Number(m.muted || 0) === 1 ? `<span class="tag gy" style="margin-left:4px" title="不进召回与主动开口（可恢复）">冷处理</span>` : ""}
                   ${m.status === "deleted" ? `<button class="btn xs" style="margin-left:4px" onclick="event.stopPropagation();hfMemRestore(${jsStr(String(m.id).replace(/^m/, ""))})">恢复</button>` : ""}
                   ${m.status === "forgotten" ? `<button class="btn xs" style="margin-left:4px" onclick="event.stopPropagation();hfMemRestore(${jsStr(String(m.id).replace(/^m/, ""))})">恢复</button>` : ""}</td>
               <td>${m.has_vec ? '<span class="tag ok">有</span>' : '<span class="tag gy">无</span>'}</td>

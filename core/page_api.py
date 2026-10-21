@@ -42,11 +42,14 @@ class PageApi:
         routes: list[tuple[str, Any, str]] = [
             ("health", self.health, "GET"),
             ("overview", self.overview, "GET"),
+            ("capture/queue", self.capture_queue, "GET"),
+            ("capture/retry", self.capture_retry, "POST"),
             ("memories", self.memories, "GET"),
             ("memory", self.memory_detail, "GET"),
             ("memory/update", self.memory_update, "POST"),
             ("memory/delete", self.memory_delete, "POST"),
             ("memory/restore", self.memory_restore, "POST"),
+            ("memory/mute", self.memory_mute, "POST"),
             ("graph", self.graph, "GET"),
             ("graph/stats", self.graph_stats, "GET"),
             ("graph/build", self.graph_build, "POST"),
@@ -55,6 +58,18 @@ class PageApi:
             ("habits", self.habits, "GET"),
             ("habit/save", self.habit_save, "POST"),
             ("habit/delete", self.habit_delete, "POST"),
+            ("style/samples", self.style_samples, "GET"),
+            ("style/learn", self.style_learn, "POST"),
+            ("style/toggle", self.style_toggle, "POST"),
+            ("style/hide", self.style_hide, "POST"),
+            ("style/quote", self.style_quote, "POST"),
+            ("style/rename", self.style_rename, "POST"),
+            ("style/status", self.style_status, "POST"),
+            ("style/delete", self.style_delete, "POST"),
+            ("style/quote_edit", self.style_quote_edit, "POST"),
+            ("style/quote_del", self.style_quote_del, "POST"),
+            ("style/term_save", self.style_term_save, "POST"),
+            ("style/term_del", self.style_term_del, "POST"),
             ("gate", self.gate, "GET"),
             ("message/hub", self.message_hub, "GET"),
             ("tokens", self.tokens, "GET"),
@@ -182,6 +197,16 @@ class PageApi:
         persona_id = request.query.get("persona_id", "") or ""
         return json_response(await self.service.overview(persona_id))
 
+    async def capture_queue(self):
+        """捕获队列（待重试 / 停摆）——只读，不含对话正文。"""
+        limit = _int_q("limit", 20, 1, 200)
+        return json_response(await self.service.capture_queue(limit))
+
+    async def capture_retry(self):
+        """手动把 parked 的批放回重试链。"""
+        limit = _int_q("limit", 20, 1, 200)
+        return json_response(await self.service.capture_retry(limit))
+
     async def memories(self):
         q = request.query.get("q", "") or ""
         tag = request.query.get("tag", "") or ""
@@ -218,6 +243,16 @@ class PageApi:
         if not payload.get("id"):
             return error_response("missing id")
         return json_response(await self.service.memory_restore(payload["id"]))
+
+    async def memory_mute(self):
+        """「别再提」开关：{"id": "985", "muted": true, "source_mode": "test"}"""
+        payload = await request.json(default={})
+        if not payload.get("id"):
+            return error_response("missing id")
+        muted = payload.get("muted")
+        muted = True if muted is None else bool(muted)
+        return json_response(await self.service.memory_mute(
+            str(payload["id"]), muted, str(payload.get("source_mode") or "")))
 
     async def recalls(self):
         limit = _int_q("limit", 200, 1, 2000)
@@ -499,6 +534,199 @@ class PageApi:
         # persona_id 由页面带上（视角人格）：可用性求值 / 隔离徽标按它算（E1 fail-closed）
         persona_id = request.query.get("persona_id", "") or ""
         return json_response(await self.service.habits(persona_id))
+
+    # ---------------- 语言学习 MVP：原话样本（新管线，只读 + 三个动作） ----------------
+    async def _style_pid(self) -> str:
+        pid = str(request.query.get("persona_id", "") or "")
+        if pid:
+            return pid
+        try:
+            return str(await self.plugin.service._active_pid() or "")
+        except Exception:                                   # noqa: BLE001
+            return ""
+
+    async def style_samples(self):
+        from . import style_memory as style_mod
+
+        pid = await self._style_pid()
+        terms = await self.plugin.store.list_style_terms(pid, limit=30)
+        cfg = await self.plugin.service.config()
+        preview = ""
+        try:
+            preview = await style_mod.style_block(
+                self.plugin.store, {**cfg, "expression_style_enabled": True},
+                pid, "private", "")
+        except Exception as exc:                            # noqa: BLE001 预览失败不影响列表
+            preview = f"（预览失败：{exc}）"
+        styles = await self.plugin.store.list_styles(pid)
+        quotes = await self.plugin.store.list_quotes(pid)
+        by_style: dict[int, list[dict[str, Any]]] = {}
+        for q in quotes:
+            by_style.setdefault(int(q.get("style_id") or 0), []).append({
+                "id": q.get("id"), "quote": q.get("quote"),
+                "memory_id": q.get("memory_id"), "user_name": q.get("user_name"),
+                "user_id": q.get("user_id"), "register": q.get("register"),
+                "trigger_text": q.get("trigger_text"),
+                "hits": q.get("hits"), "corrections": q.get("corrections"),
+                "status": q.get("status"), "created_at": q.get("created_at"),
+            })
+        out_styles = []
+        for s in styles:
+            qs = by_style.get(int(s["id"]), [])
+            out_styles.append({
+                "id": s["id"], "name": s["name"], "status": s["status"],
+                "hits": s["hits"], "corrections": s["corrections"],
+                "quotes": qs,
+                "active": sum(1 for q in qs if q["status"] == "active"),
+            })
+        return json_response({
+            "enabled": bool(cfg.get("expression_style_enabled")),
+            "mode": str(cfg.get("expression_style_inject_mode") or "legacy"),
+            "counts": {
+                "styles": len(out_styles),
+                "quotes": sum(len(v) for v in by_style.values()),
+                "terms": len(terms),
+            },
+            "styles": out_styles,
+            "terms": terms,
+            "preview": preview,
+        })
+
+    async def style_hide(self):
+        payload = await request.json(default={})
+        try:
+            sid = int(payload.get("id") or 0)
+        except (TypeError, ValueError):
+            sid = 0
+        if not sid:
+            return error_response("id required")
+        n = await self.plugin.store.hide_style_sample(sid)
+        return json_response({"ok": bool(n), "hidden": n})
+
+    async def style_learn(self):
+        from . import style_memory as style_mod
+
+        pid = await self._style_pid()
+        res = await style_mod.run_learn(
+            self.plugin, await self.plugin.service.config(), pid)
+        return json_response(res)
+
+    async def style_quote(self):
+        payload = await request.json(default={})
+        try:
+            qid = int(payload.get("id") or 0)
+        except (TypeError, ValueError):
+            qid = 0
+        if not qid:
+            return error_response("id required")
+        status = "active" if str(payload.get("action") or "") == "restore" else "dropped"
+        n = await self.plugin.store.set_quote_status(qid, status)
+        return json_response({"ok": bool(n), "id": qid, "status": status})
+
+    async def style_rename(self):
+        payload = await request.json(default={})
+        try:
+            sid = int(payload.get("id") or 0)
+        except (TypeError, ValueError):
+            sid = 0
+        name = str(payload.get("name") or "").strip()
+        if not sid or not name:
+            return error_response("id and name required")
+        n = await self.plugin.store.rename_style(sid, name)
+        return json_response({"ok": bool(n), "id": sid, "name": name})
+
+    async def style_status(self):
+        payload = await request.json(default={})
+        try:
+            sid = int(payload.get("id") or 0)
+        except (TypeError, ValueError):
+            sid = 0
+        if not sid:
+            return error_response("id required")
+        status = "paused" if str(payload.get("status") or "") == "paused" else "active"
+        n = await self.plugin.store.set_style_status(sid, status)
+        return json_response({"ok": bool(n), "id": sid, "status": status})
+
+    async def style_delete(self):
+        payload = await request.json(default={})
+        try:
+            sid = int(payload.get("id") or 0)
+        except (TypeError, ValueError):
+            sid = 0
+        if not sid:
+            return error_response("id required")
+        n = await self.plugin.store.delete_style(sid)
+        return json_response({"ok": bool(n), "id": sid})
+
+    async def style_quote_edit(self):
+        payload = await request.json(default={})
+        try:
+            qid = int(payload.get("id") or 0)
+        except (TypeError, ValueError):
+            qid = 0
+        quote = str(payload.get("quote") or "").strip()
+        if not qid or not quote:
+            return error_response("id and quote required")
+        n = await self.plugin.store.update_quote(qid, quote)
+        return json_response({"ok": bool(n), "id": qid, "quote": quote})
+
+    async def style_quote_del(self):
+        payload = await request.json(default={})
+        try:
+            qid = int(payload.get("id") or 0)
+        except (TypeError, ValueError):
+            qid = 0
+        if not qid:
+            return error_response("id required")
+        n = await self.plugin.store.delete_quote(qid)
+        return json_response({"ok": bool(n), "id": qid})
+
+    async def style_term_save(self):
+        payload = await request.json(default={})
+        try:
+            tid = int(payload.get("id") or 0)
+        except (TypeError, ValueError):
+            tid = 0
+        if not tid:
+            return error_response("id required")
+        kwargs: dict[str, Any] = {}
+        for key in ("term", "meaning", "usage", "scope"):
+            if key in payload:
+                kwargs[key] = str(payload.get(key) or "")
+        if "enabled" in payload:
+            kwargs["enabled"] = bool(payload.get("enabled"))
+        n = await self.plugin.store.update_style_term(tid, **kwargs)
+        return json_response({"ok": bool(n), "id": tid})
+
+    async def style_term_del(self):
+        payload = await request.json(default={})
+        try:
+            tid = int(payload.get("id") or 0)
+        except (TypeError, ValueError):
+            tid = 0
+        if not tid:
+            return error_response("id required")
+        n = await self.plugin.store.delete_style_term(tid)
+        return json_response({"ok": bool(n), "id": tid})
+
+    async def style_toggle(self):
+        payload = await request.json(default={})
+        patch: dict[str, Any] = {}
+        if "enabled" in payload:
+            patch["expression_style_enabled"] = bool(payload.get("enabled"))
+        if "mode" in payload:
+            m = str(payload.get("mode") or "").lower()
+            if m not in ("legacy", "new"):
+                return error_response("mode must be legacy|new")
+            patch["expression_style_inject_mode"] = m
+        if not patch:
+            return error_response("nothing to update")
+        try:
+            await self.plugin.service.save_config(patch)
+            await self.plugin.service.config_save_sync()
+        except Exception as exc:                            # noqa: BLE001
+            return error_response(str(exc)[:200])
+        return json_response({"ok": True, **patch})
 
     async def expr_review_get(self):
         return json_response(await self.service.expr_review_queue(_int_q("limit", 200, 1, 500)))

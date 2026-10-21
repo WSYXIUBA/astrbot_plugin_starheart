@@ -32,6 +32,18 @@ from .storage import (  # noqa: F401
     session_kind, session_platform,
 )
 
+# 表达块是插件每轮临时挂上去的，不属于人格本体。
+# 人格进化读人格、写人格时都必须先剥掉它，否则会把插件塞的话当成角色设定写进人格。
+_EXPR_BLOCK_RE = re.compile(r"\n*【表达】.*?【/表达】\n*", re.S)
+_LEGACY_SPLIT_RE = re.compile(r"想多说就接着往下说[^\n]*")
+
+
+def strip_expression_block(text: str) -> str:
+    t = _EXPR_BLOCK_RE.sub("\n", str(text or ""))
+    t = _LEGACY_SPLIT_RE.sub("", t)
+    return re.sub(r"\n{3,}", "\n\n", t).strip()
+
+
 
 async def _maybe_await(value: Any) -> Any:
     """统一兼容 system provider 的同步/异步返回。
@@ -312,6 +324,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # 错字率（错字机制的数值闸）：2026-10-16 勘误冻结为"真·待新增"键，范围 0–0.03
     "output_typo_rate": 0.01,
     "output_split_messages": True,      # 长回复拆成多条发（按语义边界切，短句不拆）
+    "output_split_max": 4,              # 一轮最多拆几条（空行/一行一条/语义切分共用；超出并进最后一条）
     # 打字延迟：2026-10-16 裁决 —— 打字参数一律不动、**新装默认关**（库里已有值的一字不改）
     "output_typing_delay": False,        # 补发的后续条目按"打字时长"延迟（首条立即发）
     "output_typing_per_char": 0.3,       # 每个字的打字秒数
@@ -405,6 +418,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "model_forget": "",            # 记忆遗忘评估：配了就让模型判断"哪条真该忘"（见 lifecycle_tick）
     "auto_import_external": True,
     "model_rerank": "",            # 召回结果重排：配了就把召回候选交给它重排
+    # ---- v2 记忆（批 A：只写不读；默认全关）----
+    # 这三个键刻意不进 _conf_schema.json（走 CONFIG_INTERNAL_KEYS）：
+    # 面板一改就会触发 AstrBot 重载插件，v2 开关需要热生效、只改 DB。
+    "v2_enabled": False,             # v2 召回总开关（批 B 才开）
+    "v2_shadow_write": False,        # v2 影子写（批 A 验证：episode 落库，不抽取）
+    "v2_consolidate_enabled": False, # 批 C 巩固开关
+    "v2_extract_on_boot": False,     # 启动时补跑 pending episode（一次性验证/补课用）
+    # ---- 语言学习 MVP（原话样本 + 词表；设计见 _refs/语言学习蒸馏-20261020/方案-v1.3-MVP.md）----
+    "expression_style_enabled": False,       # 新表达系统总开关（默认关，先看蒸馏产物）
+    "expression_style_inject_mode": "legacy",  # legacy=旧 30 条规则 / new=原话样本
+    "expression_style_samples": 1,           # 每轮注入条数（bot/human 各取 1）
     # 门控退避：连发到一定密度就安静一会儿（base 秒起步、指数增长、上限 max 秒；base=0 关闭）
     "gate_backoff_base": 15,
     "gate_backoff_max": 300,
@@ -454,6 +478,8 @@ PARAM_GUARDS: dict[str, dict[str, Any]] = {
                                     "why": "0 = 关闭衰减（合法）；负数会把好感算成指数增长"},
     "output_expr_max_inject": {"label": "表达注入条数", "min": 0, "max": 10},
     "output_typo_rate": {"label": "错字率", "min": 0, "max": 0.03},
+    "output_split_max": {"label": "最多分几条", "min": 2, "max": 8,
+                         "why": "少于 2 等于关掉分段；高于 8 会一轮刷屏"},
     # S5 黑话四洞之④：阈值/配额可调（拍-16/19）。R4 登记先行 —— 上页面之前先在护栏这里登记 min/max。
     "jargon_candidate_min_sessions": {"label": "黑话候选·最少会话数", "min": 1, "max": 50},
     "jargon_candidate_min_hits": {"label": "黑话候选·最少出现次数", "min": 1, "max": 500},
@@ -818,6 +844,9 @@ CONFIG_INTERNAL_KEYS = frozenset({
     "persona_last_evolve_at", "persona_last_save_at",
     "jargon_infer_day", "jargon_infer_day_count",
     "jargon_try_day", "jargon_try_day_count",
+    # v2 开关：只走 DB（面板改会触发插件重载），不登记 schema/域/面板
+    "v2_enabled", "v2_shadow_write", "v2_consolidate_enabled", "v2_extract_on_boot",
+    "expression_style_enabled", "expression_style_inject_mode", "expression_style_samples",
 })
 
 
@@ -897,8 +926,8 @@ CONFIG_DOMAINS: dict[str, list[str]] = {
                   "proactive_use_persona", "proactive_context_memories",
                   "proactive_writeback", "proactive_note_enabled",
                   "proactive_note_hours", "proactive_note_max"],
-    "output": ["output_split_messages", "output_typing_delay", "output_typing_per_char", "output_typing_max",
-               "output_typo_rate"],
+    "output": ["output_split_messages", "output_split_max", "output_typing_delay", "output_typing_per_char",
+               "output_typing_max", "output_typo_rate"],
     "persona": ["persona_active_id"],
     "contacts": ["conn_mode_group", "conn_black_group", "conn_white_group",
                  "track_platforms", "person_exclude_platforms",
@@ -914,15 +943,17 @@ ZONE_RANK = {"HOSTILE": 0, "COLD": 1, "NEUTRAL": 2, "FAMILIAR": 3, "CLOSE": 4, "
 # 改动这里 = 改所有人开箱默认；用户自定义优先。
 PROACTIVE_LAYER2_TEMPLATE = chr(10).join([
     "【本轮情境】你要主动给对方发一条消息，不是回复某条消息。",
-    "关系：{zone} · 语气：{tone} · 距对方上次说话：{idle}。",
-    "可以是一句问候、一件你刚想到的事、一个回忆、一个提问，也可以分成两三条发（空行分段）。",
+    "现在是 {now}。关系：{zone} · 语气：{tone} · 距对方上次说话：{idle}。",
+    "可以是一句问候、一件你刚想到的事、一个提问；要提旧事就说得出来历和时间，想不起来就不提。",
+    "也可以分成两三条发（空行分段）。",
     "用你平时说话的方式；想写动作就写在括号里；不要解释你为什么突然开口，也不要提到“记忆”这两个字。",
     "真的不想说，就只输出 [沉默]。",
 ])
 # 主动开口注入记忆块时追加的提醒：防「旧事当新闻」「对方的事说成你的事」「偏好被当指令」。
 PROACTIVE_MEM_NOTE = (
-    "（这些是你的长期记忆，方括号里是大约多久以前。记忆里的「TA/对方」= 现在这个对话对象，"
-    "「我」= 你自己；按这个对应理解，别反过来。用不用、怎么用你看着办；"
+    "（这些是你的长期记忆，方括号里是「大约多久以前 · 发生时间」。记忆里的「TA/对方」= 现在这个对话对象，"
+    "「我」= 你自己，按这个对应理解别反过来。只能引用这里明确写过的东西："
+    "没写的地点、计划、约定、细节就是没有，不许补；拿不准就不提。"
     "引用时用自己的话，不要整句照抄。）"
 )
 
@@ -1085,8 +1116,14 @@ class StarHeartService:
         matched = 0
         action = "log_only"
         if ref:
-            hits = await self.store.memories_by_source_ref(ref, str(info.get("session_id") or ""))
+            sid_recall = str(info.get("session_id") or "")
+            hits = await self.store.memories_by_source_ref(ref, sid_recall)
             ids = [h["id"] for h in hits]
+            # 自动总结的记忆：source_ref 是 capture:{session}，按 message_id 精确查不到。
+            # 侧车表 hf_memory_msg 是唯一反查路径；两路结果合并去重。
+            for sid_x in await self.store.memory_ids_by_message_id(ref):
+                if sid_x not in ids:
+                    ids.append(sid_x)
             if ids and mode == "weaken":
                 weaken_cfg = cfg.get("recall_weaken_factor")
                 matched = await self.store.mark_memories_stale(
@@ -1676,6 +1713,44 @@ class StarHeartService:
             return datetime.now(tz).strftime("%H:%M")
         return time.strftime("%H:%M", time.localtime())
 
+    def now_text(self, cfg: dict[str, Any]) -> str:
+        """「2026-10-19 16:37（周一）」—— 主动开口必须知道绝对时间。
+
+        真机事故：16:37 发出「这么晚了 还不睡」。主动提示词当时只有「距上次说话 232 分钟」，
+        没有钟；模型拿上一段深夜对话当现在，自己编了个半夜。回复链路早就有这行（_clock_hint），
+        主动链路一直没有。
+        """
+        from datetime import datetime
+
+        tz = self._tzinfo(cfg)
+        d = datetime.now(tz) if tz is not None else datetime.now()
+        return f"{d.strftime('%Y-%m-%d %H:%M')}（周{'一二三四五六日'[d.weekday()]}）"
+
+    def abs_stamp(self, cfg: dict[str, Any]) -> Any:
+        """epoch → 「10-17 18:13」（AstrBot 时区）。
+
+        记忆块每条都要带绝对日期：只有「2 天前」这种相对量时，模型会把它说成「昨儿」
+        （真机：10-17 排的定时提醒被 10-20 主动开口说成「昨儿不是说去杭州了」）。
+        """
+        from datetime import datetime
+
+        tz = self._tzinfo(cfg)
+
+        def _fmt(ts: float) -> str:
+            try:
+                num = float(ts or 0)
+            except (TypeError, ValueError):
+                return ""
+            if num <= 0:
+                return ""
+            try:
+                d = datetime.fromtimestamp(num, tz) if tz is not None else datetime.fromtimestamp(num)
+            except (OSError, OverflowError, ValueError):
+                return ""
+            return d.strftime("%m-%d %H:%M")
+
+        return _fmt
+
     def _quiet_now(self, cfg: dict[str, Any], now_hhmm: str) -> bool:
         start = str(cfg.get("proactive_quiet_start") or "")
         end = str(cfg.get("proactive_quiet_end") or "")
@@ -2039,14 +2114,26 @@ class StarHeartService:
                     recent_ids.update(self._split_memory_ids(r["memory_ids"]))
             except Exception as exc:                             # noqa: BLE001 查询失败按未用过处理
                 logger.debug(f"[StarHeart] 主动记忆近期使用查询失败：{exc}")
+            # 池子范围：本会话 + （私聊）同一主体在其他会话的记忆。
+            # 旧实现只取 session_id=? AND status='active' LIMIT 80 —— 线上 active 239 / archived 723，
+            # 71% 的记忆对主动开口永远不可见（P1-5）。archived 不再排除，只按 0.4 降权。
+            subject_id = str(ident or "") if kind == "private" else ""
             base_sql = (
-                "SELECT id, summary, occurred_at, created_at, atom_type, strength "
-                "FROM hf_memories WHERE session_id=? AND status='active' AND summary!=''"
+                "SELECT id, summary, occurred_at, created_at, atom_type, strength, status, "
+                "poignancy, tags, source_mode "
+                "FROM hf_memories WHERE status NOT IN ('deleted','forgotten') AND COALESCE(muted,0)=0 AND summary!='' "
+                "AND (session_id=?"
             )
-            order = " ORDER BY COALESCE(NULLIF(occurred_at,0), created_at) DESC LIMIT 80"
+            base_args: list[Any] = [sid]
+            if subject_id:
+                base_sql += " OR subject_id=?"
+                base_args.append(subject_id)
+            base_sql += ")"
+            order = (" ORDER BY (status='archived') ASC, "
+                     "COALESCE(NULLIF(occurred_at,0), created_at) DESC LIMIT 160")
 
             async def _fetch(persona_filter: bool) -> list[Any]:
-                where, args = base_sql, [sid]
+                where, args = base_sql, list(base_args)
                 if persona_filter and persona_id:
                     where += " AND (persona_id=? OR persona_id IS NULL OR persona_id='')"
                     args.append(persona_id)
@@ -2056,7 +2143,7 @@ class StarHeartService:
             if persona_id and not rows:
                 # 人格过滤后一条不剩 → 只退回「未打人格标签」的记忆，绝不拿别的人格记忆
                 rows = await (await self.store.db.execute(
-                    base_sql + " AND (persona_id IS NULL OR persona_id='')" + order, (sid,)
+                    base_sql + " AND (persona_id IS NULL OR persona_id='')" + order, tuple(base_args)
                 )).fetchall()
             pool: list[dict[str, Any]] = []
             for r in rows:
@@ -2066,13 +2153,46 @@ class StarHeartService:
             pool_size = len(pool)
             now = time.time()
 
+            def _is_action_mem(m: dict[str, Any]) -> bool:
+                """动作留痕（跨会话排消息等）：summary 里带目标消息原文，容易被当成对方说过的话。
+
+                保留在池里（用户要能想起「我替你记过事」），但抽样降权 + 注入时加主语标注。
+                """
+                tags = m.get("tags") or []
+                if isinstance(tags, str):
+                    try:
+                        tags = json.loads(tags)
+                    except (TypeError, ValueError):
+                        tags = [tags]
+                if not isinstance(tags, (list, tuple)):
+                    tags = []
+                return (any(str(t) in ("跨会话", "动作留痕") for t in tags)
+                        or str(m.get("source_mode") or "") == "action")
+
             def _weight(m: dict[str, Any]) -> float:
                 ts = float(m.get("occurred_at") or m.get("created_at") or now)
                 age_days = max(0.0, (now - ts) / 86400.0)
-                recency = 0.5 ** (age_days / 30.0)       # 30 天半衰
+                # 7 天半衰：主动开口是「刚想到的事」，不是回忆录。旧值 30 天让 4 天前的
+                # 琐事权重还有 0.91，等于每天都在翻同一批陈年旧账（真机 12:24 那批：6 条里
+                # 4 条 4 天前、2 条 2 天前，没有一条是昨天）。
+                recency = 0.5 ** (age_days / 7.0)
+                if age_days > 3:
+                    recency *= 0.55
+                if age_days > 10:
+                    recency *= 0.3
                 strength = 0.5 + float(m.get("strength") or 0.5)
                 reuse = 0.35 if str(m.get("id")) in recent_ids else 1.0
-                return max(0.01, recency * strength * reuse)
+                # 归档记忆仍可被主动想起，但权重压到 0.4：不让它们挤掉当前关系线的内容
+                live = 0.4 if str(m.get("status") or "active") == "archived" else 1.0
+                action = 0.5 if _is_action_mem(m) else 1.0
+                # 重要度参与抽样：poi 3 → 0.79，poi 10 → 1.0。
+                # 小权重就够 —— 抽签本来就该有随机性，但不能让测试残留和真实偏好同权。
+                try:
+                    poi = float(m.get("poignancy") if m.get("poignancy") is not None else 5)
+                except (TypeError, ValueError):
+                    poi = 5.0
+                importance = 0.7 + 0.3 * max(0.0, min(1.0, poi / 10.0))
+                return max(0.01, recency * strength * reuse * live * action * importance)
 
             # 加权不放回抽样：记忆越多越不容易连续撞同一组，但不封存任何一条
             for _ in range(min(limit, len(pool))):
@@ -2116,11 +2236,24 @@ class StarHeartService:
         idle_raw = item.get("idle_min")
         idle_min = round(float(idle_raw)) if idle_raw not in (None, "") else -1
         idle_text = "未知（还没在这个会话说过话）" if idle_min < 0 else f"约 {idle_min} 分钟"
+        now_text = self.now_text(cfg)
         layer2 = (tpl.replace("{zone}", str(zone))
                      .replace("{tone}", engine.tone_line(zone))
+                     .replace("{now}", now_text)
                      .replace("{idle}", idle_text))
-        system += layer2
-        block = (engine.build_memory_context(memories, budget_chars=480, extra_note=PROACTIVE_MEM_NOTE)
+        # 用户自定义模板没写 {now} 也照样给钟 —— 主动开口最常见的错就是「不知道现在几点」
+        if "{now}" not in tpl:
+            layer2 = f"现在是 {now_text}。\n" + layer2
+        # 历史对话只是背景：主动开口复用 AstrBot 上次请求的 contexts，里面带着它自己上一轮
+        # 说过的话（包括幻觉）。不写死这条，模型会接着自己的旧输出往下编 —— 真机：10-19
+        # 23:05 编的「昨天说陪我看星星」被 08:27、12:24 两轮主动开口原样照抄。
+        system += (layer2 + "\n"
+                   "如果下面有历史对话，那只是背景：不要接着你上一句话往下说，也不要复述历史里出现过的句子；"
+                   "引用记忆里超过一天的事，必须说出大概时间（比如「前几天」「上周」），"
+                   "不许说成「今天/刚才/昨天」。")
+        block = (engine.build_memory_context(
+                     memories, budget_chars=560, extra_note=PROACTIVE_MEM_NOTE,
+                     stamp_fn=self.abs_stamp(cfg), today_label=now_text)
                  if memories else "")
         head = f"（风格参考：{style}；不合适就忽略）" if style else ""
         if block:
@@ -2700,7 +2833,7 @@ class StarHeartService:
             cur = next((p for p in items if p.get("persona_id") == cfg_pid), None)
         if cur is None:
             return {"ok": False, "error": "读不到当前人格（面板「人格管理」里先确认哪个是当前使用）"}
-        base = str(cur.get("system_prompt") or "")
+        base = strip_expression_block(str(cur.get("system_prompt") or ""))
         if not base:
             return {"ok": False, "error": "该人格没有可进化的文本"}
         # 必须把**完整人格**喂给模型：以前只喂前 2000 字、却按整段写回 → 尾部设定被静默丢掉。
@@ -2802,7 +2935,8 @@ class StarHeartService:
                 await self.store.decide_proposal(int(pid), "pending")
                 return {"ok": False, "error": "人格写入通道不可用，提案已退回待审"}
             try:
-                await save(item.get("persona_id") or "", {"system_prompt": item.get("proposal") or ""})
+                await save(item.get("persona_id") or "",
+                           {"system_prompt": strip_expression_block(item.get("proposal") or "")})
             except Exception as exc:                          # noqa: BLE001
                 await self.store.decide_proposal(int(pid), "pending")
                 return {"ok": False, "error": f"写回人格失败：{exc}（提案已退回待审）"}
@@ -2903,8 +3037,8 @@ class StarHeartService:
         "memory_summary": {"label": "记忆总结", "system": MEMORY_SUMMARY_SYSTEM,
                            "desc": "把一段对话压成摘要 + 召回线索，供以后回忆",
                            "user_key": "memory_summary_prompt", "user_label": "总结用户模板"},
-        "expression_extract": {"label": "表达提取", "system": EXPRESSION_SYSTEM,
-                               "desc": "从聊天里学「怎么说话」（口头禅 / 句式 / 称呼），供拟人输出"},
+        "expression_extract": {"label": "学习", "system": EXPRESSION_SYSTEM,
+                               "desc": "从记忆的原对话里学「怎么说话」（回复方式 / 口头禅 / 黑话），供拟人输出"},
         "person_profile": {"label": "人物画像", "system": PROFILE_SYSTEM,
                            "desc": "把某个人的记忆汇总成一句话画像（会自动刷新）"},
         "group_profile": {"label": "群聊画像", "system": GROUP_PROFILE_SYSTEM,
@@ -3733,6 +3867,38 @@ class StarHeartService:
         return await _finish(len(rows), total, reason,
                              extra={"new": saved, "merged": merged, "banned": banned_hit})
 
+    # 只有「像图片相关的失败」才值得降级重跑纯文本；纯超时再跑一次只会多烧一份 prompt。
+    _IMAGE_FAIL_HINTS = ("image", "图片", "视觉", "vision", "multimodal", "media", "base64",
+                         "image_url", "unsupported", "invalid content", "content type",
+                         "400", "415", "422")
+
+    def image_related_failure(self, res: dict[str, Any]) -> bool:
+        """判断这次失败是否冲着「模型看不了图」去的（决定要不要降级重跑纯文本）。"""
+        err = str((res or {}).get("error") or "").lower()
+        if not err:
+            return False
+        if err.startswith("unparsed_model_output"):
+            # 模型把「看不了图」写成自然语言解释 → 有输出但解析不出条目
+            return True
+        return any(h in err for h in self._IMAGE_FAIL_HINTS)
+
+    @staticmethod
+    def _is_no_memory_reply(raw: str) -> bool:
+        """模型**明确**表示「这批没有值得记的」→ 可以安全丢弃这一批。
+
+        只认短回复里的明确标记：超时/空响应是空串，长篇解释与格式跑偏都不算「无」，
+        要按失败重试而不是删批 —— 旧实现用 `if not items` 一把梭，把两者混成同一个结局。
+        """
+        body = str(raw or "").strip().strip("。.!！?？~～\"'“”").strip()
+        if not body or len(body) > 40:
+            return False
+        low = body.lower()
+        if low in ("无", "空", "none", "nothing", "no", "没有"):
+            return True
+        markers = ("没有值得记", "无值得记", "没有可记", "无需记录", "无需记忆",
+                   "没有需要记", "没有值得长期", "nothing to remember", "no memory")
+        return any(m in low for m in markers)
+
     async def summarize_dialogue(
         self,
         turns: list[dict[str, str]],
@@ -3753,16 +3919,25 @@ class StarHeartService:
         """
         gen = self.system.get("llm_generate")
         if not callable(gen):
-            return {"ok": False, "error": "模型通道不可用"}
+            return {"ok": False, "outcome": "retry", "error": "模型通道不可用"}
         cfg = await self.config()
         if not cfg.get("memory_capture_enabled", True):
-            return {"ok": False, "skipped": "capture_disabled"}
+            # 用户关掉捕获 = 暂停，不是「这批不用记」：返回 hold，由 worker 保留行并推后重试，
+            # 开关重新打开后自动续跑（旧实现这里 skipped → 直接删队列，等于关开关丢对话）。
+            return {"ok": True, "outcome": "hold", "reason": "capture_disabled"}
         cleaned = [
             t for t in turns
-            if (t.get("user") or "").strip() or (t.get("bot") or "").strip()
+            if ((t.get("user") or "").strip() or (t.get("bot") or "").strip()
+                or (t.get("imgs") or []))
+            # 管理指令不是对话内容：漏进缓冲也别写进长期记忆
+            # （真机上抓到过一条「TA 发过 /hf mute m989 我没接住」的垃圾记忆）
+            and not (t.get("user") or "").strip().startswith("/")
         ]
         if not cleaned:
-            return {"ok": False, "skipped": "empty"}
+            # 空批是「无内容」，不是「失败」：旧实现返回 ok=False → 被当失败重试 5 次再搁置一年。
+            # 纯图片轮次（user/bot 文本都为空、只有 imgs）是**有内容**的批：放行后必须走带图调用，
+            # 否则 P1-1 修了等于没修（纯图会被当成 empty_batch 直接删掉）。
+            return {"ok": True, "outcome": "skipped", "reason": "empty_batch"}
         limit = cfg.get("memory_capture_max_per_run")
         limit = 5 if limit is None else int(limit)
         # 不再截断到「末 12 轮」：配置允许 50 轮，却只把末 12 轮喂给模型，前面白扫。
@@ -3782,10 +3957,15 @@ class StarHeartService:
             who_s = (t.get("name") or "").strip() or "用户"
             u = (t.get("user") or "").strip().replace("\n", " ")[:200]
             b = (t.get("bot") or "").strip().replace("\n", " ")[:200]
+            imgs = [x for x in (t.get("imgs") or []) if x]
             if u or b:
                 convo_lines.append(f"{i}. {who_s}：{u}\n   我：{b}")
+            elif imgs:
+                # 纯图片轮：正文为空，但图会随 image_urls 交给模型看，转写里必须留位置。
+                convo_lines.append(f"{i}. {who_s}：[发送了 {len(imgs)} 张图片，未附文字]")
         if not convo_lines:
-            return {"ok": False, "skipped": "empty"}
+            # cleaned 非空但全是空白：真·无内容（图片轮次已在上面保留）。
+            return {"ok": True, "outcome": "skipped", "reason": "empty_batch"}
         who = f"对话对象：{user_name}（{user_id}）" if user_id else ""
         prompt = (
             f"下面是一段人机对话。请提取值得长期记住的信息，最多 {limit} 条。每条一行，格式：\n"
@@ -3817,7 +3997,17 @@ class StarHeartService:
             out = await gen(prompt, "memory_summary", None, image_urls=image_urls or None)
         except Exception as exc:  # LLM 故障不阻塞对话
             await self.store.audit("memory.capture", f"llm_error {exc}")
-            return {"ok": False, "error": str(exc)}
+            return {"ok": False, "outcome": "retry", "error": str(exc)}
+        raw = str(out or "").strip()
+        if not raw:
+            # 空输出 ≠「这批没有值得记的」：超时 / 空响应 / 模型槽位指向已删除的模型都到这儿。
+            # 旧实现把它并进 `if not items` 当 ok=True 删 pending → 整批对话永久丢失（P0-1）。
+            await self.store.audit(
+                "memory.capture", f"empty_model_output turns={len(kept)}/{len(cleaned)}")
+            return {
+                "ok": False, "outcome": "retry", "error": "empty_model_output",
+                "scanned": len(kept), "turns_total": len(cleaned),
+            }
         items: list[dict[str, Any]] = []
         for line in str(out or "").splitlines():
             line = line.strip().lstrip("-*0123456789. ").strip()
@@ -3855,17 +4045,40 @@ class StarHeartService:
             if len(items) >= limit:
                 break
         if not items:
-            await self.store.audit("memory.capture", f"no_memory turns={len(kept)}/{len(cleaned)}")
-            return {"ok": True, "saved": 0, "scanned": len(kept), "turns_total": len(cleaned)}
+            if self._is_no_memory_reply(raw):
+                await self.store.audit(
+                    "memory.capture", f"model_none turns={len(kept)}/{len(cleaned)}")
+                return {
+                    "ok": True, "outcome": "skipped", "reason": "model_none", "saved": 0,
+                    "scanned": len(kept), "turns_total": len(cleaned),
+                }
+            # 有输出但一条都解析不出来（格式跑偏 / 模型在解释）同样是失败：重试，不能当「无内容」删批。
+            await self.store.audit(
+                "memory.capture", f"unparsed_model_output turns={len(kept)}/{len(cleaned)}")
+            return {
+                "ok": False, "outcome": "retry",
+                "error": f"unparsed_model_output: {raw[:120]}",
+                "scanned": len(kept), "turns_total": len(cleaned),
+            }
         saved = 0
         deduped = 0
         linked = 0
         link_errors = 0
         evidence = "\n".join(
             f"用户：{(t.get('user') or '').strip()[:80]}\n助手：{(t.get('bot') or '').strip()[:80]}"
-            for t in cleaned[-3:]
             if (t.get("user") or t.get("bot"))
+            else f"用户：[{len(t.get('imgs') or [])} 张图片]"
+            for t in cleaned[-3:]
+            if (t.get("user") or t.get("bot") or t.get("imgs"))
         )[:500]
+        # 撤回反查侧车：把这一批的 message_id 挂到每条新记忆上。
+        # source_ref 是 `capture:{session}`，与 message_id 永不相等 —— 没有侧车表时
+        # recall_handling=weaken/archive 对自动总结的记忆恒为 0 命中（P1-3）。
+        msg_ids: list[str] = []
+        for t in cleaned:
+            mm = str(t.get("mid") or "").strip()
+            if mm and mm not in msg_ids:
+                msg_ids.append(mm)
         # 同人格、同会话的近期记忆：新条目如果只是换了个说法，就并回旧条目，
         # 不再新增一条。同一件事换三种说法在短时间写入多条，是实机出现过的退化路径。
         existing: list[tuple[str, str, str]] = []
@@ -3913,6 +4126,8 @@ class StarHeartService:
                     await self.store.db.commit()
                 except Exception as exc:            # noqa: BLE001
                     logger.debug(f"[StarHeart] 记忆补充失败：{exc}")
+                if msg_ids:
+                    await self.store.link_memory_messages(replace_id, msg_ids)
                 deduped += 1
                 logger.info(f"[StarHeart] 记忆补充：{new_summary[:40]} → 更新 #{replace_id}")
                 continue
@@ -3921,6 +4136,8 @@ class StarHeartService:
                     await self.store.touch_memory(dup_id)
                 except Exception as exc:            # noqa: BLE001
                     logger.debug(f"[StarHeart] 记忆去重加固失败：{exc}")
+                if msg_ids:
+                    await self.store.link_memory_messages(dup_id, msg_ids)
                 deduped += 1
                 logger.info(f"[StarHeart] 记忆去重：{new_summary[:40]} → 刷新 #{dup_id}")
                 continue
@@ -3950,6 +4167,8 @@ class StarHeartService:
             )
             if mid:
                 saved += 1
+                if msg_ids:
+                    await self.store.link_memory_messages(mid, msg_ids)
                 existing.append((str(mid), it["summary"], it["summary"]))
                 # 关键：新记忆立刻建关系链（实体边 + 同会话时序边 + 共享实体语义边）。
                 # 不建链的话图谱就是一堆孤点，用户看到的就是「没有关系链」。
@@ -3971,6 +4190,7 @@ class StarHeartService:
         )
         return {
             "ok": True,
+            "outcome": "done",
             "saved": saved,
             "deduped": deduped,
             "scanned": len(kept),
@@ -4316,7 +4536,23 @@ class StarHeartService:
             "imported": detect["already_imported"],
         }
         stats["recent_batches"] = batches
+        # 捕获队列健康度：待重试 / 停摆（parked）行数，总览页直接显示，不用翻 audit 表。
+        stats["capture"] = await self.store.capture_stats()
         return stats
+
+    async def capture_queue(self, limit: int = 20) -> dict[str, Any]:
+        """捕获队列只读视图（面板用）：只给状态列，不返回 payload（对话正文）。"""
+        return {
+            "stats": await self.store.capture_stats(),
+            "rows": await self.store.capture_pending_list(limit),
+        }
+
+    async def capture_retry(self, limit: int = 20) -> dict[str, Any]:
+        """手动给停摆（parked）的批一次机会，重新走退避链。"""
+        n = await self.store.capture_parked_for_retry(limit=limit)
+        if n:
+            await self.store.audit("memory.capture.revive", f"{n} 批", "面板手动重试")
+        return {"requeued": n, "stats": await self.store.capture_stats()}
 
     # ---------------- 记忆 ----------------
     async def memories(self, **kw: Any) -> dict[str, Any]:
@@ -4380,6 +4616,18 @@ class StarHeartService:
         ok = await self.store.restore_memory(mid)
         await self.store.audit("memory.restore", str(mid))
         return {"restored": bool(ok)}
+
+    async def memory_mute(self, mid: str, muted: bool = True, source_mode: str = "") -> dict[str, Any]:
+        """「别再提」：冷处理一条记忆（不进召回 / 不进主动池，但保留可恢复）。
+
+        这是用户能给出的唯一负反馈：旧记忆反复被提起时，除了删掉没有别的动作，
+        而删掉又舍不得。muted 只影响「会不会被自动提起」，不影响面板查看与手动恢复。
+        """
+        ok = await self.store.set_muted(mid, bool(muted), source_mode=str(source_mode or ""))
+        await self.store.audit(
+            "memory.mute" if muted else "memory.unmute", str(mid),
+            "source=%s" % source_mode if source_mode else "")
+        return {"ok": bool(ok), "muted": bool(muted)}
 
     async def graph(self, limit: int = 4000, persona_id: str = "") -> dict[str, Any]:
         return await self.store.graph(limit, persona_id=persona_id)
@@ -5411,14 +5659,31 @@ class StarHeartService:
             logger.debug(f"[StarHeart] 遗忘评估失败，退回阈值判定：{exc}")
             return None
         picked: list[int] = []
+        # 只接受「整行纯 id」或「逗号分隔的纯 id」。旧实现对整行 findall(r"\d+")：
+        # 模型只要复述候选表（「12 | 强度0.30 | 情绪5 | 被提及3次」），12/0/30/5/3 全被当 id
+        # → 一次忘光整批候选（P0-2）。含任何其它字符的行整行丢弃。
+        id_line = re.compile(r"^\s*\d+(?:\s*[,，]\s*\d+)*\s*$")
+        cap = min(len(ids), 20)                    # 单次遗忘上限：防模型整批输出
         for line in str(out or "").splitlines():
             line = line.strip()
             if not line or line in ("无", "none", "None", "没有"):
+                continue
+            if not id_line.match(line):
                 continue
             for tok in re.findall(r"\d+", line):
                 v = int(tok)
                 if v in ids and v not in picked:
                     picked.append(v)
+                if len(picked) >= cap:
+                    break
+            if len(picked) >= cap:
+                break
+        if picked and len(picked) == len(ids) and len(ids) >= 5:
+            # 候选 ≥5 时「全选」是模型复述/失控的典型形态。遗忘是批量不可逆操作，
+            # 宁可这轮一条不忘，等下一轮阈值判定再来。
+            logger.warning(
+                f"[StarHeart] 遗忘评估返回了全部 {len(ids)} 个候选，判为异常输出，本轮不遗忘")
+            return []
         if not picked:
             return []                                        # 模型说"一条都不用忘" → 尊重它
         await self.store.audit("memory.forget.review", f"{len(ids)}→{len(picked)}", "模型筛过遗忘候选")

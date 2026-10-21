@@ -32,6 +32,7 @@ from astrbot.core.agent.message import TextPart
 from astrbot.core.message.message_event_result import MessageChain, ResultContentType
 
 from .core import actions, engine
+from .core import persona as persona_rt
 from .core.service import DEFAULT_CONFIG, StarHeartService
 from .core.storage import Store, session_norm
 
@@ -86,7 +87,7 @@ _CONTACT_SHAPE_KEYS = {
     "StarHeart",
     "肆一纸心",
     "记忆增强：把对话记成长期记忆，聊天时自动想起相关的；附带人物画像、关系与表达习惯，自带可视化面板。",
-    "1.0.2",
+    "1.0.3",
     "https://github.com/WSYXIUBA/astrbot_plugin_starheart",
 )
 class StarHeartPlugin(Star):
@@ -153,6 +154,11 @@ class StarHeartPlugin(Star):
         # 缓存一版门控配置给同步的窗口计数用（_initialize 时刷新）
         self._window_cfg: dict[str, Any] = {}
         self._capture_last: dict[str, float] = {}
+        # 会话 → 原始 UMO：捕获路径（observe/settle/静默补总结）手上只有归一化 session_id，
+        # 而人格的会话级覆盖按**原始 UMO** 存，拿归一化 id 去查永远查空（P1-1）。
+        self._capture_umo: dict[str, str] = {}
+        # 按原始 UMO 缓存「这个会话的人格」：注入时算一次，捕获直接吃缓存
+        self._persona_cache = persona_rt.PersonaCache(ttl=600.0)
         # 跨会话动作台账：bot 借工具（含第三方工具插件）在**别的会话**里干了什么。
         # 条目只是运行期台账（带 TTL），长期可回忆的部分由 _write_action_memory 落成记忆。
         self._action_ledger: list[dict[str, Any]] = []
@@ -444,6 +450,14 @@ class StarHeartPlugin(Star):
                 logger.warning(f"[StarHeart] 时间基修复跳过：{exc}")
             if self._loop_task is None or self._loop_task.done():
                 self._loop_task = asyncio.create_task(self._background_loop())
+            # 一次性补跑：把 pending 的 v2 episode 抽完（默认关，只用于切读前验证/补课）
+            try:
+                _cfg0 = await self.service.config()
+                if _cfg0.get("v2_extract_on_boot", False):
+                    self._spawn(self._v2_drain_pending(), label="v2-drain")
+                    logger.info("[StarHeart] v2 启动补跑已派发")
+            except Exception as exc:                             # noqa: BLE001
+                logger.debug(f"[StarHeart] v2 启动补跑跳过：{exc}")
             stats = await self.store.stats()
             logger.info(
                 f"[StarHeart] 初始化完成：记忆 {stats['memories']} 条 / 实体 {stats['entities']} / 边 {stats['edges']}"
@@ -579,15 +593,49 @@ class StarHeartPlugin(Star):
         nb = math.sqrt(sum(y * y for y in b))
         return dot / (na * nb) if na > 0 and nb > 0 else 0.0
 
-    async def _inject_persona_id(self) -> str:
-        """注入/召回用的当前人格 id（隔离开关关掉时返回空 = 不过滤）。"""
+    async def _inject_persona_id(
+        self,
+        umo: str = "",
+        *,
+        conversation_persona_id: str | None = None,
+        platform_name: str = "",
+        use_cache: bool = False,
+    ) -> str:
+        """注入/召回/捕获用的当前人格 id（按会话解析；隔离开关关掉时返回空 = 不过滤）。
+
+        旧实现只读全局默认人格（`agent_runner.config.persona.persona_id`），会话切到
+        别的 persona 后记忆仍写全局人格、注入又从全局找 —— `memory_persona_isolated`
+        形同虚设。
+
+        `use_cache=True` 走按 **原始 UMO** 的缓存：捕获路径没有 `req`，只能复用注入时
+        算出来的结果（缓存为空则现算，算完回填）。
+        """
         try:
             cfg = await self.service.config()
         except Exception:
             cfg = {}
         if not cfg.get("memory_persona_isolated", True):
             return ""
-        return self._active_persona_id_sync()
+        key = str(umo or "").strip()
+        if use_cache and key:
+            hit = self._persona_cache.get(key)
+            if hit:
+                return hit
+        pid = await self._active_persona_id(
+            key,
+            conversation_persona_id=conversation_persona_id,
+            platform_name=platform_name,
+        )
+        if pid and key:
+            self._persona_cache.put(key, pid)
+        return pid
+
+    def _persona_umo_for_session(self, session_id: str) -> str:
+        """会话归一化 id → 原始 UMO（捕获路径用）。没记录过就返回空串。"""
+        sid = str(session_id or "")
+        if not sid:
+            return ""
+        return str(self._capture_umo.get(sid) or "")
 
     # ---------------- 语料：学群友/好友怎么说话 ----------------
     async def _record_corpus(self, event: AstrMessageEvent, text: str, *, is_bot: bool) -> None:
@@ -821,15 +869,18 @@ class StarHeartPlugin(Star):
 
     async def _capture_user_only(self, event: AstrMessageEvent, user_text: str,
                                 images: list[str] | None = None) -> None:
-        """用户发言就入缓冲（bot 还没回或根本不会回，例如群聊里没 @ 它）。"""
-        if not user_text.strip():
+        """用户发言就入缓冲（bot 还没回或根本不会回，例如群聊里没 @ 它）。
+
+        纯图片消息 message_str 为空但图本身是记忆来源：只拦「无文字且无图」。
+        """
+        if not user_text.strip() and not images:
             return
         await self._capture_push(event, user_text.strip(), "", images=images)
 
     async def _capture_with_reply(self, event: AstrMessageEvent, user_text: str, bot_text: str,
                                  images: list[str] | None = None) -> None:
         """bot 有回应时入缓冲：同一条用户消息只留一条（补上 bot 文本，不重复入）。"""
-        if not user_text.strip():
+        if not user_text.strip() and not images:
             return
         await self._capture_push(event, user_text.strip(), bot_text or "", images=images)
 
@@ -1100,20 +1151,33 @@ class StarHeartPlugin(Star):
             session_id = self._sid(event)
             if not session_id:
                 return
+            # 原始 UMO（未归一化）：会话人格覆盖按它存；归一化 id 去查 scope 会查空
+            raw_umo = str(getattr(event, "unified_msg_origin", "") or "")
+            if raw_umo:
+                self._capture_umo[session_id] = raw_umo
+                if len(self._capture_umo) > 512:
+                    for k, _ in list(self._capture_umo.items())[:128]:
+                        self._capture_umo.pop(k, None)
             buf = self._capture_buffer(session_id)
             uid = self._sender_id(event)
             name_fn = getattr(event, "get_sender_name", None)
             name = (name_fn() if callable(name_fn) else "") or ""
             # 每轮都带 uid / 昵称 / 时间：群里 A/B/C 的发言不能全记成「最后说话的人」，
             # 也不能一批 5 条共用一个时间戳（ago_label 全显示「刚刚」）。
-            if buf and buf[-1].get("user") == user_text and not buf[-1].get("bot") and bot_text:
+            # 同一人 + 同一文本才合并 bot 回复：纯图片轮 user 文本都是空串，
+            # 不校验 uid 会把群里 A、B 两张图合成一个人说的话。
+            if (buf and (buf[-1].get("user") or "") == (user_text or "")
+                    and buf[-1].get("uid") == uid
+                    and not buf[-1].get("bot") and bot_text):
                 buf[-1]["bot"] = bot_text
                 buf[-1]["bot_ts"] = time.time()
                 if images:
                     buf[-1]["imgs"] = list(images)      # 后补的 bot 文本也把图带上
             else:
                 buf.append({"user": user_text, "bot": bot_text, "imgs": list(images or []),
-                            "uid": uid, "name": name, "ts": time.time()})
+                            "uid": uid, "name": name, "ts": time.time(),
+                            # 消息 id：撤回命中记忆要靠它反查（P1-3 侧车表）
+                            "mid": self._msg_id_of(event)})
             # 0 是合法值（= 每轮都总结），不能被 `or` 吞回默认值
             need_cfg = cfg.get("memory_capture_turns")
             need = max(1, int(4 if need_cfg is None else need_cfg))
@@ -1132,10 +1196,112 @@ class StarHeartPlugin(Star):
             turns = list(buf)
             buf.clear()
             logger.info(f"[StarHeart] 记忆捕获触发：{session_id} 共 {len(turns)} 轮 → 入队总结")
-            persona_id = await self._inject_persona_id()
+            # v2 落库：影子写只存原文；v2_enabled 时再异步抽取成 memories
+            if cfg.get("v2_shadow_write", False) or cfg.get("v2_enabled", False):
+                try:
+                    self._spawn(
+                        self._v2_ingest_episode(turns, session_id, uid, name, cfg),
+                        label="v2-episode",
+                    )
+                except Exception as exc:                    # noqa: BLE001 影子写失败不影响主链路
+                    logger.debug(f"[StarHeart] v2 落库派发跳过：{exc}")
+            persona_id = await self._inject_persona_id(
+                self._persona_umo_for_session(session_id) or session_id, use_cache=True
+            )
             await self._enqueue_capture(turns, session_id, persona_id, uid, name)
         except Exception as exc:
             logger.debug(f"[StarHeart] 记忆捕获跳过：{exc}")
+
+    async def _v2_ingest_episode(
+        self, turns: list[dict[str, Any]], session_id: str, uid: str, name: str,
+        cfg: dict[str, Any] | None = None,
+    ) -> None:
+        """v2 落库：原文写 episodes；v2_enabled 时紧接着抽成 memories。
+
+        影子写（v2_shadow_write）只存原文，不调模型、不写 memories，读路径完全不动。
+        """
+        try:
+            msgs: list[dict[str, Any]] = []
+            mids: list[str] = []
+            for t in turns or []:
+                if t.get("user"):
+                    msgs.append({
+                        "role": "user", "content": str(t["user"])[:2000],
+                        "ts": float(t.get("ts") or 0), "message_id": str(t.get("mid") or ""),
+                        "name": str(t.get("name") or name or ""),
+                    })
+                    if t.get("mid"):
+                        mids.append(str(t["mid"]))
+                if t.get("bot"):
+                    msgs.append({
+                        "role": "assistant", "content": str(t["bot"])[:2000],
+                        "ts": float(t.get("bot_ts") or t.get("ts") or 0), "message_id": "",
+                    })
+                for img in (t.get("imgs") or []):
+                    msgs.append({"role": "system", "content": "[图片]", "image": str(img)[:500]})
+            if not msgs:
+                return
+            raw_json = json.dumps(msgs, ensure_ascii=False)
+            msg_hash = hashlib.sha1(
+                ("|".join(mids) if mids else raw_json).encode("utf-8")
+            ).hexdigest()[:24]
+            try:
+                kind, _ident = self.service.session_kind(session_id)
+            except Exception:                               # noqa: BLE001
+                kind = "private"
+            ts0 = float(msgs[0].get("ts") or time.time())
+            ts1 = float(msgs[-1].get("ts") or ts0)
+            ep_id = await self.store.upsert_episode({
+                "session_id": session_id,
+                "persona_id": "",
+                "subject_id": str(uid or "") if kind == "private" else "",
+                "started_at": ts0,
+                "ended_at": ts1,
+                "raw_json": raw_json,
+                "message_ids": mids,
+                "msg_hash": msg_hash,
+                "summary": "",
+            })
+            logger.debug(f"[StarHeart] v2 episode：{session_id} {len(msgs)} 条消息 → {ep_id}")
+            if ep_id and (cfg or {}).get("v2_enabled", False):
+                from .core import memory_v2 as v2mem
+
+                await v2mem.write_episode(self, int(ep_id), cfg)
+        except Exception as exc:                            # noqa: BLE001 落库失败不影响主链路
+            logger.debug(f"[StarHeart] v2 落库跳过：{exc}")
+
+    async def _v2_drain_pending(self, limit: int = 10) -> None:
+        """把 pending/failed 的 v2 episode 抽完（启动补跑用；/hf v2 extract 同源）。"""
+        try:
+            from .core import memory_v2 as v2mem
+
+            # 启动早期 provider 还没就绪，等它挂好再抽（否则 _session_provider 返回 None）
+            await asyncio.sleep(15)
+            rows = await (await self.store.db.execute(
+                "SELECT id FROM episodes WHERE extract_state IN ('pending','failed') "
+                "ORDER BY id LIMIT ?", (int(limit),))).fetchall()
+            if not rows:
+                logger.info("[StarHeart] v2 补跑：没有待抽取的 episode")
+                return
+            cfg = dict(await self.service.config())
+            cfg["v2_enabled"] = True
+            for r in rows:
+                eid = int(r["id"])
+                try:
+                    s = await v2mem.write_episode(self, eid, cfg)
+                    logger.info(f"[StarHeart] v2 补跑 ep{eid} → {s}")
+                except Exception as exc:                    # noqa: BLE001 单条失败不影响其它
+                    logger.warning(f"[StarHeart] v2 补跑失败 ep{eid}：{exc}")
+        except Exception as exc:                            # noqa: BLE001
+            logger.warning(f"[StarHeart] v2 补跑跳过：{exc}")
+
+    @staticmethod
+    def _capture_outcome(res: dict[str, Any]) -> str:
+        """统一捕获结果口径：新结果用 outcome（done/skipped/retry），老结果退回 ok。"""
+        out = str((res or {}).get("outcome") or "")
+        if out:
+            return out
+        return "done" if (res or {}).get("ok") else "retry"
 
     async def _summarize_capture(
         self, turns: list[dict[str, Any]], session_id: str, user_id: str, name: str, persona_id: str
@@ -1162,10 +1328,34 @@ class StarHeartPlugin(Star):
                 turns, session_id=session_id, user_id=user_id, user_name=name, persona_id=persona_id,
                 image_urls=urls or None,
             )
-            if not res.get("ok") and urls:
-                # 模型看不了图 → 明确记日志（不再偷偷换一个吃不到提示词的模型去描述图片）
-                logger.warning(f"[StarHeart] 图片没能进记忆（当前总结模型看不了图）：{res.get('error') or res}")
-            if not res.get("ok") or not res.get("saved"):
+            # 带图失败 → 去掉图片立刻重跑一次纯文本。旧实现这里只打一行 warning
+            # （注释写「上层会降级重跑纯文本」，但下面没有降级代码）：总结模型不支持图片时，
+            # 含图批次失败 5 次（约 8 分钟）后连同该批纯文本对话一起停摆一年（P0-3）。
+            # 只在失败时降级，成功路径不会多跑一次模型。
+            if (urls and self._capture_outcome(res) == "retry"
+                    and self.service.image_related_failure(res)):
+                logger.warning(
+                    f"[StarHeart] 带图总结失败，降级纯文本重跑一次：{str(res.get('error') or res)[:120]}"
+                )
+                res_text = await self.service.summarize_dialogue(
+                    turns, session_id=session_id, user_id=user_id, user_name=name, persona_id=persona_id,
+                    image_urls=None,
+                )
+                if self._capture_outcome(res_text) in ("done", "skipped"):
+                    res_text["degraded"] = "image_to_text"
+                    await self.service.store.audit(
+                        "memory.capture",
+                        f"image_degraded session={session_id} saved={res_text.get('saved')}",
+                    )
+                    logger.info("[StarHeart] 图片降级生效：本批按纯文本总结（图片未进记忆）")
+                else:
+                    logger.warning(
+                        f"[StarHeart] 纯文本降级仍失败：{str(res_text.get('error') or res_text)[:120]}"
+                    )
+                res = res_text
+            if self._capture_outcome(res) not in ("done", "skipped"):
+                return res
+            if not res.get("saved"):
                 return res
             logger.info(
                 f"[StarHeart] 记忆总结：写入 {res.get('saved')} 条（扫 {res.get('scanned')} 轮）"
@@ -1196,20 +1386,22 @@ class StarHeartPlugin(Star):
         if not turns:
             return
         try:
-            pid = await self.store.capture_enqueue(
+            row = await self.store.capture_enqueue_row(
                 turns, session_id=session_id, persona_id=persona_id,
                 user_id=user_id, user_name=name,
             )
         except Exception as exc:                            # noqa: BLE001 落库失败退回直接跑
-            logger.warning(f"[StarHeart] 记忆捕获入队失败（改为直接总结）：{exc}")
+            logger.error(
+                f"[StarHeart] 记忆捕获入队失败（改为直接总结：本批不进队列、失败没有退避）：{exc}")
             await self._capture_worker({"id": 0, "turns": list(turns), "session_id": session_id,
                                         "persona_id": persona_id, "user_id": user_id, "user_name": name})
             return
-        if not pid:
+        if not row:
             return
+        # 入队即占位（capture_enqueue_row 在 INSERT 里写 locked_by + 租约）：不再有
+        # 「INSERT 完成 → capture_claim 之前」的空窗，retry tick 抢不走这一批。
         self._spawn(
-            self._capture_worker({"id": pid, "turns": list(turns), "session_id": session_id,
-                                  "persona_id": persona_id, "user_id": user_id, "user_name": name}),
+            self._capture_worker(row),
             label="memory-capture",
         )
 
@@ -1226,19 +1418,42 @@ class StarHeartPlugin(Star):
             raise
         except Exception as exc:                            # noqa: BLE001
             res = {"ok": False, "error": str(exc)[:200]}
-        if res.get("ok"):
+        outcome = self._capture_outcome(res)
+        token = str(row.get("locked_by") or "")
+        if outcome == "hold":
+            # 捕获开关关掉 / 主动暂停：行留着，到期时间推后，开关恢复后自动续跑。
             if pid:
-                await self.store.capture_done(pid)
+                await self.store.capture_hold(pid, str(res.get("reason") or "hold"), token=token)
+                logger.info("[StarHeart] 记忆捕获已暂停：本批留在队列（未删除），开关恢复后自动续跑")
+            return
+        if outcome in ("done", "skipped"):
+            if pid:
+                await self.store.capture_done(pid, token)
             return
         if not pid:
             return
-        tries = await self.store.capture_fail(pid, str(res.get("error") or res))
+        tries = await self.store.capture_fail(pid, str(res.get("error") or res), token=token)
+        if not tries:
+            # 锁已被租约回收（同一批可能已有另一个 worker 在跑）：不覆盖别人的状态，也不再重复记账。
+            logger.debug(f"[StarHeart] 捕获批 {pid} 锁已失效，跳过本次失败记账")
+            return
         logger.warning(
             f"[StarHeart] 记忆总结失败，已留档待重试（第 {tries} 次）：{str(res.get('error') or res)[:160]}"
         )
 
     async def _capture_retry_tick(self) -> None:
         """到期重试：每次最多 2 批，避免模型故障时反复打爆（数据一直留着）。"""
+        # 停摆回暖：退避链只有 ~7.5 分钟，模型/网关故障一久队列会整批 parked。
+        # 每 6h 给 5 批一次机会，修好之后能自己恢复，不必人工翻库。
+        now_t = time.time()
+        if now_t - float(getattr(self, "_capture_parked_last", 0.0) or 0.0) >= 6 * 3600:
+            self._capture_parked_last = now_t
+            try:
+                n = await self.store.capture_parked_for_retry(limit=5)
+                if n:
+                    logger.warning(f"[StarHeart] 停摆队列回暖：{n} 批重新进入重试")
+            except Exception as exc:                        # noqa: BLE001
+                logger.debug(f"[StarHeart] 停摆队列回暖跳过：{exc}")
         try:
             rows = await self.store.capture_take(limit=2)
         except Exception as exc:                            # noqa: BLE001
@@ -1271,7 +1486,11 @@ class StarHeartPlugin(Star):
                 uid = str(turns[-1].get("uid") or "")
                 name = str(turns[-1].get("name") or "")
                 logger.info(f"[StarHeart] 记忆捕获（静默补总结）：{sid} 共 {len(turns)} 轮")
-                await self._enqueue_capture(turns, sid, await self._inject_persona_id(), uid, name)
+                await self._enqueue_capture(
+                    turns, sid,
+                    await self._inject_persona_id(self._persona_umo_for_session(sid) or sid, use_cache=True),
+                    uid, name,
+                )
         except Exception as exc:                            # noqa: BLE001
             logger.debug(f"[StarHeart] 静默补总结跳过：{exc}")
 
@@ -1331,13 +1550,38 @@ class StarHeartPlugin(Star):
                 slot = fused.setdefault(str(mem.get("id")), {"mem": mem, "score": 0.0, "arms": set()})
                 slot["score"] += weight / (60.0 + rank)
                 slot["arms"].add(arm)
-        ordered = sorted(fused.values(), key=lambda sl: sl["score"] * _boost(sl["mem"]), reverse=True)
+        def _poi_factor(mem: dict[str, Any]) -> float:
+            """重要度只做 0.8~1.0 的轻推。
+
+            真正决定排序的必须是「这句话和当前话题的相关性」，不能是「这条被注入过几次」——
+            旧实现里 strength 占 30%，一句被反复注入的测试话会压过真正相关的偏好。
+            """
+            try:
+                poi = float(mem.get("poignancy") if mem.get("poignancy") is not None else 5)
+            except (TypeError, ValueError):
+                poi = 5.0
+            return 0.8 + 0.2 * max(0.0, min(1.0, poi / 10.0))
+
+        ordered = sorted(
+            fused.values(),
+            key=lambda sl: sl["score"] * _boost(sl["mem"]) * _poi_factor(sl["mem"]),
+            reverse=True,
+        )
         out: list[dict[str, Any]] = []
-        for slot in ordered[:cand]:
+        seen_texts: list[str] = []
+        for slot in ordered:
+            if len(out) >= cand:
+                break
             mem = slot["mem"]
+            summary = str(mem.get("summary") or "")
+            # 同主题去重：一轮注入里「小猫娘」这类同义句最多留一条。
+            # 真机现场：一次 8 条里 6 条都在说猫，模型自然只会抓着猫不放。
+            if summary and any(engine.text_similarity(summary, prev) >= 0.42 for prev in seen_texts):
+                continue
             mem["_hit_kind"] = "semantic" if "semantic" in slot["arms"] else "keyword"
-            mem["_recall_score"] = round(float(slot["score"] * _boost(mem)), 5)
+            mem["_recall_score"] = round(float(slot["score"] * _boost(mem) * _poi_factor(mem)), 5)
             out.append(mem)
+            seen_texts.append(summary)
         if out:
             return out
         # 两臂都空（纯标点 / 库里一条都没匹配）→ 最近兜底，标 fallback：不算被提及
@@ -1922,7 +2166,7 @@ class StarHeartPlugin(Star):
 
     async def _llm_generate(self, prompt: str, task: str = "", system_prompt: str | None = None,
                             image_urls: list[str] | None = None, contexts: list[Any] | None = None,
-                            umo: str = "") -> str:
+                            umo: str = "", timeout: float | None = None) -> str:
         try:
             cfg = await self.service.config()
         except Exception:
@@ -1951,6 +2195,8 @@ class StarHeartPlugin(Star):
             # 没登记槽位的任务（主动开口 / 未指定）→ 用**该会话**的模型（按 UMO 解析）
             provider = await self._session_provider(umo)
         if provider is None:
+            logger.warning(
+                f"[StarHeart] 任务 {task or 'chat'} 取不到可用模型（umo={umo or '空'}、槽位={provider_id or '空'}），本次跳过")
             return ""
         # 系统提示词：面板里配的覆盖优先 → 调用方显式给的 → 插件内置默认（service.TASK_PROMPTS）。
         # 留空 = 内置默认；任务不在清单里（例如主动开口，它吃 AstrBot 那份系统提示词）就原样传。
@@ -1975,10 +2221,11 @@ class StarHeartPlugin(Star):
         # 必须带超时：调用方有 _background_loop 里的 proactive_scan / 总结 / 画像，
         # 裸 await 一旦网络挂起会把整条后台链堵死到进程重启。
         try:
-            resp = await asyncio.wait_for(provider.text_chat(**kwargs), timeout=self.LLM_TIMEOUT_SECONDS)
+            _to = float(timeout or self.LLM_TIMEOUT_SECONDS)
+            resp = await asyncio.wait_for(provider.text_chat(**kwargs), timeout=_to)
         except TimeoutError:
             logger.warning(
-                f"[StarHeart] 模型调用超时（{self.LLM_TIMEOUT_SECONDS:.0f}s，task={task or 'chat'}）"
+                f"[StarHeart] 模型调用超时（{float(timeout or self.LLM_TIMEOUT_SECONDS):.0f}s，task={task or 'chat'}）"
                 "：放弃本轮结果（返回空串），不让它拖住后台循环"
             )
             return ""
@@ -2118,14 +2365,27 @@ class StarHeartPlugin(Star):
             self._writeback_failed.add(str(session))
             logger.warning(f"[StarHeart] 写回对话历史失败（不影响已发出的消息）：{exc}")
 
-    def _split_for_send(self, text: str, cfg: dict[str, Any], typo_mode: str = "off") -> tuple[list[str], str]:
+    def _split_cap(self, cfg: dict[str, Any]) -> int:
+        """一轮最多拆几条（面板键 output_split_max，2–8）；脏值退回 4。
+
+        为什么必须有上限：模型会把「想多说」写成十几行短句，空行协议就照单全拆 ——
+        真机出现过一轮 9 条、32 秒内连发（用户原话「话唠，一发发一堆」）。
+        """
+        try:
+            v = int(float(cfg.get("output_split_max", 4) or 4))
+        except (TypeError, ValueError):
+            v = 4
+        return max(2, min(8, v))
+
+    def _split_for_send(self, text: str, cfg: dict[str, Any], typo_mode: str = "off",
+                        max_seg: int = 6) -> tuple[list[str], str]:
         """把一条待发文本切段（主动通道用）：判定交给 engine.split_for_send，这里只逐段收尾。
 
         主动消息不走 AstrBot 的 result_decorate 管线，`humanize_output` 永远收不到它，
         所以「空行 = 分一条」的协议必须在发送层自己兑现，否则提示词教模型分段等于白教。
         不拆时返回 ([原文], "")，调用方照旧整条发，避免意外改动未开分段时的观感。
         """
-        segs, how = engine.split_for_send(str(text or ""))
+        segs, how = engine.split_for_send(str(text or ""), max_seg=max_seg)
         if len(segs) <= 1:
             return [text], ""
         cleaned = [engine.apply_typo(engine.tidy_output(s), typo_mode, cfg.get("output_typo_rate")) for s in segs]
@@ -2155,7 +2415,9 @@ class StarHeartPlugin(Star):
             except Exception:                            # noqa: BLE001 读不到配置就按不拆发，不许影响发送
                 cfg = {}
             if bool(cfg.get("output_enabled", True)) and bool(cfg.get("output_split_messages", False)):
-                segs, how = self._split_for_send(text, cfg, str(cfg.get("output_typo_mode") or "off"))
+                segs, how = self._split_for_send(
+                    text, cfg, str(cfg.get("output_typo_mode") or "off"), max_seg=self._split_cap(cfg)
+                )
         first = segs[0] if len(segs) > 1 else text
         ok = False
         try:
@@ -2263,6 +2525,7 @@ class StarHeartPlugin(Star):
         last_evolve_tick = 0.0
         last_habit_tick = 0.0
         last_jargon_tick = 0.0
+        last_style_tick = 0.0
         while True:
             try:
                 now_t = time.time()
@@ -2311,6 +2574,10 @@ class StarHeartPlugin(Star):
                 if time.time() - last_jargon_tick > 1800:
                     last_jargon_tick = time.time()
                     await self._jargon_auto_tick(cfg)
+                # 语言学习：每 6 小时检查一次（新语料够量才真跑，事件触发）
+                if time.time() - last_style_tick > 21600:
+                    last_style_tick = time.time()
+                    await self._style_auto_tick(cfg)
                 if time.time() - last_recall_cleanup > 86400:
                     last_recall_cleanup = time.time()
                     removed = await self.service.recall_log_cleanup()
@@ -2452,30 +2719,29 @@ class StarHeartPlugin(Star):
         except Exception:
             return ""
 
-    async def _active_persona_id(self, umo: str = "") -> str:
+    async def _active_persona_id(
+        self,
+        umo: str = "",
+        *,
+        conversation_persona_id: str | None = None,
+        platform_name: str = "",
+    ) -> str:
         """当前人格：按**原生优先级**解析（会话规则 > 会话级 > 全局默认）。
 
         旧实现只读全局默认那一条 → 多会话下会把「被会话规则强制指定的人格」「会话自选人格」
         都当成全局默认，导致记忆按错人格归档、主动消息用错语气（审计实测）。
+
+        调用方式必须对齐 AstrBot 原生签名（`umo` / `conversation_persona_id` /
+        `platform_name` / `provider_settings` 全是 keyword-only，前三个必填），
+        少传就是 TypeError → 静默回退全局。具体规则见 core/persona.py。
         """
-        pm = self._persona_manager()
-        fn = getattr(pm, "resolve_selected_persona", None) if pm is not None else None
-        if callable(fn):
-            for call in ((lambda: fn(umo=umo)) if umo else None, lambda: fn()):
-                if call is None:
-                    continue
-                try:
-                    res = call()
-                    res = await res if asyncio.iscoroutine(res) else res
-                    pid = res[0] if isinstance(res, (tuple, list)) and res else res
-                    if pid:
-                        return str(pid)
-                except TypeError:
-                    continue
-                except Exception as exc:                 # noqa: BLE001
-                    logger.debug(f"[StarHeart] resolve_selected_persona 不可用：{exc}")
-                break
-        return self._active_persona_id_sync()
+        return await persona_rt.resolve_persona_id(
+            self._persona_manager(),
+            umo=str(umo or ""),
+            conversation_persona_id=conversation_persona_id,
+            platform_name=platform_name,
+            fallback=self._active_persona_id_sync(),
+        )
 
     async def _activate_persona(self, pid: str) -> dict[str, Any]:
         """切换 AstrBot 全局人格：写官方配置路径 agent_runner.config.persona.persona_id 并保存。"""
@@ -2681,7 +2947,12 @@ class StarHeartPlugin(Star):
         # 纯图片消息 message_str 为空，但撤回时同样要能给出「谁撤回了什么」；命令也留。
         await self._keep_live_message(event, text)
         await self._remember_person_name(event)
-        if not text or text.startswith("/"):
+        # 纯图片消息 message_str 为空：图片是记忆来源，不能在这里被拦掉。
+        # 旧实现 `if not text` 让「群里发一张图、bot 没回」永远进不了记忆（P1-1）。
+        images = self._collect_image_urls(event)
+        if text.startswith("/"):
+            return
+        if not text and not images:
             return
         try:
             is_private = event.is_private_chat()
@@ -2692,7 +2963,7 @@ class StarHeartPlugin(Star):
             is_at = bool(event.is_at_or_wake_command)
         except Exception:
             is_at = False
-        if gate_on:
+        if gate_on and text:
             fav = {f["user_id"]: f for f in await self.store.list_favours()}
             sender = self._sender_id(event)
             relation = engine.relation_coefficient(float(fav.get(sender, {}).get("daily", 0)))
@@ -2775,7 +3046,7 @@ class StarHeartPlugin(Star):
         try:
             # 图片必须在这里收进缓冲：不传 images 的话「图像识别」开关整条链路空转
             # （_run_capture 里读的是 turns[*]["imgs"]，恒空 = 图片永远进不了记忆）
-            await self._capture_user_only(event, text, self._collect_image_urls(event))
+            await self._capture_user_only(event, text, images)
         except Exception as exc:
             logger.debug(f"[StarHeart] 记忆捕获（用户侧）跳过：{exc}")
 
@@ -2866,13 +3137,17 @@ class StarHeartPlugin(Star):
             clock = f"现在是 {now_dt.strftime('%Y-%m-%d %H:%M')}（周{'一二三四五六日'[now_dt.weekday()]}）"
         except Exception:                                   # noqa: BLE001 时间算不出来就不注入这段
             return ""
-        gap = self._session_gap_text(self._sid(event))
+        gap = self._session_gap_text(self._sid(event), cfg)
         if gap:
             clock += f"，距这个会话上一条消息 {gap}"
         return clock + "。"
 
-    def _session_gap_text(self, session_id: str) -> str:
-        """距本会话上一条消息多久（内存记账；不到 1 分钟就不说，免得变成噪音）。"""
+    def _session_gap_text(self, session_id: str, cfg: dict[str, Any] | None = None) -> str:
+        """距本会话上一条消息多久（内存记账；不到 1 分钟就不说，免得变成噪音）。
+
+        间隔超过 6 小时时补一个绝对时刻：只写「11 小时前」，模型会把昨晚的对话
+        当成「今天早些时候」甚至「刚才」（真机痛点：分不清昨天和今天）。
+        """
         slot = self._session_touch.get(str(session_id or "")) or {}
         last_ts = float(slot.get("last") or 0)
         prev_ts = float(slot.get("prev") or 0)
@@ -2881,7 +3156,21 @@ class StarHeartPlugin(Star):
         gap = max(0.0, last_ts - prev_ts)
         if gap < 60:
             return ""
-        return actions.duration_text(gap)
+        text = actions.duration_text(gap)
+        if gap >= 6 * 3600:
+            try:
+                from datetime import datetime
+
+                tz = None
+                try:
+                    tz = self.service.timezone(dict(cfg or {}))
+                except Exception:                       # noqa: BLE001 取不到时区就退回本机
+                    tz = None
+                d = datetime.fromtimestamp(prev_ts, tz) if tz is not None else datetime.fromtimestamp(prev_ts)
+                text += f"（上一次是 {d.strftime('%m-%d %H:%M')}）"
+            except Exception:                           # noqa: BLE001 算不出来就只给相对量
+                pass
+        return text
 
     def _touch_session(self, session_id: str) -> None:
         """记下本会话「这一条 / 上一条」的时间：注入里的「距上一条多久」靠它。"""
@@ -3013,7 +3302,11 @@ class StarHeartPlugin(Star):
             summary, content = actions.summarize(entry)
             if not summary:
                 return
-            persona_id = await self._inject_persona_id()
+            persona_id = await self._inject_persona_id(
+                self._persona_umo_for_session(str(entry.get("src_session") or ""))
+                or str(entry.get("src_session") or ""),
+                use_cache=True,
+            )
             entities = [x for x in (str(entry.get("actor_name") or "").strip(),
                                     str(entry.get("actor_id") or "").strip()) if x]
             cues = [content[:24]]
@@ -3078,10 +3371,12 @@ class StarHeartPlugin(Star):
         try:
             sess_cache = self._sid(event)
             if sess_cache:
+                # 只留最近 4 条（约 2 轮）：主动开口复用这段历史，留太长模型会接着自己
+                # 上一轮的输出往下编（真机：把 8:27 那条主动消息原样复读到 10:16 的回复里）。
                 self._agent_prompt_cache[sess_cache] = {
                     "ts": time.time(),
                     "system": str(getattr(req, "system_prompt", "") or ""),
-                    "contexts": list(getattr(req, "contexts", []) or [])[-8:],
+                    "contexts": list(getattr(req, "contexts", []) or [])[-4:],
                 }
                 if len(self._agent_prompt_cache) > 64:      # 防无界增长：丢掉最旧的 16 个会话
                     for k, _ in sorted(
@@ -3095,6 +3390,19 @@ class StarHeartPlugin(Star):
         cfg = await self.service.config()
         if not cfg.get("master_switch", True):
             return
+        # 人格解析的会话上下文：原始 UMO（不是归一化 sid）+ 本轮会话级人格 + 平台名。
+        # 注入路径手上就有 req，照 AstrBot 官方调用点取全四个参数；捕获路径吃这里的缓存。
+        raw_umo = str(getattr(event, "unified_msg_origin", "") or "")
+        try:
+            conv_persona_id: str | None = getattr(getattr(req, "conversation", None), "persona_id", None)
+        except Exception:                                   # noqa: BLE001 老版本没有 conversation
+            conv_persona_id = None
+        try:
+            plat_name = str(event.get_platform_name() or "")
+        except Exception:                                   # noqa: BLE001
+            plat_name = ""
+        if raw_umo and sess_cache:
+            self._capture_umo[sess_cache] = raw_umo
         parts: list[str] = []
         # 连发合并：把同一人窗口内连发的几条顶替成本轮 prompt（改 req.prompt 才有效）
         if cfg.get("burst_merge_enabled", True):
@@ -3129,23 +3437,62 @@ class StarHeartPlugin(Star):
             top_k = int(8 if top_k_cfg is None else top_k_cfg)
             budget_cfg = cfg.get("memory_inject_budget_tokens")
             budget = int(1200 if budget_cfg is None else budget_cfg)
-            persona_id = await self._inject_persona_id()
-            picked = await self._recall_picked(event, top_k, persona_id)
-            # 「结果重排」：配了重排模型就先按它重新定序（失败/未配 → 原序）
-            picked = await self._rerank_memories(event.message_str or "", picked, top_k)
-            # 被提及 → 刷新遗忘计时；归档中的当场拉回正常记忆并补回强度。
-            # 只认真实命中：兜底（最近 N 条）不算被提及，否则最新几条永远霸榜（P0-5）。
-            for m in picked[: max(1, int(top_k))]:
-                if str(m.get("_hit_kind") or "") == "fallback":
-                    continue
+            persona_id = await self._inject_persona_id(
+                raw_umo or sess_cache or self._sid(event),
+                conversation_persona_id=conv_persona_id,
+                platform_name=plat_name,
+            )
+            v2_ok = False
+            if bool(cfg.get("v2_enabled", False)):
+                # v2 召回：5 路候选 + 间隙法 + RRF + MMR（旧链路完全跳过，含重排）
                 try:
-                    if await self.store.touch_memory(m.get("id")):
-                        logger.info(f"[StarHeart] 记忆 {m.get('id')} 被提及，已自动拉回正常记忆")
-                except Exception as exc:                 # noqa: BLE001 计时失败不许影响注入
-                    logger.debug(f"[StarHeart] 记忆计时刷新跳过：{exc}")
-            block = engine.build_memory_context(picked, budget_chars=budget)
-            if block:
-                parts.append(block)
+                    from .core import memory_v2 as v2mem
+
+                    turn_id = hashlib.md5(
+                        f"{self._sid(event)}|{time.time()}".encode("utf-8")).hexdigest()[:16]
+                    if not hasattr(self, "_v2_turn"):
+                        self._v2_turn = {}
+                    self._v2_turn[self._sid(event)] = turn_id
+                    picked = await v2mem.recall_v2(self, event, cfg, top_k=top_k, persona_id=persona_id)
+                    addresses = await v2mem.load_addresses(self.store, self._sender_id(event), persona_id)
+                    block = v2mem.render_block(
+                        picked, cfg, now_ts=time.time(), tz=self.service._tzinfo(cfg),
+                        addresses=addresses, today_label=self.service.now_text(cfg),
+                    )
+                    await v2mem.log_shown(
+                        self, turn_id, self._sid(event),
+                        "" if "group" in str(self._sid(event)).lower() else self._sender_id(event),
+                        picked, "recall",
+                    )
+                    if block:
+                        parts.append(block)
+                    v2_ok = True
+                except Exception as exc:                    # noqa: BLE001 v2 失败必须退回旧链路
+                    logger.warning(f"[StarHeart] v2 召回失败，本轮回退旧链路：{exc}")
+            if not v2_ok:
+                picked = await self._recall_picked(event, top_k, persona_id)
+                # 「结果重排」：配了重排模型就先按它重新定序（失败/未配 → 原序）
+                picked = await self._rerank_memories(event.message_str or "", picked, top_k)
+                # 排障用：把本轮真正注入的 id 记下来（权重调完要能核对「那条到底进没进」）
+                logger.debug(
+                    f"[StarHeart] 记忆召回：{len(picked)} 条 → {[str(m.get('id')) for m in picked[:max(1, int(top_k))]]}"
+                )
+                # 被提及 → 刷新遗忘计时；归档中的当场拉回正常记忆并补回强度。
+                # 只认真实命中：兜底（最近 N 条）不算被提及，否则最新几条永远霸榜（P0-5）。
+                for m in picked[: max(1, int(top_k))]:
+                    if str(m.get("_hit_kind") or "") == "fallback":
+                        continue
+                    try:
+                        if await self.store.touch_memory(m.get("id")):
+                            logger.info(f"[StarHeart] 记忆 {m.get('id')} 被提及，已自动拉回正常记忆")
+                    except Exception as exc:                 # noqa: BLE001 计时失败不许影响注入
+                        logger.debug(f"[StarHeart] 记忆计时刷新跳过：{exc}")
+                block = engine.build_memory_context(
+                    picked, budget_chars=budget,
+                    stamp_fn=self.service.abs_stamp(cfg), today_label=self.service.now_text(cfg),
+                )
+                if block:
+                    parts.append(block)
         if cfg.get("favour_enabled", True):
             fav = {f["user_id"]: f for f in await self.store.list_favours()}
             sender = self._sender_id(event)
@@ -3160,7 +3507,27 @@ class StarHeartPlugin(Star):
         # 只在本来就有注入内容时才追加，避免"没内容也硬塞一行"破坏空注入的早退。
         if parts:
             parts.append("（记忆由系统自动处理，不用调用任何记忆类工具去搜或存）")
-        if not parts:
+        # 表达块：挂在人格之后、system 最末尾（不是 user content）。
+        # 学到东西就整块换成学到的原话；没学到就是人格里搬出来的默认规则。
+        sys_tail: list[str] = []
+        try:
+            from .core import style_memory as style_mod
+
+            _reg = "group" if "group" in str(self._sid(event)).lower() else "private"
+            _pid_style = await self._inject_persona_id(
+                raw_umo or sess_cache or self._sid(event),
+                conversation_persona_id=conv_persona_id,
+                platform_name=plat_name,
+                use_cache=True,
+            )
+            _sblock = await style_mod.expression_block(
+                self.store, cfg, _pid_style or "", _reg, event.message_str or ""
+            )
+            if _sblock:
+                sys_tail.append(_sblock)
+        except Exception as exc:                            # noqa: BLE001 表达块失败不影响回复
+            logger.debug(f"[StarHeart] 表达块注入跳过：{exc}")
+        if not parts and not sys_tail:
             return
         # 表达学习真生效：把学到的说话习惯注入（原实现只提取不使用 = 假功能）
         if cfg.get("expression_enabled", True):
@@ -3171,7 +3538,12 @@ class StarHeartPlugin(Star):
                 _cap = 5
             if _cap > 0:
                 try:
-                    _pid = await self._inject_persona_id()
+                    _pid = await self._inject_persona_id(
+                        raw_umo or sess_cache or self._sid(event),
+                        conversation_persona_id=conv_persona_id,
+                        platform_name=plat_name,
+                        use_cache=True,
+                    )
                     hints, expr_ids = await self.service.habit_hints_detail(
                         persona_id=_pid, limit=_cap
                     )
@@ -3195,9 +3567,11 @@ class StarHeartPlugin(Star):
         # 输出分段协议：只有开了插件的分段发送才教 —— 否则空行没有意义、白占提示词。
         # 这条是「让 bot 自己控制分段」的关键：bot 空一行 = 它想分一条发，split_message() 就照办。
         if bool(cfg.get("output_split_messages", False)):
-            parts.append(
-                "【输出方式】想分多条消息发就空一行（一个空行 = 分成两条发出）；"
-                "同一条消息里不要出现空行，也不要把一句话拆成两条。不想分条就一直连着写。"
+            sys_tail.append(
+                "【输出方式】分条 = 把同一段话顺着往下说、拆成几条发（一个空行 = 分成两条）。"
+                "不是让你列出几种说法或备选：每条必须接着上一条说新内容，"
+                "不能互相替代，也不能把同一个意思换个说法再说一遍。"
+                "同一条消息里不要出现空行。不想分条就一直连着写。"
             )
         # 撤回知会：把对方最近撤回过的消息**一次**告诉 bot（下一轮它就知道"那条已经不算数"了），
         # 然后清掉。依据：AstrBot 的撤回通知不进对话历史，bot 本来永远不知情。
@@ -3217,6 +3591,17 @@ class StarHeartPlugin(Star):
                 logger.info(f"[StarHeart] 撤回知会已注入本轮请求（{len(_lines)} 条）")
         except Exception as exc:                                # noqa: BLE001 知会失败不影响注入
             logger.debug(f"[StarHeart] 撤回知会注入跳过：{exc}")
+        if sys_tail:
+            _tail = "\n".join(sys_tail).strip()
+            if _tail:
+                try:
+                    _old_sys = str(getattr(req, "system_prompt", "") or "")
+                    req.system_prompt = (_old_sys.rstrip() + "\n\n【表达】\n" + _tail + "\n【/表达】").lstrip()
+                    logger.debug(f"[StarHeart] 表达块已挂到人格末尾（{len(_tail)} 字）")
+                except Exception as exc:                        # noqa: BLE001 挂不上不影响回复
+                    logger.warning(f"[StarHeart] 表达块挂 system 失败：{exc}")
+        if not parts:
+            return
         try:
             text = "\n".join(parts)
             target = getattr(req, "extra_user_content_parts", None)
@@ -3261,6 +3646,15 @@ class StarHeartPlugin(Star):
                 )
             except Exception as exc:
                 logger.debug(f"[StarHeart] 记忆捕获未触发：{exc}")
+            # v2 归因：这轮回复到底用没用注入的记忆（shown 与 cited 分开记）
+            try:
+                _turn = (getattr(self, "_v2_turn", {}) or {}).pop(self._sid(event), None)
+                if _turn:
+                    from .core import memory_v2 as v2mem
+
+                    await v2mem.attribute_reply(self, _turn, text, "recall")
+            except Exception as exc:                        # noqa: BLE001 归因失败不影响回复
+                logger.debug(f"[StarHeart] v2 归因跳过：{exc}")
         cfg = await self.service.config()
         if not cfg.get("master_switch", True) or not cfg.get("favour_enabled", True):
             return
@@ -3334,6 +3728,23 @@ class StarHeartPlugin(Star):
         except Exception as exc:                            # noqa: BLE001 后台任务异常不允许拖垮循环
             logger.warning(f"[StarHeart] 表达学习自动提取失败（不影响其它任务）：{exc}")
 
+    async def _style_auto_tick(self, cfg: dict[str, Any]) -> None:
+        """语言学习：新记忆够量就跑一轮（从记忆原对话学，事件触发）。"""
+        logger.info(f"[StarHeart] 语言学习 tick（enabled={cfg.get('expression_style_enabled')}）")
+        if not bool(cfg.get("expression_style_enabled", False)):
+            return
+        try:
+            from .core import style_memory as style_mod
+
+            pid = await self.service._active_pid()
+            res = await style_mod.run_learn(self, cfg, pid or "")
+            if res.get("ok"):
+                logger.info(f"[StarHeart] 语言学习自动学习：{res}")
+            else:
+                logger.info(f"[StarHeart] 语言学习跳过：{res.get('reason')} / 新记忆={res.get('fresh')}")
+        except Exception as exc:                            # noqa: BLE001
+            logger.warning(f"[StarHeart] 语言学习自动学习失败：{exc}")
+
     async def _jargon_auto_tick(self, cfg: dict[str, Any]) -> None:
         """黑话含义推断的自动敲钟（S5-1）：到点敲一次，配额/门槛全部由 service 按配置判定。
 
@@ -3363,10 +3774,11 @@ class StarHeartPlugin(Star):
             except Exception as exc:                        # noqa: BLE001 记账不许影响本轮对话
                 logger.warning(f"[StarHeart] 表达使用记账失败（不影响本轮）：{exc}")
 
-    async def _log_first_seg(self, event: AstrMessageEvent, chain: list[Any]) -> None:
+    async def _log_first_seg(self, event: AstrMessageEvent, chain: list[Any], seg_total: int = 1) -> None:
         """首条（框架管线直接发出）记账：内容此刻已确定，但发送结果不在本插件手里。
 
         因此落 kind='first_seg'、emit_ok=NULL（未确认）—— 不冒充「已确认发出」，也不当成失败。
+        seg_total 取本轮实际总段数（含首条），否则流水里 seg_index/seg_total 对不上真机气泡数。
         """
         try:
             text = "\n".join(str(getattr(c, "text", "") or "") for c in chain if isinstance(c, Plain)).strip()
@@ -3376,6 +3788,8 @@ class StarHeartPlugin(Star):
                 "session_id": self._sid(event),
                 "kind": "first_seg",
                 "text": text,
+                "seg_index": 0,
+                "seg_total": max(1, int(seg_total or 1)),
                 "emit_ok": None,
                 "trigger": "首条",
             })
@@ -3437,9 +3851,10 @@ class StarHeartPlugin(Star):
         if plains:
             body = "\n".join((c.text or "") for c in plains).strip()
             if body:
-                self._plan_humanized_followups(event, plains, body, cfg, raw_body=raw_body, typo_mode=typo_mode)
+                _total = self._plan_humanized_followups(event, plains, body, cfg,
+                                                        raw_body=raw_body, typo_mode=typo_mode)
                 # 计划落定后记首条：此时 comps[0] 已去掉表情标记/只留第一段，正是框架将要发出的内容
-                await self._log_first_seg(event, chain)
+                await self._log_first_seg(event, chain, seg_total=_total or 1)
 
     # ---------------- 输出拟人：把"首条之后要补发什么"计划出来 ----------------
     def _plan_humanized_followups(self, event: AstrMessageEvent, comps: list[Any], body: str,
@@ -3480,26 +3895,41 @@ class StarHeartPlugin(Star):
             #    ③「语义切分」= 前两条都不成立、且长度与断点够时才按标点边界兜底切。
             _segs: list[str] = []
             _how = ""
+            # 段数上限：空行 / 一行一条这两条协议以前**没有收口**（只有语义切分走 split_message 的 6 段上限），
+            # 模型把「想多说」写成十几行短句时就整轮刷屏（真机一轮 9 条）。超出的并进最后一条，不丢字。
+            _cap = self._split_cap(cfg)
             _blocks = [b.strip() for b in re.split(r"\n\s*\n", raw_body or "") if b.strip()]
             if len(_blocks) >= 2:
+                if len(_blocks) > _cap:
+                    _blocks = _blocks[: _cap - 1] + ["\n".join(_blocks[_cap - 1:])]
+                    logger.info(f"[StarHeart] 输出分段收口：空行协议超上限，合并到 {_cap} 段")
                 _segs = [engine.apply_typo(engine.tidy_output(b), typo_mode, cfg.get("output_typo_rate")) for b in _blocks]
                 _how = "空行协议"
             else:
                 _ls = [ln.strip() for ln in text.split("\n") if ln.strip()]
                 if len(_ls) >= 2 and max(len(ln) for ln in _ls) <= 12 and "\n\n" not in text:
+                    if len(_ls) > _cap:
+                        _ls = _ls[: _cap - 1] + ["\n".join(_ls[_cap - 1:])]
                     _segs, _how = _ls, "一行一条"
                 elif engine.should_split(text):
-                    _segs, _how = engine.split_message(text), "语义切分"
+                    _segs, _how = engine.split_message(text, max_seg=_cap), "语义切分"
             if bool(cfg.get("output_split_messages", False)) and len(_segs) > 1:
                 comps[0].text = _segs[0]
                 for c in comps[1:]:
                     c.text = ""
                 plan = [("text", seg) for seg in _segs[1:]] + plan
-                logger.info(f"[StarHeart] 输出分段：首条 + 补发 {len(_segs) - 1} 条（{_how}）")
+                logger.info(f"[StarHeart] 输出分段：首条 + 补发 {len(_segs) - 1} 条（{_how}；上限 {_cap}）")
             if plan:
-                self._spawn(self._send_followups(session, plan, cfg), label="output-followups")
+                # 记账口径：首条已由管线发出（index 0），补发从 1 起；
+                # 总段数 = 首条 + 文本补发 + 表情/语音（原实现漏了首条，seg_index 还会重复记 0）。
+                _extras = sum(1 for _k, _v in plan if _k != "text")
+                _total = (len(_segs) if len(_segs) > 1 else 1) + _extras
+                self._spawn(self._send_followups(session, plan, cfg, seg_offset=1, seg_total=_total),
+                            label="output-followups")
+                return _total
         except Exception as exc:                            # noqa: BLE001 首条不受影响
             logger.warning(f"[StarHeart] 输出拟人计划失败（首条不受影响）：{exc}")
+        return 1
 
     def _typing_delay(self, text: str, cfg: dict[str, Any]) -> float:
         """打字时长 = 每字秒数 × 字数，封顶 output_typing_max；关掉就是 0（立刻发）。"""
@@ -3622,6 +4052,7 @@ class StarHeartPlugin(Star):
         ("/hf on | off", "总开关（关掉后StarHeart彻底不介入）"),
         ("/hf recall 关键词", "混合召回测试（关键词 + 向量 → RRF）"),
         ("/hf mem <记忆ID>", "看某条记忆的详情"),
+        ("/hf mute <记忆ID> [off]", "别再提这条记忆（冷处理：不进召回与主动开口；off 恢复）"),
         ("/hf gate [条数]", "最近的门控决策"),
         ("/hf fav [用户ID]", "好感概览；加 /hf fav set <用户ID> <增减> [理由] 可手调"),
         ("/hf expr", "表达习惯概览（学来的说法 + 最近轨迹）"),
@@ -3718,7 +4149,10 @@ class StarHeartPlugin(Star):
         """查看当前会话 ID / 用户 ID / 人格"""
         try:
             try:
-                persona = await self._active_persona_id()
+                persona = await self._active_persona_id(
+                    str(getattr(event, "unified_msg_origin", "") or ""),
+                    platform_name=str(event.get_platform_name() or ""),
+                )
             except Exception:                               # noqa: BLE001 人格拿不到不该让整条指令失败
                 persona = "（读取失败）"
             lines = [
@@ -3819,6 +4253,193 @@ class StarHeartPlugin(Star):
         except Exception as exc:                            # noqa: BLE001
             logger.warning(f"[StarHeart] /hf mem 失败：{exc}")
             yield event.plain_result(f"/hf mem 执行出错：{str(exc)[:120]}")
+
+    @filter.permission_type(PermissionType.ADMIN)
+    @hf.command("mute")
+    async def hf_mute(self, event: AstrMessageEvent):
+        """别再提这条记忆：/hf mute <记忆ID> [off]"""
+        try:
+            if not await self._cmd_ready():
+                yield event.plain_result("StarHeart尚未初始化完成，请稍后重试")
+                return
+            parts = self._cmd_arg(event, 2).split()
+            if not parts:
+                yield event.plain_result(
+                    "用法：/hf mute <记忆ID>（恢复：/hf mute <记忆ID> off）\n先 /hf recall 关键词 找到 ID")
+                return
+            mid = parts[0]
+            off = len(parts) > 1 and parts[1].lower() in ("off", "0", "false", "取消", "恢复")
+            if off:
+                res = await self.service.memory_mute(mid, False)
+            else:
+                # 顺手标成 test 来源：这条多半是当初拿测试句喂进来的，
+                # 留个标签，面板筛选时一眼能认出来（真正的开关仍是 muted）。
+                res = await self.service.memory_mute(mid, True, source_mode="test")
+            if not res.get("ok"):
+                yield event.plain_result(f"没找到记忆 {mid}")
+                return
+            if off:
+                yield event.plain_result(f"{mid} 已恢复：重新参与召回与主动开口")
+            else:
+                yield event.plain_result(f"{mid} 已冷处理：不再进召回与主动开口（/hf mute {mid} off 可恢复）")
+        except Exception as exc:                            # noqa: BLE001
+            logger.warning(f"[StarHeart] /hf mute 失败：{exc}")
+            yield event.plain_result(f"/hf mute 执行出错：{str(exc)[:120]}")
+
+    @filter.permission_type(PermissionType.ADMIN)
+    @hf.command("v2")
+    async def hf_v2(self, event: AstrMessageEvent):
+        """v2 记忆：status / migrate / shadow on|off / on|off"""
+        try:
+            if not await self._cmd_ready():
+                yield event.plain_result("StarHeart尚未初始化完成，请稍后重试")
+                return
+            parts = self._cmd_arg(event, 2).split()
+            sub = (parts[0] if parts else "status").lower()
+            if sub == "migrate":
+                res = await self.store.migrate_v1_to_v2()
+                yield event.plain_result(
+                    "v2 迁移完成："
+                    f"源 {res['total']} / 新增 {res['inserted']} / 跳过 {res['skipped']} / "
+                    f"向量 {res['vectors']} / 实体边 {res['edges']} / 错误 {res['errors']}"
+                )
+                return
+            if sub in ("extract", "run"):
+                # 手动跑抽取：不依赖全局开关，先把 pending 的 episode 消化掉
+                from .core import memory_v2 as v2mem
+
+                rows = await (await self.store.db.execute(
+                    "SELECT id FROM episodes WHERE extract_state IN ('pending','failed') "
+                    "ORDER BY id LIMIT 5")).fetchall()
+                if not rows:
+                    yield event.plain_result(
+                        "没有待抽取的 episode（先聊几轮攒原文；影子写开着就会自动攒）")
+                    return
+                _cfg = dict(await self.service.config())
+                _cfg["v2_enabled"] = True
+                out = []
+                for r in rows:
+                    eid = int(r["id"])
+                    try:
+                        s = await v2mem.write_episode(self, eid, _cfg)
+                        out.append(
+                            f"· ep{eid}: 抽出 {s.get('extracted', 0)} / 写入 {s.get('written', 0)} / "
+                            f"合并 {s.get('merged', 0)} / 跳过 {s.get('noop', 0)} / "
+                            f"错误 {s.get('errors', 0)}"
+                            + (f"（{s.get('reason')}）" if s.get("reason") else ""))
+                    except Exception as exc:                # noqa: BLE001
+                        out.append(f"· ep{eid}: 失败 {str(exc)[:80]}")
+                yield event.plain_result("v2 抽取完成：\n" + "\n".join(out))
+                return
+            if sub == "shadow":
+                val = (parts[1] if len(parts) > 1 else "").lower()
+                if val not in ("on", "off"):
+                    yield event.plain_result("用法：/hf v2 shadow on|off")
+                    return
+                await self.service.save_config({"v2_shadow_write": val == "on"})
+                await self.service.config_save_sync()
+                yield event.plain_result(
+                    "v2 影子写：" + ("已开启（只落 episode 原文，不抽取、不影响主链路）" if val == "on" else "已关闭")
+                )
+                return
+            if sub in ("on", "off"):
+                await self.service.save_config({"v2_enabled": sub == "on"})
+                await self.service.config_save_sync()
+                yield event.plain_result("v2 召回：" + ("已开启" if sub == "on" else "已关闭（旧链路照旧）"))
+                return
+            cfg = await self.service.config()
+            counts = await self.store.v2_counts()
+            lines = [
+                "v2 状态：",
+                f"· 召回开关 v2_enabled={bool(cfg.get('v2_enabled'))}",
+                f"· 影子写 v2_shadow_write={bool(cfg.get('v2_shadow_write'))}",
+                f"· 巩固 v2_consolidate_enabled={bool(cfg.get('v2_consolidate_enabled'))}",
+            ]
+            lines += [f"· {k}：{v}" for k, v in counts.items()]
+            lines.append("命令：/hf v2 migrate | shadow on|off | on|off")
+            yield event.plain_result("\n".join(lines))
+        except Exception as exc:                            # noqa: BLE001
+            logger.warning(f"[StarHeart] /hf v2 失败：{exc}")
+            yield event.plain_result(f"/hf v2 执行出错：{str(exc)[:160]}")
+
+    @filter.permission_type(PermissionType.ADMIN)
+    @hf.command("style")
+    async def hf_style(self, event: AstrMessageEvent):
+        """语言学习：status / learn / list / show / on|off / mode legacy|new"""
+        try:
+            if not await self._cmd_ready():
+                yield event.plain_result("StarHeart尚未初始化完成，请稍后重试")
+                return
+            parts = self._cmd_arg(event, 2).split()
+            sub = (parts[0] if parts else "status").lower()
+            cfg = await self.service.config()
+            if sub == "learn":
+                from .core import style_memory as style_mod
+
+                pid = await self.service._active_pid()
+                res = await style_mod.run_learn(self, cfg, pid or "")
+                if not res.get("ok"):
+                    yield event.plain_result(
+                        f"这轮没学到：{res.get('reason')}（新记忆 {res.get('fresh')} 条）")
+                    return
+                yield event.plain_result(
+                    f"学完了：{res['saved']} 条原话 / {res['styles']} 种回复方式 / "
+                    f"词条 +{res['terms']} / 其中被纠正 {res['fixed']} 条")
+                return
+            if sub == "list":
+                styles = await self.store.list_styles("")
+                if not styles:
+                    yield event.plain_result("还没有回复方式，先 /hf style learn")
+                    return
+                lines = []
+                for s in styles[:6]:
+                    quotes = await self.store.list_quotes("", int(s["id"]), status="active")
+                    first = str(quotes[0].get("quote"))[:20] if quotes else "（空）"
+                    lines.append(
+                        f"· {s['name']}（{len(quotes)} 条 · 命中 {s['hits']} / 纠正 {s['corrections']}）"
+                        f" 例：{first}"
+                    )
+                yield event.plain_result("回复方式：\n" + "\n".join(lines))
+                return
+            if sub == "show":
+                from .core import style_memory as style_mod
+
+                pid = await self._inject_persona_id(self._sid(event), use_cache=True)
+                _reg = "group" if "group" in str(self._sid(event)).lower() else "private"
+                blk = await style_mod.style_block(
+                    self.store,
+                    {**cfg, "expression_style_enabled": True},
+                    pid or "", _reg, event.message_str or "",
+                )
+                yield event.plain_result(blk or "（当前没有可注入的样本/词条）")
+                return
+            if sub in ("on", "off"):
+                await self.service.save_config({"expression_style_enabled": sub == "on"})
+                await self.service.config_save_sync()
+                yield event.plain_result(
+                    "新表达系统：" + ("已开启（记得 mode new）" if sub == "on" else "已关闭（旧规则照旧）"))
+                return
+            if sub == "mode":
+                val = (parts[1] if len(parts) > 1 else "").lower()
+                if val not in ("legacy", "new"):
+                    yield event.plain_result("用法：/hf style mode legacy|new")
+                    return
+                await self.service.save_config({"expression_style_inject_mode": val})
+                await self.service.config_save_sync()
+                yield event.plain_result(
+                    "注入模式：" + ("新·原话样本" if val == "new" else "旧·30 条规则"))
+                return
+            counts = await self.store.style_counts()
+            yield event.plain_result(
+                "语言学习：\n"
+                f"· 开关 {bool(cfg.get('expression_style_enabled'))} / "
+                f"模式 {cfg.get('expression_style_inject_mode')}\n"
+                f"· bot 样本 {counts.get('bot')} / 人样本 {counts.get('human')} / "
+                f"词条 {counts.get('terms')}\n"
+                "命令：learn | list | show | on|off | mode legacy|new")
+        except Exception as exc:                            # noqa: BLE001
+            logger.warning(f"[StarHeart] /hf style 失败：{exc}")
+            yield event.plain_result(f"/hf style 出错：{str(exc)[:160]}")
 
     @filter.permission_type(PermissionType.ADMIN)
     @hf.command("gate")

@@ -5,11 +5,11 @@
  * 保存时只提交本页出现过的键，避免误改别的域。
  */
 
-import * as C from "./charts.js?v=1.0.2";
+import * as C from "./charts.js?v=1.0.3";
 import {
   $, $$, api, apiSafe, apiPostSafe, esc, fmtNum, fmtTime, toast, confirmModal, pageHead, card, mount, emptyBlock,
   skelBlock, refreshCurrent, normList, jsStr, configTouchedAt, noteConfigTouched, recentFirstKeys, takeConfigDirty, nativeWriteError,
-} from "./store.js?v=1.0.2";
+} from "./store.js?v=1.0.3";
 
 /** key -> [标签, 说明, 类型, min, max, step, 选项] */
 export const CONFIG_META = {
@@ -86,6 +86,7 @@ export const CONFIG_META = {
   proactive_note_max: ["知会最多几条", "主动消息知会最多带几条", "num", 1, 10, 1],
 
   output_split_messages: ["分段发送", "长回复按语义边界拆成多条发（短句不拆）", "bool"],
+  output_split_max: ["最多分几条", "一轮最多拆几条，超出并进最后一条（2–8）", "num", 2, 8, 1],
   output_typing_delay: ["打字延迟", "补发的后续条目按「每字秒数 × 字数」延迟（首条立即发）", "bool"],
   output_typing_per_char: ["每字秒数", "0.3 ≈ 一字 0.3 秒；低于 0.2 等于关掉打字节奏（保存时被拦下）", "num", 0.2, 2, 0.05],
   output_typing_max: ["单条延迟上限(秒)", "打字时长封顶，别等太久；低于 3 秒等于关掉打字延迟（保存时被拦下）", "num", 3, 30, 0.5],

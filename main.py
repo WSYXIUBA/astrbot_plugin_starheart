@@ -87,7 +87,7 @@ _CONTACT_SHAPE_KEYS = {
     "StarHeart",
     "肆一纸心",
     "记忆增强：把对话记成长期记忆，聊天时自动想起相关的；附带人物画像、关系与表达习惯，自带可视化面板。",
-    "1.0.3",
+    "1.0.4",
     "https://github.com/WSYXIUBA/astrbot_plugin_starheart",
 )
 class StarHeartPlugin(Star):
@@ -3568,10 +3568,8 @@ class StarHeartPlugin(Star):
         # 这条是「让 bot 自己控制分段」的关键：bot 空一行 = 它想分一条发，split_message() 就照办。
         if bool(cfg.get("output_split_messages", False)):
             sys_tail.append(
-                "【输出方式】分条 = 把同一段话顺着往下说、拆成几条发（一个空行 = 分成两条）。"
-                "不是让你列出几种说法或备选：每条必须接着上一条说新内容，"
-                "不能互相替代，也不能把同一个意思换个说法再说一遍。"
-                "同一条消息里不要出现空行。不想分条就一直连着写。"
+                "【输出方式】默认一条发完，一句话能说完就别拆。真的有两件事要分开说，才空一行，"
+                "一次最多两三条；短回复不用分。空行只表示「换一条发」，不是让你列备选。"
             )
         # 撤回知会：把对方最近撤回过的消息**一次**告诉 bot（下一轮它就知道"那条已经不算数"了），
         # 然后清掉。依据：AstrBot 的撤回通知不进对话历史，bot 本来永远不知情。
@@ -3868,10 +3866,14 @@ class StarHeartPlugin(Star):
             if not session:
                 return
             try:
-                logger.info(f"[StarHeart] 拟人计划：session={'有' if session else '空'} 正文长={len(body or '')} 分段开关={bool(cfg.get('output_split_messages', False))} should_split={engine.should_split(body or '')} 延迟开关={bool(cfg.get('output_typing_delay', True))}")
-            except Exception:                               # noqa: BLE001
+                _has_blank = bool(re.search(r"\n\s*\n", raw_body or body or ""))
+                logger.info(
+                    f"[StarHeart] 拟人计划：session={'有' if session else '空'} 正文长={len(body or '')} "
+                    f"分段开关={bool(cfg.get('output_split_messages', False))} 空行={'有' if _has_blank else '无'} "
+                    f"延迟开关={bool(cfg.get('output_typing_delay', True))}"
+                )
+            except Exception:                               # noqa: BLE001 打点失败不影响拟人
                 pass
-                return
             plan: list[tuple[str, str]] = []
             text = body
             # ① 表情包：回复里带 [表情] 标记 → 从「表情包槽位」指定的目录随机发一张
@@ -3888,32 +3890,17 @@ class StarHeartPlugin(Star):
             voice_slot = str(cfg.get("voice_slot") or "off").strip()
             if text and voice_slot.lower() not in ("off", "none", ""):
                 plan.append(("voice", text))
-            # ③ 分段（三条协议，优先级从上到下）：
-            #    ①「空行协议」= bot 自己写的空行，表示「这里换一条发」——每段发什么、发多长全由它决定。
-            #      必须用分词前的 raw_body 判定：tidy_output 会把空行压掉，用 body 判等于协议永不生效。
-            #    ②「一行一条」= 整段没有空行、但每行都很短（如 1/2/3…一条一个数字）时按单换行切。
-            #    ③「语义切分」= 前两条都不成立、且长度与断点够时才按标点边界兜底切。
-            _segs: list[str] = []
-            _how = ""
-            # 段数上限：空行 / 一行一条这两条协议以前**没有收口**（只有语义切分走 split_message 的 6 段上限），
-            # 模型把「想多说」写成十几行短句时就整轮刷屏（真机一轮 9 条）。超出的并进最后一条，不丢字。
+            # ③ 分段：分不分条由 bot 自己决定（engine.plan_segments，含「整条 <24 字不拆」的克制闸）。
+            #    以前还有一条「语义切分」兜底 —— 模型没打算分条，机器也按标点硬切成两条，
+            #    这就是「一句话敷衍也被拆」的来源；已删除，没有空行就整条发。
             _cap = self._split_cap(cfg)
-            _blocks = [b.strip() for b in re.split(r"\n\s*\n", raw_body or "") if b.strip()]
-            if len(_blocks) >= 2:
-                if len(_blocks) > _cap:
-                    _blocks = _blocks[: _cap - 1] + ["\n".join(_blocks[_cap - 1:])]
+            _segs, _how = engine.plan_segments(raw_body, text, cap=_cap)
+            if _how == "空行协议":
+                _raw_blocks = [b for b in re.split(r"\n\s*\n", raw_body or "") if b.strip()]
+                if len(_raw_blocks) > _cap:
                     logger.info(f"[StarHeart] 输出分段收口：空行协议超上限，合并到 {_cap} 段")
-                _segs = [engine.apply_typo(engine.tidy_output(b), typo_mode, cfg.get("output_typo_rate")) for b in _blocks]
-                _how = "空行协议"
-            else:
-                _ls = [ln.strip() for ln in text.split("\n") if ln.strip()]
-                if len(_ls) >= 2 and max(len(ln) for ln in _ls) <= 12 and "\n\n" not in text:
-                    if len(_ls) > _cap:
-                        _ls = _ls[: _cap - 1] + ["\n".join(_ls[_cap - 1:])]
-                    _segs, _how = _ls, "一行一条"
-                elif engine.should_split(text):
-                    _segs, _how = engine.split_message(text, max_seg=_cap), "语义切分"
             if bool(cfg.get("output_split_messages", False)) and len(_segs) > 1:
+                _segs = [engine.apply_typo(engine.tidy_output(s), typo_mode, cfg.get("output_typo_rate")) for s in _segs]
                 comps[0].text = _segs[0]
                 for c in comps[1:]:
                     c.text = ""

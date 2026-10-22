@@ -13,6 +13,7 @@ from astrbot.api import logger
 from astrbot.api.web import error_response, json_response, request, stream_response
 
 from .service import StarHeartService
+from .actor import ActorView
 
 PLUGIN_NAME = "astrbot_plugin_starheart"
 PAGE_PREFIX = f"/{PLUGIN_NAME}/page"
@@ -35,6 +36,7 @@ class PageApi:
     def __init__(self, plugin) -> None:
         self.plugin = plugin
         self.service: StarHeartService = plugin.service
+        self.actor = ActorView(self.service)
 
     # ---------------- 注册 ----------------
     def register_routes(self) -> None:
@@ -164,6 +166,22 @@ class PageApi:
             ("memory/lifecycle/run", self.memory_lifecycle_run, "POST"),
             # 拟人指标（六指标 + 长度分布 + 门控因子分布；每项带 n 与 state）
             ("metrics", self.metrics, "GET"),
+            # 人格与表达（合并页）：四个页签 + 来处 + 只读注入预览
+            ("actor/overview", self.actor_overview, "GET"),
+            ("actor/review", self.actor_review, "GET"),
+            ("actor/voice", self.actor_voice, "GET"),
+            ("actor/personas", self.actor_personas, "GET"),
+            ("actor/revisions", self.actor_revisions, "GET"),
+            ("actor/provenance", self.actor_provenance, "GET"),
+            ("actor/preview", self.actor_preview, "POST"),
+            ("actor/review/decide", self.actor_decide, "POST"),
+            ("actor/voice/save", self.actor_voice_save, "POST"),
+            ("actor/voice/status", self.actor_voice_status, "POST"),
+            ("actor/voice/delete", self.actor_voice_delete, "POST"),
+            ("actor/persona/save", self.actor_persona_save, "POST"),
+            ("actor/revision/decide", self.actor_revision_decide, "POST"),
+            ("actor/revision/rollback", self.actor_revision_rollback, "POST"),
+            ("actor/learn", self.style_learn, "POST"),
         ]
         for path, handler, method in routes:
             register(f"{PAGE_PREFIX}/{path}", self._guard(path, handler), [method], f"StarHeart page {path}")
@@ -1038,3 +1056,106 @@ class PageApi:
         limit = min(200, max(10, request.query.get("limit", 60, type=int) or 60))
         session_id = request.query.get("session_id", "") or ""
         return json_response(await self.service.message_hub(limit=limit, session_id=session_id))
+
+    # ---------------- 人格与表达（合并页） ----------------
+    async def actor_overview(self):
+        return json_response(await self.actor.overview())
+
+    async def actor_review(self):
+        return json_response(await self.actor.review(_int_q("limit", 100, 1, 500)))
+
+    async def actor_voice(self):
+        return json_response(await self.actor.voice(request.query.get("persona_id", "") or ""))
+
+    async def actor_personas(self):
+        return json_response(await self.actor.personas())
+
+    async def actor_revisions(self):
+        return json_response(await self.actor.revisions(request.query.get("persona_id", "") or ""))
+
+    async def actor_provenance(self):
+        try:
+            ident = int(request.query.get("id", 0, type=int) or 0)
+        except (TypeError, ValueError):
+            ident = 0
+        if not ident:
+            return error_response("id required")
+        return json_response(await self.actor.provenance(
+            request.query.get("kind", "") or "", ident))
+
+    async def actor_preview(self):
+        payload = await request.json(default={})
+        return json_response(await self.actor.preview(
+            str(payload.get("persona_id") or ""),
+            str(payload.get("register") or "private"),
+            str(payload.get("message") or ""),
+        ))
+
+    async def actor_decide(self):
+        payload = await request.json(default={})
+        try:
+            ident = int(payload.get("id") or 0)
+        except (TypeError, ValueError):
+            ident = 0
+        if not ident:
+            return error_response("id required")
+        return json_response(await self.actor.decide(
+            str(payload.get("kind") or ""), ident,
+            str(payload.get("action") or ""), str(payload.get("reason") or "")))
+
+    async def actor_voice_save(self):
+        payload = await request.json(default={})
+        try:
+            ident = int(payload.get("id") or 0)
+        except (TypeError, ValueError):
+            ident = 0
+        if not ident:
+            return error_response("id required")
+        return json_response(await self.actor.voice_save(
+            str(payload.get("kind") or ""), ident, payload.get("fields") or {}))
+
+    async def actor_voice_status(self):
+        payload = await request.json(default={})
+        try:
+            ident = int(payload.get("id") or 0)
+        except (TypeError, ValueError):
+            ident = 0
+        if not ident:
+            return error_response("id required")
+        return json_response(await self.actor.voice_status(
+            str(payload.get("kind") or ""), ident, str(payload.get("status") or "")))
+
+    async def actor_voice_delete(self):
+        payload = await request.json(default={})
+        try:
+            ident = int(payload.get("id") or 0)
+        except (TypeError, ValueError):
+            ident = 0
+        if not ident:
+            return error_response("id required")
+        return json_response(await self.actor.voice_delete(
+            str(payload.get("kind") or ""), ident))
+
+    async def actor_persona_save(self):
+        payload = await request.json(default={})
+        return json_response(await self.actor.persona_save(payload))
+
+    async def actor_revision_decide(self):
+        payload = await request.json(default={})
+        try:
+            ident = int(payload.get("id") or 0)
+        except (TypeError, ValueError):
+            ident = 0
+        if not ident:
+            return error_response("id required")
+        return json_response(await self.actor.revision_decide(ident, bool(payload.get("approve"))))
+
+    async def actor_revision_rollback(self):
+        payload = await request.json(default={})
+        try:
+            ident = int(payload.get("id") or 0)
+        except (TypeError, ValueError):
+            ident = 0
+        if not ident:
+            return error_response("id required")
+        return json_response(await self.actor.revision_rollback(ident))

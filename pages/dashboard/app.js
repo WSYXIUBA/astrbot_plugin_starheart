@@ -7,17 +7,18 @@
  * 「先读到数据再画」，不会出现图表画在空容器上的空白页。
  */
 
-import * as charts from "./charts.js?v=1.0.3";
-import { MemoryGraph } from "./graph.js?v=1.0.3";
-import { Graph3D } from "./graph3d.js?v=1.0.3";
+import * as charts from "./charts.js?v=1.0.4";
+import { MemoryGraph } from "./graph.js?v=1.0.4";
+import { Graph3D } from "./graph3d.js?v=1.0.4";
 import {
   $, $$, STATE, initBridge, setLive, setRefreshHook, goPage, toggleTheme, toast, openDrawer, closeDrawer, esc,
    syncSeg, jsStr, emptyBlock, refreshCurrent, hfGoParams, consumeParamsAnchor, noteConfigDirty,
-} from "./store.js?v=1.0.3";
-import * as mem from "./views-memory.js?v=1.0.3";
-import * as evt from "./views-events.js?v=1.0.3";
-import * as sys from "./views-system.js?v=1.0.3";
-import { hfSaveDomain } from "./views-conf.js?v=1.0.3";
+} from "./store.js?v=1.0.4";
+import * as mem from "./views-memory.js?v=1.0.4";
+import * as evt from "./views-events.js?v=1.0.4";
+import * as sys from "./views-system.js?v=1.0.4";
+import * as act from "./views-actor.js?v=1.0.4";
+import { hfSaveDomain } from "./views-conf.js?v=1.0.4";
 
 /* ---------------- 页面表 ---------------- */
 const PAGES = {
@@ -35,14 +36,17 @@ const PAGES = {
     render: (sub) =>
       sub === "list" ? mem.renderMemoryList() : sub === "person" ? mem.renderPersons() : sub === "conf" ? mem.renderMemoryConf() : mem.renderGraph(),
   },
-  expression: {
-    title: "语言学习",
-    icon: "✎",
-    nav: "expression",
-    // 一页到底：主体是"学到的东西"，日志/参数/语料收进默认折叠区（不再拆子页）
-    // 只有一页（没有真正的二级页）→ 不摆子页签按钮，免得出现"点不动的假子菜单"
-    subs: [],
-    render: (sub) => (sub === "log" ? sys.renderExpressionLog() : sub === "conf" ? sys.renderExpressionConf() : sys.renderExpressionLib()),
+  actor: {
+    title: "人格与表达",
+    icon: "☺",
+    nav: "actor",
+    subs: [
+      { id: "review", label: "审核", hint: "表达 / 群内用语；人格提案去「人格」页（带左右对比）" },
+      { id: "voice", label: "表达", hint: "他平时怎么说话、说过的话、口头禅、群内用语；每条都能回到原对话" },
+      { id: "persona", label: "人格", hint: "人格本体与修订时间线；写入必须你批准" },
+      { id: "inject", label: "注入", hint: "这一轮 system / user 各带什么、丢弃了什么" },
+    ],
+    render: (sub) => act.renderActor(sub || "review"),
   },
   messages: {
     title: "消息事件",
@@ -61,16 +65,6 @@ const PAGES = {
     ],
     render: (sub) => evt.renderMsgDomain(sub || "hub"),
   },
-  persona: {
-    title: "人格管理",
-    icon: "☺",
-    nav: "persona",
-    subs: [
-      { id: "list", label: "人格列表" },
-      { id: "state", label: "状态与进化" },
-    ],
-    render: (sub) => (sub === "state" ? sys.renderPersonaState() : sys.renderPersonaList()),
-  },
   settings: {
     title: "设置",
     icon: "⚙",
@@ -86,7 +80,7 @@ const PAGES = {
   },
 };
 
-const DEFAULT_SUB = { memory: "graph", expression: "lib", messages: "hub", persona: "list", settings: "main" };
+const DEFAULT_SUB = { memory: "graph", actor: "review", messages: "hub", settings: "main" };
 
 /* ---------------- 路由 ---------------- */
 /** 上一次解析到的原始 hash：用来判断「这次是导航还是同 hash 的软刷新」
@@ -95,7 +89,16 @@ let lastRawHash = "";
 
 function parseHash() {
   const raw = String(location.hash || "").replace(/^#/, "").replace(/^\/+/, "");
-  const [page, sub, extra] = raw.split("/");
+  let [page, sub, extra] = raw.split("/");
+  // 老书签：语言学习 → 表达，人格管理 → 人格；旧页 id 不再进 PAGES。
+  if (page === "expression" || page === "persona") {
+    const legacySub = page === "expression" ? "voice" : "persona";
+    page = "actor";
+    sub = legacySub;
+    try {
+      if (location.hash !== `#actor/${sub}`) history.replaceState(null, "", `#actor/${sub}`);
+    } catch (err) { /* 沙箱里可能不允许改 URL，忽略 */ }
+  }
   const p = PAGES[page] ? page : "overview";
   let s = sub || DEFAULT_SUB[p] || "";
   // 老书签兼容：旧的子页 id 映射到新的域 + 域内页
@@ -358,7 +361,7 @@ function openHelp() {
       <b>好感</b>：daily 会冷却、lifetime 只增不减；分数不进 prompt，只有区间会变成语气。<br>
       <b>主动</b>：静默时长、每日上限、名单三重护栏，先开影子模式观察它想说什么；「主动设置」页里可以直接给某个人试发一条。<br>
       <b>设置</b>：模型分配、名单勾选、导入与数据治理（破坏性操作集中卡）。<br><br>
-      <span class="mut">顶栏的人格下拉只切换「记忆查看视角」，不会改 bot 实际人格；改实际人格请到「人格管理」。</span>
+      <span class="mut">顶栏的人格下拉只切换「记忆查看视角」，不会改 bot 实际人格；改实际人格请到「人格与表达 · 人格」。</span>
     </div>`
   );
 }
@@ -437,6 +440,22 @@ function bindActions() {
     hfTermDel: sys.hfTermDel,
     hfStyleTip: sys.hfStyleTip,
     hfStyleTipHide: sys.hfStyleTipHide,
+    // 人格与表达（合并页）
+    hfActorProv: act.hfActorProv,
+    hfActorLearn: act.hfActorLearn,
+    hfActorDecide: act.hfActorDecide,
+    hfActorFilter: act.hfActorFilter,
+    hfActorReg: act.hfActorReg,
+    hfActorPreview: act.hfActorPreview,
+    hfActorPersonaUse: act.hfActorPersonaUse,
+    hfActorPersonaSave: act.hfActorPersonaSave,
+    hfActorRevisionDecide: act.hfActorRevisionDecide,
+    hfActorRollback: act.hfActorRollback,
+    hfActorRename: act.hfActorRename,
+    hfActorEditQuote: act.hfActorEditQuote,
+    hfActorEditTerm: act.hfActorEditTerm,
+    hfActorStyleStatus: act.hfActorStyleStatus,
+    hfActorQuoteStatus: act.hfActorQuoteStatus,
     hfMemMute: mem.hfMemMute,
     hfMemFilter: mem.hfMemFilter,
     hfMemMaintain: mem.hfMemMaintain,

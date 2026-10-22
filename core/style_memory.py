@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-"""语言学习 v2：从记忆的原对话里学「回复方式」，注入逐字原话。
+"""语言学习 v2：从记忆的原对话里学「对方这个人怎么说话」，注入他的话当口吻样本。
 
 口径（用户 2026-10-21）：
 - 对话先落成记忆，每条记忆带原对话（hf_memories.evidence：`用户：… / 助手：…`）。
-- 学习 = 读这些原对话，把 bot 说过且被接住的话收成样本，按「回复方式」归组。
-- 一种回复方式可以由多条记忆累积、也可能被多条记忆纠正；不准的原话会被丢弃，准的继续用。
+- 学习 = 读这些原对话，把**对方**说过的句子收成样本，按「说话方式」归组。
+- 学的是人说话，不是 bot 自己说过的话（自我模仿只会越学越像 AI）。
 - 变旧不淘汰：只按 相关度 × 准确率 × 新近度 加权。
 - 注入只投逐字原话（附记忆出处），不投「情景→说法」这类要模型解释的规则。
 """
@@ -29,15 +29,15 @@ CORRECTION_PAT = re.compile(
 USER_LINE = re.compile(r"^\s*用户\s*[:：]\s*(.*)$")
 BOT_LINE = re.compile(r"^\s*(?:助手|bot|BOT|Bot)\s*[:：]\s*(.*)$")
 
-LEARN_SYSTEM = """你在帮一个聊天机器人整理「它自己怎么说话」。只输出 JSON。
+LEARN_SYSTEM = """你在帮一个聊天机器人学会「对面这个人平时怎么说话」。只输出 JSON。
 
-输入是它自己说过的短句，每行 `编号 | 记忆#id | 原话`。
-给每一条起一个「回复方式」的名字（2–8 个汉字），描述这句话属于哪种回法，例如：
-  嘴硬一句、认错/自嘲、被呛后软下来、陪着说话、短答敷衍、撒娇要人陪、认真接话。
-实在没有复用价值的（命令、报错、复述用户、纯表情）写「跳过」。
+输入是这个人自己发过的短句，每行 `编号 | 原话`。
+给每一条起一个「说话方式」的名字（2–8 个汉字），描述他这句话是怎么说的，例如：
+  短句直给、反问怼人、敷衍嗯哦、撒娇拖音、先骂后哄、认真讲道理、报点式、口头禅式。
+实在没有复用价值的（命令、链接、报错、复述别人、纯表情、纯数字）写「跳过」。
 
 输出（严格 JSON，不要解释、不要 markdown）：
-{"1":"嘴硬一句","2":"跳过","3":"陪着说话"}
+{"1":"短句直给","2":"跳过","3":"反问怼人"}
 """
 
 
@@ -61,6 +61,19 @@ def _split_role_lines(evidence: str) -> list[dict[str, Any]]:
         bubbles = [b.strip() for b in re.split(r"\n\s*\n", s["text"]) if b.strip()]
         if bubbles:
             out.append({"role": s["role"], "bubbles": bubbles})
+    return out
+
+
+def human_lines_from_memory(evidence: str) -> list[str]:
+    """一条记忆里「对方这个人」说过的句子（学的是人说话，不是 bot 自己）。"""
+    out: list[str] = []
+    for seg in _split_role_lines(evidence):
+        if seg["role"] != "user":
+            continue
+        for b in seg["bubbles"]:
+            t = canon_mod.clean(b).strip()
+            if t:
+                out.append(t)
     return out
 
 
@@ -160,7 +173,7 @@ def _register(session_id: str) -> str:
 
 
 async def run_learn(main, cfg: dict[str, Any], persona_id: str = "") -> dict[str, Any]:
-    """新记忆 → 代码挑候选原话 → 模型只起「回复方式」名字 → 入库。
+    """新记忆 → 代码挑出对方说过的话 → 模型只起「说话方式」名字 → 入库。
 
     为什么不让模型挑下标：真机上模型连续返回 `{"picks":[]}`（它不愿意按行号挑），
     而「哪些话是她说的、多长算短」其实代码能判。模型只做它擅长的：给这些原话归类命名。
@@ -208,18 +221,22 @@ async def run_learn(main, cfg: dict[str, Any], persona_id: str = "") -> dict[str
         stat["reason"] = "no_new_memory"
         return stat
 
-    # 代码挑候选：每个助手段落里 4–30 字的完整气泡，去掉好感标签/占位/元话术
+    # 学的是「对方这个人」怎么说话，不是 bot 自己怎么说话——拿 bot 的旧回复回来喂它，
+    # 只会自我模仿、越学越像 AI。每个记忆里取出对方说过的每一句当候选。
     cands: list[dict[str, Any]] = []
     for m in mems:
-        for t in turns_from_memory(m.get("evidence") or ""):
-            for b in t["bubbles"]:
-                b2 = canon_mod.clean(b).strip()
-                if not (4 <= len(b2) <= 30):
-                    continue
-                if canon_mod.looks_like_bot_meta(b2) or not re.search(r"[\u4e00-\u9fff]", b2):
-                    continue
-                cands.append({"mem": m, "turn": t, "quote": b2})
-    # 同一句话只留一次；库里已有的也不再收（跨批去重）
+        for line in human_lines_from_memory(m.get("evidence") or ""):
+            t = line.strip()
+            if not (4 <= len(t) <= 120):
+                continue
+            if not re.search(r"[\u4e00-\u9fff]", t):
+                continue
+            if canon_mod.looks_like_bot_meta(t):
+                continue
+            if t.startswith("/") or "http://" in t or "https://" in t:
+                continue
+            cands.append({"mem": m, "quote": t})
+    # 同一条回复只留一次；库里已有的也不再收（跨批去重）
     seen_q: set[str] = {str(q.get("quote") or "").strip() for q in await store.list_quotes(persona_id)}
     cands = [c for c in cands if not (c["quote"] in seen_q or seen_q.add(c["quote"]))]
     stat["cands"] = len(cands)
@@ -232,15 +249,15 @@ async def run_learn(main, cfg: dict[str, Any], persona_id: str = "") -> dict[str
         return stat
 
     listing = "\n".join(
-        f"{i}. 记忆#{int(c['mem'].get('id') or 0)} | {c['quote']}" for i, c in enumerate(cands, 1)
+        f"{i}. 记忆#{int(c['mem'].get('id') or 0)} | {c['quote'].replace(chr(10), ' / ')}" for i, c in enumerate(cands, 1)
     )
     existing = [str(x.get("name") or "") for x in await store.list_styles(persona_id)]
     existing = [x for x in existing if x]
     prompt = (
-        ("现有的回复方式（优先复用，不要造近义词）：" + "、".join(existing[:20]) + "\n"
-         "都不合适才新建，整批最多新建 3 种。名字太泛（陪着说话 / 其他 / 日常）就把里面最特别的那几条单独起个更具体的名字，不要全塞进一个。\n\n") if existing else
-        "还没有回复方式，给这批短句起名（整批最多 3 种）。\n\n"
-    ) + "它自己说过的短句：\n" + listing
+        ("现有的说话方式（优先复用，不要造近义词）：" + "、".join(existing[:20]) + "\n"
+         "都不合适才新建，整批最多新建 3 种。名字太泛（随口说 / 其他 / 日常）就把里面最特别的那几条单独起个更具体的名字，不要全塞进一个。\n\n") if existing else
+        "还没有说话方式的分类，给这批句子起名（整批最多 3 种）。\n\n"
+    ) + "他说过的话：\n" + listing
     gen = svc.system.get("llm_generate")
     if not callable(gen):
         stat["reason"] = "no_llm"
@@ -274,21 +291,17 @@ async def run_learn(main, cfg: dict[str, Any], persona_id: str = "") -> dict[str
         if name not in used_styles:
             used_styles.add(name)
             stat["styles"] += 1
-        t = c["turn"]
         qid = await store.upsert_quote({
             "style_id": sid, "persona_id": persona_id, "quote": c["quote"],
-            "trigger_text": t["trigger"], "memory_id": int(c["mem"].get("id") or 0),
+            "trigger_text": "", "memory_id": int(c["mem"].get("id") or 0),
             "session_id": str(c["mem"].get("session_id") or ""),
             "user_id": str(c["mem"].get("subject_id") or ""),
             "user_name": _user_name(c["mem"]),
             "register": _register(str(c["mem"].get("session_id") or "")),
-            "corrections": 1 if t["fixed"] else 0,
+            "corrections": 0,
         })
         if qid:
             stat["saved"] += 1
-            if t["fixed"]:
-                stat["fixed"] += 1
-                await store.bump_style(sid, corrections=1)
     stat["ok"] = stat["saved"] > 0
     if not stat["ok"]:
         stat["reason"] = "model_named_nothing"
@@ -356,34 +369,62 @@ def _accuracy(hits: int, corrections: int) -> float:
 
 # 人格里搬出来的那套说话方式（默认表达块）。
 # 学不到东西时用它；一旦学到原话，整块换成学到的内容（用户定的规则）。
-DEFAULT_RULES = (
-    "说话短 一条尽量二十字以内 能一个字回就一个字回 累了懒得回就说嗯 哦 6 行 随便 不知道\n"
-    "段内不换行 不用逗号 用空格隔开 喜欢用～拖音 不写旁白 不写括号动作 也不写笑"
+# 表达块的底线：长度与敷衍（任何模式都带 —— 学到的原话只补语气，不接管长度）。
+# 旧文案写「一条尽量二十字以内」，模型会理解成「每条 20 字、可以很多条」，
+# 于是每轮都排好几拍短句（真机 reasoning 原文：短句 空格 不用逗号 … 注意别太长，每条20字内）。
+BREVITY_RULE = (
+    "默认一句就够 十几字以内 说完就停 别一口气说好几件事 也别把一句话拆成几条\n"
+    "能敷衍就敷衍 嗯 哦 6 行 随便 都行 不解释 不追问 不总结 不写旁白 不写括号动作"
 )
+
+# 默认的表达块（没学到原话时用）。
+DEFAULT_RULES = BREVITY_RULE + "\n" + "段内不用逗号 用空格隔开 偶尔用～拖音"
 
 
 async def expression_block(store, cfg: dict[str, Any], persona_id: str,
-                           register: str, current_msg: str) -> str:
-    """人格之后、system 最末尾的表达块：默认规则，或整个换成学到的原话 + 黑话。"""
+                           register: str, current_msg: str, dry: bool = False) -> str:
+    """人格之后、system 最末尾的表达块：默认规则，或整个换成学到的原话 + 黑话。
+
+    dry=True 只编译、不记账（面板预览用）：预览不能改变命中与冷却。
+    """
     learned = bool(cfg.get("expression_style_enabled", False))
-    best = None
+    picked: list[dict[str, Any]] = []
+    part_names: list[str] = []
     parts: list[str] = []
     if learned:
         quotes = await store.list_quotes(persona_id, status="active")
-        quotes = [q for q in quotes if str(q.get("register") or "private") == register] or quotes
-        best_score = -1.0
-        for q in quotes:
-            sim = canon_mod.similar(str(q.get("trigger_text") or ""), str(current_msg or ""))
-            acc = _accuracy(int(q.get("hits") or 0), int(q.get("corrections") or 0))
-            age = max(0.0, time.time() - float(q.get("created_at") or 0)) / 86400.0
-            rec = 0.5 ** (age / 30.0)
-            score = 0.55 * sim + 0.3 * acc + 0.15 * rec
-            if score > best_score:
-                best, best_score = q, score
-    if best:
+        if quotes:
+            pool = [q for q in quotes if str(q.get("register") or "private") == register] or quotes
+            for q in sorted(pool, key=lambda x: float(x.get("created_at") or 0), reverse=True):
+                text = str(q.get("quote") or "").strip()
+                if not text:
+                    continue
+                # 对方刚说的这句不要再原样摆回去
+                if current_msg and canon_mod.similar(text, str(current_msg or "")) >= 0.72:
+                    continue
+                picked.append(q)
+                if len(picked) >= 2:
+                    break
+            # 「说话方式」就是学来的每句原话的提炼结果，注入时带上
+            try:
+                names = {int(s["id"]): str(s.get("name") or "") for s in await store.list_styles(persona_id)}
+                for q in picked:
+                    nm = names.get(int(q.get("style_id") or 0)) or ""
+                    if nm and nm not in part_names:
+                        part_names.append(nm)
+            except Exception:                                   # noqa: BLE001
+                part_names = part_names[:0]
+    if picked:
+        lines = "\n".join(
+            f"- 「{str(q.get('quote') or '').replace(chr(10), ' / ')[:60]}」" for q in picked
+        )
+        head = "【他平时的说话口吻】"
+        if part_names:
+            head += "他的几种习惯：" + "、".join(part_names[:4]) + "。"
+        parts.append(BREVITY_RULE)
         parts.append(
-            f"【你自己这么说过】「{str(best.get('quote'))[:60]}」\n"
-            f"（学语气，别逐字复述｜来自记忆 #{int(best.get('memory_id') or 0)}）"
+            head + "下面是**他过去**说过的句子，只学他的语气、句式和用词；"
+            "不是他现在说的话，也不要把这些句子回给他（别逐字复刻，别用客服腔）：\n" + lines
         )
     else:
         parts.append(DEFAULT_RULES)
@@ -397,12 +438,13 @@ async def expression_block(store, cfg: dict[str, Any], persona_id: str,
     if hits:
         parts.append("【黑话】" + "；".join(hits[:4]))
     block = "\n".join(parts)
-    if len(block) > 300:
-        block = block[:299] + "…"
-    if best:
+    if len(block) > 460:
+        block = block[:459] + "…"
+    if picked and not dry:
         try:
-            await store.bump_quote(int(best["id"]), hits=1)
-            await store.bump_style(int(best.get("style_id") or 0), hits=1)
+            for q in picked:
+                await store.bump_quote(int(q["id"]), hits=1)
+                await store.bump_style(int(q.get("style_id") or 0), hits=1)
         except Exception:                                   # noqa: BLE001
             pass
     return block

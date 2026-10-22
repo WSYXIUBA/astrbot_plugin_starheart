@@ -8,17 +8,17 @@
  * - 设置：模块开关 + 数据治理（破坏性操作集中卡），模块卡带状态灯。
  */
 
-import * as C from "./charts.js?v=1.0.3";
+import * as C from "./charts.js?v=1.0.4";
 import {
   $, $$, api, apiSafe, apiPostSafe, esc, fmtNum, fmtPct, fmt1, fmtTime, timeAgo, toast, openDrawer, closeDrawer,
   confirmModal, formModal, pageHead, card, kpiCard, kpis, secTitle, mount, emptyBlock, skelBlock, jsStr, STATE, segmentHtml,
   syncSeg, bridge, EP, refreshCurrent, goPage, countUp, configTouchedAt, noteConfigTouched, recentFirstKeys, takeConfigDirty, nativeWriteError,
-} from "./store.js?v=1.0.3";
-import { renderDomainConf, domainRowsHtml, CONFIG_META } from "./views-conf.js?v=1.0.3";
+} from "./store.js?v=1.0.4";
+import { renderDomainConf, domainRowsHtml, CONFIG_META } from "./views-conf.js?v=1.0.4";
 // 收尾批：四个消息域的参数渲染器（原页底折叠区）——原样迁进本文件的「设置 · 模块与参数」页
-import { renderGateConf, renderProactiveConf, renderRecallConf, renderFavourConf } from "./views-events.js?v=1.0.3";
-import { ATOM_LABEL } from "./views-memory.js?v=1.0.3";
-import { GRAPH_PALETTE } from "./graph.js?v=1.0.3";
+import { renderGateConf, renderProactiveConf, renderRecallConf, renderFavourConf } from "./views-events.js?v=1.0.4";
+import { ATOM_LABEL } from "./views-memory.js?v=1.0.4";
+import { GRAPH_PALETTE } from "./graph.js?v=1.0.4";
 
 // S4-2：「先审后用」开关挂语言学习域。CONFIG_META 由 views-conf.js 定义并被域页过滤读取，
 // 新键必须登记在这里，否则参数页不渲染、保存也会被 CONFIG_META 过滤掉（静默丢键）。
@@ -40,15 +40,16 @@ const MODULES = [
    总览
    ================================================================== */
 export async function renderOverview() {
-  const [ov, gate, gstats] = await Promise.all([
+  const [ov, gate, gstats, voice] = await Promise.all([
     api("overview"),
     apiSafe("gate", { limit: 40 }, { items: [], total: 0 }),
     apiSafe("graph/stats", {}, {}),
+    apiSafe("actor/voice", {}, { styles: [], terms: [], jargon: [], counts: {} }),
   ]);
+  const vc = (voice && voice.counts) || {};
   STATE.overview = ov;
   STATE.graphStats = gstats;
   const c = ov.config || {};
-  const lm = ov.livingmemory || {};
   const cap = ov.capture || {};
   const gateItems = gate.items || [];
   const trigger = gateItems.filter((g) => g.decision === "reply").length;
@@ -72,9 +73,8 @@ export async function renderOverview() {
         : "—（后端未提供队列状态，不当作 0）" },
     { n: "门控" + (c.gate_shadow ? "（影子）" : ""), ok: !!c.gate_enabled, d: c.gate_shadow ? "只记录不拦截" : "低于阈值会沉默" },
     { n: "关系链", ok: !gstatsErr && (gstats.avg_degree || 0) > 0.3, d: chainSub },
-    { n: "语言学习", ok: !!c.output_enabled, d: `习惯 ${fmtNum(ov.habits)} 条` },
+    { n: "表达学习", ok: !!(vc.styles || vc.quotes), d: `${fmtNum(vc.styles || 0)} 种回复方式 · ${fmtNum(vc.quotes || 0)} 段原话` },
     { n: "主动消息", ok: !!c.proactive_enabled, d: c.proactive_enabled ? "已启用" : "未启用（默认关）" },
-    { n: "LivingMemory", ok: !!lm.installed, d: lm.installed ? `可导入 ${fmtNum((lm.documents || 0) + (lm.atoms || 0))} 条 · 已导入 ${fmtNum(lm.imported)}` : "未检测到该插件" },
     { n: "好感结算", ok: !!c.favour_enabled, d: `跟踪 ${fmtNum(ov.favours)} 人` },
     // 门控流水读不到时也显式说出来，别让它静默变成「0 条流水」
     ...(gateErr ? [{ n: "门控流水", ok: false, d: `⚠ 读取失败：${gateErr}` }] : []),
@@ -109,7 +109,7 @@ export async function renderOverview() {
       </div>
       <div class="row bt wrap" style="gap:9px;margin-top:11px;padding-top:9px;border-top:1px solid var(--bd)">
         ${cap.parked ? `<button class="btn xs" onclick="hfCaptureRetry(this)">重试停摆队列（${fmtNum(cap.parked)}）</button>` : ""}
-        <button class="btn xs" onclick="goPage('expression')">去语言学习 →</button>
+        <button class="btn xs" onclick="goPage('actor','review')">去人格与表达 →</button>
       </div>`,
       { title: "模块状态", sub: "按当前配置实时判定" }
     )}
@@ -120,18 +120,7 @@ export async function renderOverview() {
   </div>
   <div class="grid g23 sec">
     ${card(`<div id="ovFeed"></div>`, { title: "最近决策", sub: "倒序 · 点「决策流水」看完整因子分解", actions: `<button class="btn xs" onclick="goPage('messages','gate')">全部 →</button>` })}
-    ${card(
-      `<table><tbody>${
-        (ov.recent_batches || [])
-          .map(
-            (b) =>
-              `<tr><td>⬇ 记忆导入</td><td class="mut">${fmtTime(b.started_at)}</td>
-               <td><span class="tag ${b.status === "done" ? "ok" : "info"}">+${fmtNum(b.imported)} / 跳过 ${fmtNum(b.skipped)} / 失败 ${fmtNum(b.failed)}</span></td></tr>`
-          )
-          .join("") || `<tr><td class="mut">还没有导入记录</td><td></td><td><span class="tag gy">空闲</span></td></tr>`
-      }</tbody></table>`,
-      { title: "后台任务", sub: "最近三次记忆导入" }
-    )}
+    ${card(`<div id="ovVoice"></div>`, { title: "表达库构成", sub: "学到的说法按类型分；口头禅命中才进提示词，群内用语只用于听懂", actions: `<button class="btn xs" onclick="goPage('actor','voice')">打开 →</button>` })}
   </div>`;
   return {
     html,
@@ -142,7 +131,7 @@ export async function renderOverview() {
         { id: "msg", stage: 0, label: "消息进来", icon: "✉", value: fmtNum(ov.gate_total), unit: "次评估", sub: "收到并被评估的消息", color: "#3c96ca", to: ["messages", "gate"] },
         { id: "gate", stage: 1, label: "门控决策", icon: "◐", value: fmtPct(ov.gate_rate, 1), unit: "开口率", sub: c.gate_shadow ? "影子模式：只记录不拦" : "低于阈值会沉默", color: "#03c9d7", to: ["messages", "gate"] },
         { id: "mem", stage: 2, label: "记忆库", icon: "◍", value: fmtNum(ov.memories), unit: "条", sub: `实体 ${fmtNum(ov.entities)} · 平均强度 ${fmt1(ov.memory_avg_strength)}`, color: "#4a90d9", to: ["memory", "graph"] },
-        { id: "exp", stage: 2, label: "语言学习", icon: "✎", value: fmtNum(ov.habits), unit: "条习惯", sub: c.output_enabled ? "会按习惯说话" : "输出拟人化未开", color: "#8b5cf6", to: ["expression", "lib"] },
+        { id: "exp", stage: 2, label: "人格与表达", icon: "✎", value: fmtNum(vc.styles || 0), unit: "种说法", sub: `${fmtNum(vc.quotes || 0)} 段原话 · 下一轮按相关度挑一条`, color: "#8b5cf6", to: ["actor", "voice"] },
         { id: "link", stage: 3, label: "关系链", icon: "⬡", value: fmtNum(ov.edges), unit: "条边", sub: chainSub, color: "#00c853", to: ["memory", "graph"] },
         { id: "fav", stage: 3, label: "好感结算", icon: "♥", value: fmtNum(ov.favours), unit: "人", sub: "区间会变成语气描述", color: "#e0559a", to: ["messages", "favour"] },
         { id: "out", stage: 4, label: "回复输出", icon: "➤", value: on(c.output_enabled), unit: "", sub: "拟人化 / 分条 / 错别字", color: "#f59e0b", to: ["settings", "main"] },
@@ -151,7 +140,7 @@ export async function renderOverview() {
       const flowLinks = [
         { from: "msg", to: "gate", value: ov.gate_total || 1 },
         { from: "gate", to: "mem", value: ov.memories || 1 },
-        { from: "gate", to: "exp", value: ov.habits || 1 },
+        { from: "gate", to: "exp", value: vc.quotes || 1 },
         { from: "gate", to: "fav", value: ov.favours || 1 },
         { from: "mem", to: "link", value: ov.edges || 1 },
         { from: "mem", to: "pro", value: ov.memories || 1 },
@@ -181,6 +170,17 @@ export async function renderOverview() {
       mount(host, "#ovTypes", (el) =>
         C.barSplit(el, {
           items: Object.keys(byType).map((k) => ({ label: ATOM_LABEL[k] || k, value: byType[k], color: ATOM_COLOR[k] })),
+          height: 18,
+        })
+      );
+      mount(host, "#ovVoice", (el) =>
+        C.barSplit(el, {
+          items: [
+            { label: "说话方式", value: vc.styles || 0, color: "#8b5cf6" },
+            { label: "原话", value: vc.quotes || 0, color: "#4a90d9" },
+            { label: "口头禅", value: vc.terms || 0, color: "#00c853" },
+            { label: "群内用语", value: vc.jargon || 0, color: "#f59e0b" },
+          ],
           height: 18,
         })
       );
@@ -278,11 +278,11 @@ export async function syncExpressionBadge(n) {
     ensureHbBadgeCss();
     const nav = document.getElementById("railNav");
     if (!nav) return;
-    const btn = nav.querySelector('[data-nav="expression"]');
+    const btn = nav.querySelector('[data-nav="actor"]');
     if (!btn) return;
     let num = n;
     if (num === undefined || num === null) {
-      const r = await apiSafe("expr/review", {}, { counts: {} });
+      const r = await apiSafe("actor/overview", {}, { counts: {} });
       num = Number((((r || {}).counts) || {}).pending || 0);
     }
     num = Math.max(0, Number(num) || 0);
@@ -297,7 +297,7 @@ export async function syncExpressionBadge(n) {
       btn.appendChild(el);
     }
     el.textContent = String(num);
-    el.title = `待审 ${num} 条表达`;
+    el.title = `待审 ${num} 条（表达 / 群内用语 / 人格提案）`;
   } catch (err) {
     /* 徽标拿不到就不显示 */
   }
@@ -1244,7 +1244,7 @@ export async function renderExpressionConf(opts = {}) {
         模型在「设置 → 模型分配 → 表达提取」里指定。</div>
        <div class="row" style="gap:6px;margin-top:10px">
          <button class="btn s" onclick="goPage('settings','models')">去配模型</button>
-         <button class="btn s" onclick="goPage('expression','lib')">去习惯库</button>
+         <button class="btn s" onclick="goPage('actor','voice')">去表达库</button>
        </div>`,
       { title: "学习链路" }
     ),
@@ -1300,7 +1300,7 @@ export async function renderPersonaList() {
       `<div class="mut" style="font-size:11.5px;line-height:1.8">
         人格只有一套：AstrBot 原生人格。<br>
         记忆按人格隔离：切换人格后，记忆库与图谱只显示当前人格的数据（顶栏可临时切换查看视角）。</div>
-       <div class="row" style="gap:6px;margin-top:10px"><button class="btn s" onclick="goPage('persona','state')">人格状态与进化 →</button></div>`,
+       <div class="row" style="gap:6px;margin-top:10px"><button class="btn s" onclick="goPage('actor','persona')">人格与表达 →</button></div>`,
       { title: "人格与记忆" }
     )}
     ${card(`<div id="psDist"></div>`, { title: "记忆的人格分布", sub: "各人格下沉淀了多少条记忆（空人格=未归属）" })}

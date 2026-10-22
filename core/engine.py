@@ -533,6 +533,65 @@ def should_split(text: str, *, min_len: int = 40, max_seg: int = 4) -> bool:
     return sum(body.count(c) for c in _SPLIT_END) >= 2
 
 
+def _merge_tiny(segs: list[str], *, min_len: int = 6) -> list[str]:
+    """把「嗯」「好」这种极短段并进相邻段：真人不会为一个字单发一条。"""
+    out: list[str] = []
+    for s in segs:
+        s = str(s or "").strip()
+        if not s:
+            continue
+        if out and len(s) < min_len:
+            out[-1] = out[-1] + "\n" + s
+        elif not out and len(s) < min_len and len(segs) > 1:
+            out.append(s)          # 开头太短：先留着，下一段进来时一起并
+        else:
+            if out and len(out[-1]) < min_len:
+                out[-1] = out[-1] + "\n" + s
+            else:
+                out.append(s)
+    return out
+
+
+def plan_segments(raw: str, text: str, *, cap: int = 4, min_chars: int = 24) -> tuple[list[str], str]:
+    """回复路径的分段决策（纯函数，便于单测）。
+
+    原则：**分不分条由 bot 自己决定**，机器只在它明确写了空行时才照办。
+
+      ① 空行协议：`raw`（压空行前的原文）里出现空行 → 每段一条；
+      ② 一行一条：整段没有空行、每行都 ≤12 字（1/2/3 那种）→ 按单换行切；
+      ③ 其余情况一律整条发 —— 不再按标点兜底硬切。
+
+    克制闸（都是「少拆」方向，不丢字）：
+      · 整条去空白不到 `min_chars`(24) 字：空行也不拆；
+      · 不到 80 字：最多 2 段（一句话敷衍拆成三四条最招人烦）；
+      · 单段不到 6 字：并进相邻段（「嗯」不该独占一条气泡）。
+
+    返回 (段列表, 依据)；不拆时返回 ([raw], "")。
+    """
+    raw = str(raw or "")
+    body = str(text or "")
+    flat = re.sub(r"\s+", "", raw)
+    if not raw.strip():
+        return [], ""
+
+    blocks = [b.strip() for b in re.split(r"\n\s*\n", raw) if b.strip()]
+    if len(blocks) >= 2 and len(flat) >= int(min_chars or 0):
+        if len(flat) < 80:
+            cap = min(cap, 2)
+        blocks = _merge_tiny(blocks)
+        if len(blocks) > cap:
+            blocks = blocks[: max(1, cap - 1)] + ["\n".join(blocks[max(1, cap - 1):])]
+        return blocks, "空行协议"
+
+    lines = [ln.strip() for ln in body.split("\n") if ln.strip()]
+    if len(lines) >= 3 and max(len(ln) for ln in lines) <= 12 and not re.search(r"\n\s*\n", raw):
+        if len(lines) > cap:
+            lines = lines[: max(1, cap - 1)] + ["\n".join(lines[max(1, cap - 1):])]
+        return lines, "一行一条"
+
+    return [raw], ""
+
+
 def tidy_output(text: str) -> str:
     """发出去前收拾一下：模型爱用空行当分段符，会变成真的空行；分段交给官方机制。"""
     if not text:

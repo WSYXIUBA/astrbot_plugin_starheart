@@ -6,17 +6,17 @@
  * memory↔memory 的关系链（实体/时序/语义）。
  */
 
-import * as C from "./charts.js?v=1.0.3";
-import { GRAPH_PALETTE } from "./graph.js?v=1.0.3";
+import * as C from "./charts.js?v=1.0.4";
+import { GRAPH_PALETTE } from "./graph.js?v=1.0.4";
 import {
   createGraph3D, webglAvailable, LAYOUT_DEFS, LAYOUT_HOTKEYS, CAM_DEFS, PALETTE_DEFS, TIER_DEFS,
   PARA_DEFS, LEVEL_DEFS, ATOM_LABEL as ATOM_LABEL_3D,
-} from "./graph3d.js?v=1.0.3";
+} from "./graph3d.js?v=1.0.4";
 import {
   $, api, apiPost, apiPostSafe, apiSafe, esc, fmtNum, fmtPct, fmt1, fmtTime, timeAgo, toast, openDrawer, closeDrawer,
   confirmModal, formModal, pageHead, tabBar, card, kpiCard, kpis, secTitle, mount, emptyBlock, skelBlock, jsStr, STATE,
   segmentHtml, syncSeg, countUp, goPage, refreshCurrent,
-} from "./store.js?v=1.0.3";
+} from "./store.js?v=1.0.4";
 
 export const ATOM_LABEL = {
   factual: "事实", episodic: "经历", relational: "关系", preference: "偏好",
@@ -106,7 +106,7 @@ export function hfGraphReload() {
 const HF3D_CSS = `
 /* 浮层配色：深色液态玻璃（高透 + 强模糊 + 镜面高光边）。
    底色用中性石墨（不带藏青/深蓝——用户明确否掉），透明度压到 .38~.55，
-   让后面的星空/星云透过来，才有"液态玻璃"而不是"奶白塑料板"的观感。 */
+   让后面的星空透过来，才有"液态玻璃"而不是"奶白塑料板"的观感。 */
 .hf3d-ui{position:relative}
 .hf3d-ui .hud{position:absolute;z-index:6;font-size:12px;letter-spacing:.2px;color:rgba(235,235,245,.66)}
 .hf3d-ui .hud b{color:#f5f5f7;font-weight:600}
@@ -278,14 +278,13 @@ function graphPanelHtml(sid, opts = {}) {
     <div class="fph">图谱控制台<b data-act="toggle-panel">收起</b></div>
     <div class="fbd">
       ${views}
-      <div class="fgrp"><label>显示样式（12 种布局）</label><div class="fbtns" data-list="layout">${layouts}</div></div>
+      <div class="fgrp"><label>显示样式（3 种布局）</label><div class="fbtns" data-list="layout">${layouts}</div></div>
       <div class="fgrp"><label>镜头</label><div class="fchips" data-list="cam">${cams}</div></div>
       <div class="fgrp"><label>分层依据（换层，不只是换色）</label><div class="fchips" data-list="tier">${tiers}</div></div>
       <div class="fgrp"><label>显示开关</label><div class="fchips">
         <button class="fchip on" data-tgl="links">连线</button>
         <button class="fchip on" data-tgl="labels">标签</button>
         <button class="fchip" data-tgl="tour">自动巡演</button>
-        <button class="fchip" data-tgl="simple" title="关掉星云逐像素计算，弱机上更流畅">省电背景</button>
       </div></div>
       <div class="fgrp"><label>参数</label>${paras}</div>
       <div class="fgrp" style="margin-bottom:0"><label>检索与复位</label>
@@ -1028,6 +1027,10 @@ async function loadUiPref() {
     UI_PREF.loading = apiSafe("config", {}, {}).then((cfg) => {
       const v = (cfg && cfg.graph_ui) || {};
       UI_PREF.value = typeof v === "object" && v ? v : {};
+      // 布局从 12 种收到 3 种：旧配置里存的 cone/rings… 一律回球壳，别让控制台显示一个点不出来的名字
+      if (UI_PREF.value.layout && !LAYOUT_DEFS.some((x) => x.key === UI_PREF.value.layout)) {
+        UI_PREF.value.layout = "shell";
+      }
       return UI_PREF.value;
     });
   }
@@ -1619,7 +1622,7 @@ export async function renderGraph() {
   return {
     html: `${pageHead(
       "记忆图谱",
-      "3D 星云拓扑（WebGL）：12 种布局 × 4 镜头。拖拽旋转 · 滚轮缩放 · 悬停高亮邻居 · 单击锁定 · 双击聚焦 · 拖单点可单独挪",
+      "3D 星空拓扑（WebGL）：3 种布局 × 4 镜头。拖拽旋转 · 滚轮缩放 · 悬停高亮邻居 · 单击锁定 · 双击聚焦 · 拖单点可单独挪",
       `
        <button class="btn s" onclick="hfGraphFit()">适应视角</button>
        

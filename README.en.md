@@ -7,7 +7,7 @@
 | | |
 | --- | --- |
 | Package | `astrbot_plugin_starheart` |
-| Version | `1.0.2` |
+| Version | `1.0.4` |
 | Author | 肆一纸心 |
 | Repository | <https://github.com/WSYXIUBA/astrbot_plugin_starheart> |
 | Adapters | `aiocqhttp` (OneBot v11) |

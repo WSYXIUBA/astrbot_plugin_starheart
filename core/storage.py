@@ -6646,6 +6646,24 @@ class Store:
         )).fetchall()
         return [dict(r) for r in rows]
 
+    async def get_style_row(self, sid: int) -> dict[str, Any] | None:
+        row = await (await self._db.execute("SELECT * FROM hf_style_styles WHERE id=?", (int(sid),))).fetchone()
+        return dict(row) if row else None
+
+    async def get_style_quote(self, qid: int) -> dict[str, Any] | None:
+        row = await (await self._db.execute("SELECT * FROM hf_style_quotes WHERE id=?", (int(qid),))).fetchone()
+        return dict(row) if row else None
+
+    async def get_expr(self, eid: int) -> dict[str, Any] | None:
+        row = await (await self._db.execute("SELECT * FROM hf_expr WHERE id=?", (int(eid),))).fetchone()
+        return dict(row) if row else None
+
+    async def message_count(self, session_id: str) -> int:
+        row = await (await self._db.execute(
+            "SELECT COUNT(*) AS n FROM hf_messages WHERE session_id=?", (str(session_id or ""),)
+        )).fetchone()
+        return int(row["n"] or 0) if row else 0
+
     async def set_quote_status(self, qid: int, status: str) -> int:
         cur = await self._db.execute(
             "UPDATE hf_style_quotes SET status=?, updated_at=? WHERE id=?",

@@ -13,7 +13,7 @@
  * 世界尺度与参考实现一致（约 ±10，相机距离 ~21，FOV 48°），12 种布局的公式可以照着搬。
  */
 
-import { Graph3D as Graph3DCanvas } from "./graph3d-fallback.js?v=1.0.3";
+import { Graph3D as Graph3DCanvas } from "./graph3d-fallback.js?v=1.0.4";
 
 const TAU = Math.PI * 2;
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
@@ -79,20 +79,11 @@ const LAYER_SIZES = [0.78, 0.52, 0.30, 0.185, 0.155, 0.135];
 const ROLE_LVL = { person: 0, session: 1, topic: 2, memory: 3 };
 
 export const LAYOUT_DEFS = [
-  { key: "cone", label: "锥形分层", en: "CONTOURED LAYER TOPOLOGY", short: "锥形", spinLevel: 0, view: [0.55, 22, -1.0] },
-  { key: "rings", label: "环塔相扣", en: "STACKED RING TOWERS", short: "环塔", spinLevel: 0.28, view: [0.95, 25, -3.4] },
-  { key: "helix", label: "螺旋上升", en: "HELICAL LAYER SPIRAL", short: "螺旋", spinLevel: 0.1, view: [0.1, 26, -2.4] },
   { key: "shell", label: "同心球壳", en: "CONCENTRIC SHELL SPHERES", short: "球壳", spinLevel: 0.06, view: [0.2, 22, 0] },
-  { key: "planes", label: "分层平面", en: "LAYERED DATA PLANES", short: "平面", spinLevel: 0, view: [0.16, 24, -1.4] },
-  { key: "force", label: "力导向云", en: "3D FORCE-DIRECTED CLOUD", short: "力导", spinLevel: 0.03, view: [0.22, 22, 0] },
-  { key: "hang", label: "垂吊立柱", en: "HANGING COLUMN TREE", short: "垂吊", spinLevel: 0, view: [0.1, 22, -0.4] },
   { key: "galaxy", label: "银河旋臂", en: "GALACTIC SPIRAL ARMS", short: "旋臂", spinLevel: 0, view: [0.55, 20, 2.0] },
-  { key: "dna", label: "双螺旋链", en: "DOUBLE HELIX CHAINS", short: "双螺", spinLevel: 0.12, view: [0.08, 24, -2.2] },
-  { key: "cube", label: "立方点阵", en: "CUBIC LATTICE STACK", short: "点阵", spinLevel: 0.04, view: [0.3, 20, 0] },
-  { key: "burst", label: "放射星芒", en: "RADIAL BURST SPOKES", short: "星芒", spinLevel: 0.07, view: [0.24, 21, -1.2] },
   { key: "wave", label: "波浪曲面", en: "WAVE SURFACE FIELD", short: "波面", spinLevel: 0.05, view: [0.22, 22, 0.4] },
 ];
-export const LAYOUT_HOTKEYS = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "q", "w"];
+export const LAYOUT_HOTKEYS = ["1", "2", "3"];   // 只剩三种：球壳 / 旋臂 / 波面
 
 export const CAM_DEFS = [
   { key: "orbit", label: "环绕", pitch: 0.2, dist: 21, ty: -1.0 },
@@ -126,7 +117,6 @@ export const PARA_DEFS = [
   { key: "glow", label: "光晕", min: 0.35, max: 2.2, step: 0.01, value: 1 },
   { key: "spin", label: "自转", min: 0, max: 0.6, step: 0.01, value: 0.02 },
   { key: "cap", label: "节点规模", min: 200, max: 3200, step: 50, value: 1600 },
-  { key: "nebula", label: "星云亮度", min: 0, max: 2.5, step: 0.05, value: 1 },
 ];
 
 /** 语义色板（记忆类型 / 实体），和面板其它图保持同一套色 */
@@ -158,10 +148,10 @@ export class Graph3D {
   constructor(host, opts = {}) {
     this.host = host;
     this.opts = opts || {};
-    this.mode = opts.layout || "cone";
+    this.mode = opts.layout || "shell";
     this.paletteKey = opts.palette || "blue_gold";
     this.tierMode = normTier(opts.tier);
-    this.P = { gap: 1, rad: 1, glow: 1, spin: 0.02, cap: 1600, nebula: 1 };
+    this.P = { gap: 1, rad: 1, glow: 1, spin: 0.02, cap: 1600 };
     this.cam = { yaw: 0.6, pitch: 0.2, dist: 21, tPitch: 0.2, tDist: 21, ty: -1.0, tTy: -1.0 };
     this.camKey = "orbit";
     this.showLinks = true;
@@ -368,87 +358,28 @@ void main(){
       ["aP"]
     );
 
-    // 每帧的成本：两张纹理 + 暗角 + 抖动
+    // 每帧的成本：一张星空纹理 + 暗角 + 抖动（星云已移除，只剩黑底星点）
     this.BG = prog(
       `attribute vec2 aP;varying vec2 vUv;void main(){vUv=aP*0.5+0.5;gl_Position=vec4(aP,0.0,1.0);}`,
-      `precision highp float;varying vec2 vUv;uniform sampler2D uGas;uniform sampler2D uStar;
-uniform vec2 uPar;uniform vec2 uRes1;uniform float uTime;uniform float uStars;uniform float uSimple;uniform float uNeb;
+      `precision highp float;varying vec2 vUv;uniform sampler2D uStar;
+uniform vec2 uPar;uniform vec2 uRes1;uniform float uTime;
 float h21(vec2 p){p=fract(p*vec2(123.34,456.21));p+=dot(p,p+45.32);return fract(p.x*p.y);}
 void main(){
  vec2 base=0.06+vUv*0.88;
- // 程序化星云（uNeb1）已经在半分辨率里按相机方向算好了，这里只做放大 + 补细节
- vec3 gas=texture2D(uGas,base).rgb*uNeb;
- vec3 col=gas;
- // 全分辨率细丝：半分辨率放大后会糊，用两阶 2D 噪声补回"絮状纤维"，成本极低
- float lumGas=dot(gas,vec3(0.2126,0.7152,0.0722));
- // 原来这里加了一层全分辨率细丝当"细节"，实际看是**满屏噪点颗粒**（用户明确否掉）。
- // 现在只留极弱的一点点，且只在星云较亮处出现。
- float n1=fract(sin(dot(floor(vUv*260.0),vec2(127.1,311.7)))*43758.5453123);
- float n2=fract(sin(dot(floor(vUv*113.0+7.3),vec2(269.5,183.3)))*43758.5453123);
- float fix=(n1*0.6+n2*0.4-0.5)*0.30;
- col+=vec3(1.00,0.72,0.55)*clamp(lumGas*5.0-0.5,0.0,1.0)*max(fix,0.0)*0.13;   // 极弱亮丝
- col-=vec3(0.50,0.40,0.35)*clamp(lumGas*5.0-0.5,0.0,1.0)*max(-fix,0.0)*0.10;  // 极弱暗带
- if(uSimple<0.5&&uStars>0.0){
-   vec3 st=texture2D(uStar,base+vec2(sin(uPar.x*0.9)*0.12,sin(uPar.y*1.2)*0.09)).rgb;
-   // 闪烁：按屏幕位置错开相位，避免整屏一起亮暗
-   float tw=0.80+0.20*sin(uTime*1.6+(vUv.x*37.0+vUv.y*53.0));
-   col+=st*tw*uStars;
- }
- col*=1.0-0.34*pow(length((vUv-0.5)*vec2(0.92,1.16)),2.2);   // 暗角（收一档：原来四角被压得发空）
+ vec3 col=vec3(0.006,0.008,0.012);
+ vec3 st=texture2D(uStar,base+vec2(sin(uPar.x*0.9)*0.12,sin(uPar.y*1.2)*0.09)).rgb;
+ float tw=0.80+0.20*sin(uTime*1.6+(vUv.x*37.0+vUv.y*53.0));
+ col+=st*tw;
+ col*=1.0-0.34*pow(length((vUv-0.5)*vec2(0.92,1.16)),2.2);
  float l=dot(col,vec3(0.2126,0.7152,0.0722));
- col=mix(vec3(l),col,1.14);                                  // 轻微提饱和
+ col=mix(vec3(l),col,1.14);
  col=1.0-exp(-col*1.12);
- col+=(h21(vUv*uRes1+vUv.y*uTime)-0.5)*0.010;                 // 抖动去色带
+ col+=(h21(vUv*uRes1+vUv.y*uTime)-0.5)*0.010;
  gl_FragColor=vec4(col,1.0);}`,
       ["aP"]
     );
 
     // 点精灵：halo + core 双峰叠加 = 发光球手感
-    // 真·程序化星云：一个无限的三维噪声场，镜头一转就是在里面穿行。
-    // 所以永远不会"飘出去回不来"，也不存在边界。代价用半分辨率 + 限帧压住（见 _renderNeb）。
-    this.NEB = prog(
-      `attribute vec2 aP;void main(){gl_Position=vec4(aP,0.0,1.0);}`,
-      `precision highp float;
-uniform vec2 uRes;uniform float uTime;uniform vec2 uPar;uniform float uNeb;
-float h13(vec3 p){return fract(sin(dot(p,vec3(127.1,311.7,74.7)))*43758.5453123);}
-float n3(vec3 p){vec3 i=floor(p),f=fract(p);f=f*f*(3.0-2.0*f);
- return mix(mix(mix(h13(i),h13(i+vec3(1,0,0)),f.x),mix(h13(i+vec3(0,1,0)),h13(i+vec3(1,1,0)),f.x),f.y),
-            mix(mix(h13(i+vec3(0,0,1)),h13(i+vec3(1,0,1)),f.x),mix(h13(i+vec3(0,1,1)),h13(i+vec3(1,1,1)),f.x),f.y),f.z);}
-float fb(vec3 p,int oct){float s=0.0,a=0.5;for(int i=0;i<5;i++){if(i>=oct)break;s+=a*n3(p);p=p*2.07+vec3(11.3,7.7,3.1);a*=0.5;}return s;}
-/* 三相配色：暖发射(绯红→橙→金) / 冷反射(靛→青) / 激波白丝 */
-vec3 ramp(float d,float phase,float ridge){
- vec3 warm=mix(vec3(0.40,0.035,0.15),vec3(1.00,0.42,0.16),d*d);
- warm=mix(warm,vec3(1.00,0.83,0.45),pow(d,3.0)*0.95);
- vec3 cold=mix(vec3(0.035,0.055,0.22),vec3(0.20,0.60,0.72),d*d);
- vec3 c=mix(warm,cold,smoothstep(0.52,0.86,phase)*0.75);   // 暖区为主，青只当点缀（参考图就是绯红/橙/紫打底）
- return mix(c,vec3(1.00,0.97,0.92),pow(ridge,7.0)*0.60);}
-void main(){
- // 以画面高度归一 → 任意宽高比都不变形
- vec2 uv=(gl_FragCoord.xy-0.5*uRes)/uRes.y;
- vec3 dir=normalize(vec3(uv,1.75));
- float cy=cos(uPar.x),sy=sin(uPar.x),cp=cos(uPar.y),sp=sin(uPar.y);
- vec3 rd=vec3(dir.x*cy+dir.z*sy,dir.y,-dir.x*sy+dir.z*cy);      // yaw
- rd=vec3(rd.x,rd.y*cp-rd.z*sp,rd.y*sp+rd.z*cp);                // pitch
- float t=uTime*0.012; vec3 acc=vec3(0.0); float T=1.0;
- for(int i=0;i<5;i++){                       // 5 层切片：够体量又不至于满屏噪点（用户反馈 8 层太吵）
-  float fi=float(i);
-  vec3 p=rd*(1.7+fi*1.25)+vec3(0.0,0.0,t)+vec3(3.1,7.7,1.3);   // 尺度放大 → 大团块，才够'浓密'
-  float w1=fb(p,2), w2=fb(p+vec3(5.2,1.3,2.8),2);
-  vec3 q=vec3(w1,w2,w1*0.7+w2*0.5);
-  float f=fb(p+2.5*q,3);
-  float ridge=1.0-abs(2.0*f-1.0);
-  float mask=0.30+0.70*smoothstep(0.30,0.95,fb(p*0.40+vec3(2.3,1.9,5.1),2));
-  float d=smoothstep(0.30,0.84,f)*mask;
-  float phase=0.5+0.5*sin(1.1*(q.x*1.7+q.y*2.1-ridge*1.4)+fi*0.8);
-  vec3 c=ramp(d,phase,ridge);
-  float a=d*exp(-fi*0.26)*(1.0-fi*0.055);
-  acc+=c*a*T; T*=1.0-a*0.50;
- }
- acc*=0.38;   // 柔和但看得见：真正的噪点感来自上面那层全屏细丝，已单独大幅削弱
- gl_FragColor=vec4(acc*uNeb,1.0);}`,
-      ["aP"]
-    );
-
     this.PT = prog(
       `attribute vec3 aPos;attribute vec3 aCol;attribute float aSize;attribute float aA;
 uniform mat4 uMVP;uniform float uPS;uniform float uGlow;varying vec3 vC;varying float vA;
@@ -486,61 +417,12 @@ void main(){gl_FragColor=vec4(vC*vA,1.0);}`,
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
       return t;
     };
-    this.texGas = mkTex();
     this.texStar = mkTex();
     this.fbo = gl.createFramebuffer();
-    // 程序化星云渲染目标（半分辨率：软云放大看不出来，省一半以上算力）
-    this.texNeb = gl.createTexture();
-    this._texNebSize = [0, 0];
-    this.nebFbo = gl.createFramebuffer();
     this._bakeQueue = [];
     gl.bindBuffer(gl.ARRAY_BUFFER, this.buf.quad);
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
     this._mat = { proj: new Float32Array(16), view: new Float32Array(16), mvp: new Float32Array(16) };
-  }
-
-  /**
-   * 程序化星云：半分辨率渲染 + 限帧（相机不动就复用上一帧）。
-   * 真·程序化，不是贴图：转镜头 = 在三维噪声场里穿行，永远不会有边界或"飘走"。
-   */
-  _renderNeb(tms) {
-    const gl = this.gl;
-    const size = this._nebSize || [
-      Math.max(64, Math.round(this.glCanvas.width * 0.5)),
-      Math.max(64, Math.round(this.glCanvas.height * 0.5)),
-    ];
-    const W = size[0], H = size[1];
-    if (this._texNebSize[0] !== W || this._texNebSize[1] !== H) {
-      gl.bindTexture(gl.TEXTURE_2D, this.texNeb);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, W, H, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-      this._texNebSize = [W, H];
-      this._nebT = -1e9;
-    }
-    // 约 20fps 重算；相机一转立刻重算（拖视角绝不能糊）
-    const moved = Math.abs(this.cam.yaw - (this._nebYaw || 0)) + Math.abs(this.cam.pitch - (this._nebPitch || 0)) > 0.003;
-    if (!moved && this._nebT && tms - this._nebT < 48) return;
-    this._nebT = tms;
-    this._nebYaw = this.cam.yaw;
-    this._nebPitch = this.cam.pitch;
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.nebFbo);
-    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.texNeb, 0);
-    gl.viewport(0, 0, W, H);
-    gl.disable(gl.BLEND);
-    gl.useProgram(this.NEB.p);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.buf.quad);
-    gl.enableVertexAttribArray(0);
-    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
-    gl.uniform2f(this.NEB.u.uRes, W, H);
-    gl.uniform1f(this.NEB.u.uTime, tms * 0.001);
-    gl.uniform2f(this.NEB.u.uPar, this.cam.yaw, this.cam.pitch);
-    gl.uniform1f(this.NEB.u.uNeb, this.P.nebula == null ? 1 : this.P.nebula);
-    gl.drawArrays(gl.TRIANGLES, 0, 3);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    gl.viewport(0, 0, this.glCanvas.width, this.glCanvas.height);
   }
 
   /** 上下文恢复后重建一切（贴图/程序/缓冲区都没了，必须重烤星云，否则背景永远黑） */
@@ -579,12 +461,11 @@ void main(){gl_FragColor=vec4(vC*vA,1.0);}`,
   }
 
   /**
-   * 星云自愈看门狗：偶尔整块背景变黑（贴图被驱动/显存回收），刷新网页才好。
-   * 每 ~4 秒采一次缩略画面，若整片纯黑且没丢上下文、星云亮度也不是 0，就重烤一次。
+   * 背景自愈看门狗：偶尔整块背景变黑（贴图被驱动/显存回收），刷新网页才好。
+   * 每 ~4 秒采一次缩略画面，若整片纯黑且没丢上下文，就重烤一次星空。
    */
   _bgWatchdog() {
     if (this._ctxLost || this._bakeFailed) return;
-    if ((this.P.nebula == null ? 1 : this.P.nebula) < 0.05) return;
     if (this._buildStep === undefined) this._buildStep = 0;
     const w = 64, h = 40;
     const px = this._bgProbeBuf || (this._bgProbeBuf = new Uint8Array(w * h * 4));
@@ -800,7 +681,6 @@ void main(){gl_FragColor=vec4(vC*vA,1.0);}`,
     // 换数据 = 从头开始。不复位的话，上一次「全库大图把 FPS 压低」触发的自动降级
     // 会把 _quality 永久锁成 low（绘制上限 ×0.6、只剩度数最高的一小撮节点与线），
     // 切回小范围也仍然停在那个残缺态 —— 这正是「切回当前视角后线消失」的第二个成因。
-    // 注意 _simple 是用户自己按的「简版」开关，不能碰。
     this._quality = "high";
     this._lowCount = 0;
     this._fps = 0;
@@ -1130,7 +1010,8 @@ void main(){gl_FragColor=vec4(vC*vA,1.0);}`,
   }
 
   setLayout(key, instant) {
-    const def = LAYOUT_DEFS.find((x) => x.key === key);
+    let def = LAYOUT_DEFS.find((x) => x.key === key);
+    if (!def) { key = "shell"; def = LAYOUT_DEFS[0]; }   // 旧配置存过其它布局 → 回球壳，别让按钮变死键
     const n = this.nodes.length;
     if (!def || !n) return this;
     const P = this.P;
@@ -1405,12 +1286,6 @@ void main(){gl_FragColor=vec4(vC*vA,1.0);}`,
   }
 
   setToggle(key, on) {
-    if (key === "simple") {
-      this._simple = !!on;
-      this._kick();
-      this.emit("toggle", { key, on: !!on });
-      return this;
-    }
     if (key === "links") this.showLinks = !!on;
     if (key === "labels") this.showLabels = !!on;
     if (key === "tour") {
@@ -1615,7 +1490,6 @@ void main(){gl_FragColor=vec4(vC*vA,1.0);}`,
       nodes: this.nodes.length,
       links: this.links.length,
       showLinks: this.showLinks,
-      nebW: this._texNebSize ? this._texNebSize[0] : 0,
       fatal: this._fatal || null,
       drawn: this._visList ? this._visList.length : 0,
       drawnLinks: this._visLinks ? this._visLinks.length : 0,
@@ -1626,8 +1500,7 @@ void main(){gl_FragColor=vec4(vC*vA,1.0);}`,
       cam: this.camKey,
       palette: this.paletteKey,
       tier: this.tierMode,
-      quality: this._simple ? "low" : this._quality,
-      simple: !!this._simple,
+      quality: this._quality,
       gpu: this.isGL2 ? "WebGL2" : "WebGL1",
       selected: this.selected >= 0 ? this.nodes[this.selected].id : null,
       hover: this.hover >= 0 ? this.nodes[this.hover].id : null,
@@ -1901,7 +1774,7 @@ void main(){gl_FragColor=vec4(vC*vA,1.0);}`,
 
   _prepareDraw() {
     const n = this.nodes.length;
-    const lowK = this._quality === "low" || this._simple ? 0.6 : 1;
+    const lowK = this._quality === "low" ? 0.6 : 1;
     const cap = clamp(Math.round(this.P.cap * lowK), 50, Math.max(50, n));
     const keep = new Set();
     if (n > cap) {
@@ -2103,7 +1976,6 @@ void main(){gl_FragColor=vec4(vC*vA,1.0);}`,
   }
 
   _draw(t) {
-    this._renderNeb(t * 1000);
     const gl = this.gl;
     if (gl.isContextLost && gl.isContextLost()) return;
     const W = this.glCanvas.width, H = this.glCanvas.height;
@@ -2113,17 +1985,11 @@ void main(){gl_FragColor=vec4(vC*vA,1.0);}`,
     gl.enableVertexAttribArray(0);
     gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
     gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, this.texNeb);   // uGas 这个采样器现在指程序化星云
-    gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D, this.texStar);
-    gl.uniform1i(this.BG.u.uGas, 0);
-    gl.uniform1i(this.BG.u.uStar, 1);
+    gl.uniform1i(this.BG.u.uStar, 0);
     gl.uniform2f(this.BG.u.uPar, this.cam.yaw, this.cam.pitch);
     gl.uniform2f(this.BG.u.uRes1, W, H);
     gl.uniform1f(this.BG.u.uTime, t);
-    gl.uniform1f(this.BG.u.uStars, this._simple ? 0.0 : 1.0);
-    gl.uniform1f(this.BG.u.uSimple, this._simple ? 1.0 : 0.0);
-    gl.uniform1f(this.BG.u.uNeb, this.P.nebula == null ? 1.0 : this.P.nebula);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
 
     gl.enable(gl.BLEND);
@@ -2193,7 +2059,7 @@ void main(){gl_FragColor=vec4(vC*vA,1.0);}`,
     if (hh <= 0) { this._bakeStep++; return false; }
     const prog = isGas ? this.BAKE : this.STAR;
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbo);
-    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, isGas ? this.texGas : this.texStar, 0);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.texStar, 0);
     gl.viewport(0, 0, W, H);
     gl.enable(gl.SCISSOR_TEST);
     gl.scissor(0, y0, W, hh);

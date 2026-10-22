@@ -8,17 +8,17 @@
  * - 设置：模块开关 + 数据治理（破坏性操作集中卡），模块卡带状态灯。
  */
 
-import * as C from "./charts.js?v=1.0.4";
+import * as C from "./charts.js?v=1.0.4-3";
 import {
   $, $$, api, apiSafe, apiPostSafe, esc, fmtNum, fmtPct, fmt1, fmtTime, timeAgo, toast, openDrawer, closeDrawer,
   confirmModal, formModal, pageHead, card, kpiCard, kpis, secTitle, mount, emptyBlock, skelBlock, jsStr, STATE, segmentHtml,
   syncSeg, bridge, EP, refreshCurrent, goPage, countUp, configTouchedAt, noteConfigTouched, recentFirstKeys, takeConfigDirty, nativeWriteError,
-} from "./store.js?v=1.0.4";
-import { renderDomainConf, domainRowsHtml, CONFIG_META } from "./views-conf.js?v=1.0.4";
+} from "./store.js?v=1.0.4-3";
+import { renderDomainConf, domainRowsHtml, CONFIG_META } from "./views-conf.js?v=1.0.4-3";
 // 收尾批：四个消息域的参数渲染器（原页底折叠区）——原样迁进本文件的「设置 · 模块与参数」页
-import { renderGateConf, renderProactiveConf, renderRecallConf, renderFavourConf } from "./views-events.js?v=1.0.4";
-import { ATOM_LABEL } from "./views-memory.js?v=1.0.4";
-import { GRAPH_PALETTE } from "./graph.js?v=1.0.4";
+import { renderGateConf, renderProactiveConf, renderRecallConf, renderFavourConf } from "./views-events.js?v=1.0.4-3";
+import { ATOM_LABEL } from "./views-memory.js?v=1.0.4-3";
+import { GRAPH_PALETTE } from "./graph.js?v=1.0.4-3";
 
 // S4-2：「先审后用」开关挂语言学习域。CONFIG_META 由 views-conf.js 定义并被域页过滤读取，
 // 新键必须登记在这里，否则参数页不渲染、保存也会被 CONFIG_META 过滤掉（静默丢键）。

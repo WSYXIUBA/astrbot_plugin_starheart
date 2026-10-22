@@ -6,17 +6,17 @@
  * memory↔memory 的关系链（实体/时序/语义）。
  */
 
-import * as C from "./charts.js?v=1.0.4";
-import { GRAPH_PALETTE } from "./graph.js?v=1.0.4";
+import * as C from "./charts.js?v=1.0.4-3";
+import { GRAPH_PALETTE } from "./graph.js?v=1.0.4-3";
 import {
   createGraph3D, webglAvailable, LAYOUT_DEFS, LAYOUT_HOTKEYS, CAM_DEFS, PALETTE_DEFS, TIER_DEFS,
   PARA_DEFS, LEVEL_DEFS, ATOM_LABEL as ATOM_LABEL_3D,
-} from "./graph3d.js?v=1.0.4";
+} from "./graph3d.js?v=1.0.4-3";
 import {
   $, api, apiPost, apiPostSafe, apiSafe, esc, fmtNum, fmtPct, fmt1, fmtTime, timeAgo, toast, openDrawer, closeDrawer,
   confirmModal, formModal, pageHead, tabBar, card, kpiCard, kpis, secTitle, mount, emptyBlock, skelBlock, jsStr, STATE,
   segmentHtml, syncSeg, countUp, goPage, refreshCurrent,
-} from "./store.js?v=1.0.4";
+} from "./store.js?v=1.0.4-3";
 
 export const ATOM_LABEL = {
   factual: "事实", episodic: "经历", relational: "关系", preference: "偏好",

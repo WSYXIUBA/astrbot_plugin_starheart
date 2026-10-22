@@ -558,6 +558,13 @@ h1,h2,h3,h4,.card .ct,.ph h1{font-family:Georgia,'Times New Roman','Songti SC','
 .inp,input,select,textarea{background:transparent !important;border:0 !important;border-bottom:1px solid var(--gold) !important;
   border-radius:0 !important;color:var(--tx1) !important;box-shadow:none !important;letter-spacing:.04em}
 .inp:focus,input:focus,select:focus,textarea:focus{outline:none !important;border-bottom-color:var(--ink) !important}
+/* 原生 select 的弹出列表由浏览器自己画，不继承 select 的透明底与字色，
+   深色主题下默认会画成白底浅字（模型名看不见）。这里让它跟着主题走：
+   color-scheme 决定系统弹层的底色，option 再显式给主题色兜底。 */
+select, .inp{color-scheme:light}
+html[data-theme="dark"] select, html[data-theme="dark"] .inp{color-scheme:dark}
+select option,.inp option{background:var(--surface) !important;color:var(--tx1) !important}
+select option:checked,.inp option:checked{background:var(--surface3) !important;color:var(--tx1) !important}
 ::placeholder{color:var(--tx3) !important}
 /* 标签：金色细描边 + 透明底（金色只做点缀，不铺面） */
 .tag{background:transparent !important;border:1px solid var(--gold) !important;border-radius:2px !important;
@@ -642,6 +649,6 @@ a{color:var(--primary)}
 <div class="modal-mask" id="modalMask"><div class="modal" id="modal"></div></div>
 <div class="toasts" id="toasts"></div>
 
-<script type="module" src="./app.js?v=1.0.4"></script>
+<script type="module" src="./app.js?v=1.0.4-3"></script>
 </body>
 </html>

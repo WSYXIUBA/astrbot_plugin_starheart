@@ -25,10 +25,10 @@
  * state ∈ ok / INSUFFICIENT_DATA / NOT_IMPLEMENTED / ERROR；state != ok 时接口不给 value。
  */
 
-import * as C from "./charts.js?v=1.0.4";
+import * as C from "./charts.js?v=1.0.4-3";
 import {
   api, esc, fmt1, fmtNum, fmtPct, card, kpis, mount, emptyBlock, pageHead,
-} from "./store.js?v=1.0.4";
+} from "./store.js?v=1.0.4-3";
 
 /* 六张 KPI 卡（卡序：长度 / 连发 / 间隔 / 表情 / 沉默 / 命中，与设计稿一致）。
    keys = 接口字段别名：契约字段名在前，历史别名在后（比对忽略大小写与下划线）。

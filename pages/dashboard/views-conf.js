@@ -5,11 +5,11 @@
  * 保存时只提交本页出现过的键，避免误改别的域。
  */
 
-import * as C from "./charts.js?v=1.0.4-3";
+import * as C from "./charts.js?v=1.0.5-3";
 import {
   $, $$, api, apiSafe, apiPostSafe, esc, fmtNum, fmtTime, toast, confirmModal, pageHead, card, mount, emptyBlock,
   skelBlock, refreshCurrent, normList, jsStr, configTouchedAt, noteConfigTouched, recentFirstKeys, takeConfigDirty, nativeWriteError,
-} from "./store.js?v=1.0.4-3";
+} from "./store.js?v=1.0.5-3";
 
 /** key -> [标签, 说明, 类型, min, max, step, 选项] */
 export const CONFIG_META = {

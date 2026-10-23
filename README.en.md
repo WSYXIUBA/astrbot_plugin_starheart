@@ -7,7 +7,7 @@
 | | |
 | --- | --- |
 | Package | `astrbot_plugin_starheart` |
-| Version | `1.0.4` |
+| Version | `1.0.5` |
 | Author | 肆一纸心 |
 | Repository | <https://github.com/WSYXIUBA/astrbot_plugin_starheart> |
 | Adapters | `aiocqhttp` (OneBot v11) |
@@ -23,6 +23,7 @@
 
 - Long-term memory: conversations are distilled into entries stored locally; entries not accessed for a long time decay and are archived.
 - Relevant recall: memories are retrieved per turn by topic.
+- Multi-generation vectors: a new embedding model builds and backfills its own generation, switches when complete, and keeps old generations for instant switch-back.
 - Person / group profiles: generated and updated per person and per group.
 - Relationship score: interaction accumulates a score that affects tone.
 - Expression habits: learned from conversations and referenced in replies.

@@ -9,13 +9,13 @@
  * - 好感：关系是连续量 → 区间色带 + 数值环，而不是只写一个数字。
  */
 
-import * as C from "./charts.js?v=1.0.4-3";
+import * as C from "./charts.js?v=1.0.5-3";
 import {
   $, $$, api, apiSafe, contactLabel, apiPostSafe, esc, fmtNum, fmt1, fmtPct, fmtTime, timeAgo, toast, openDrawer, closeDrawer,
   pageHead, card, kpiCard, kpis, mount, emptyBlock, skelBlock, jsStr, STATE, segmentHtml, syncSeg, countUp,
   refreshCurrent, goPage, noteConfigTouched, takeConfigDirty, nativeWriteError,
-} from "./store.js?v=1.0.4-3";
-import { renderDomainConf } from "./views-conf.js?v=1.0.4-3";
+} from "./store.js?v=1.0.5-3";
+import { renderDomainConf } from "./views-conf.js?v=1.0.5-3";
 
 const ZONE_RANK = { HOSTILE: 0, COLD: 1, NEUTRAL: 2, FAMILIAR: 3, CLOSE: 4, DEVOTED: 5 };
 const ZONE_COLOR = { HOSTILE: "#f44336", COLD: "#90a4ae", NEUTRAL: "#8e8e93", FAMILIAR: "#03c9d7", CLOSE: "#3c96ca", DEVOTED: "#e0559a" };

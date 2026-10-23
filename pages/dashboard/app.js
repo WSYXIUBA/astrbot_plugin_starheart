@@ -7,18 +7,18 @@
  * 「先读到数据再画」，不会出现图表画在空容器上的空白页。
  */
 
-import * as charts from "./charts.js?v=1.0.4-3";
-import { MemoryGraph } from "./graph.js?v=1.0.4-3";
-import { Graph3D } from "./graph3d.js?v=1.0.4-3";
+import * as charts from "./charts.js?v=1.0.5-3";
+import { MemoryGraph } from "./graph.js?v=1.0.5-3";
+import { Graph3D } from "./graph3d.js?v=1.0.5-3";
 import {
   $, $$, STATE, initBridge, setLive, setRefreshHook, goPage, toggleTheme, toast, openDrawer, closeDrawer, esc,
    syncSeg, jsStr, emptyBlock, refreshCurrent, hfGoParams, consumeParamsAnchor, noteConfigDirty,
-} from "./store.js?v=1.0.4-3";
-import * as mem from "./views-memory.js?v=1.0.4-3";
-import * as evt from "./views-events.js?v=1.0.4-3";
-import * as sys from "./views-system.js?v=1.0.4-3";
-import * as act from "./views-actor.js?v=1.0.4-3";
-import { hfSaveDomain } from "./views-conf.js?v=1.0.4-3";
+} from "./store.js?v=1.0.5-3";
+import * as mem from "./views-memory.js?v=1.0.5-3";
+import * as evt from "./views-events.js?v=1.0.5-3";
+import * as sys from "./views-system.js?v=1.0.5-3";
+import * as act from "./views-actor.js?v=1.0.5-3";
+import { hfSaveDomain } from "./views-conf.js?v=1.0.5-3";
 
 /* ---------------- 页面表 ---------------- */
 const PAGES = {

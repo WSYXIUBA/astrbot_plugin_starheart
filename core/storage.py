@@ -4111,21 +4111,27 @@ class Store:
         `hf_vectors`。只写旧列的话，迁移之后新建的记忆在面板里永远显示"缺向量"、也永远
         进不了面板召回结果（点「补全向量」也没用，因为补的就是旧列）。写入端对齐后，
         两条读取路径才算一致。
+
+        多代修正（2026-10-23）：旧列只是「当前代」的兼容镜像。写非当前代时必须
+        **不动旧列**，否则换模型后旧列会混进不同维度的向量，召回会静默归零。
         """
         import array
         sid = self._split_mid(mid)
         if sid is None:
             return
         blob = array.array("f", [float(x) for x in vector]).tobytes()
-        await self.db.execute(
-            "UPDATE hf_memories SET embedding=?, embedding_model=?, updated_at=? WHERE id=?",
-            (blob, model, now(), sid),
-        )
+        gk = self.gen_key(model, len(vector))
         await self.db.execute(
             "INSERT OR REPLACE INTO hf_vectors (memory_id, gen_key, model, dim, vec, created_at)"
             " VALUES (?,?,?,?,?,?)",
-            (sid, self.gen_key(model, len(vector)), str(model or ""), len(vector), blob, now()),
+            (sid, gk, str(model or ""), len(vector), blob, now()),
         )
+        active = await self.active_gen()
+        if not active or gk == active:
+            await self.db.execute(
+                "UPDATE hf_memories SET embedding=?, embedding_model=?, updated_at=? WHERE id=?",
+                (blob, model, now(), sid),
+            )
         await self.db.commit()
 
     async def memories_without_embedding(self, limit: int = 200, persona_id: str = "") -> list[dict[str, Any]]:
@@ -6334,11 +6340,20 @@ class Store:
             )
         await self._db.commit()
 
-    async def all_embeddings_gen(self, gen_key: str, persona_id: str = "", include_stale: bool = True) -> list[tuple[str, bytes]]:
-        """读取指定代的向量（同一维度，天然不会混代）。"""
-        sql = "SELECT v.memory_id AS id, v.vec AS vec FROM hf_vectors v JOIN hf_memories m ON m.id = v.memory_id WHERE v.gen_key=?"
+    async def all_embeddings_gen(self, gen_key: str, persona_id: str = "", include_stale: bool = True,
+                                 *, include_archived: bool = False) -> list[tuple[str, bytes]]:
+        """读取指定代的向量（同一维度，天然不会混代）。
+
+        include_archived 只给注入召回用：归档记忆被提及要能拉回，所以聊天注入要带上；
+        面板召回保持原口径（默认不带归档）。
+        """
+        sql = ("SELECT v.memory_id AS id, v.vec AS vec FROM hf_vectors v "
+               "JOIN hf_memories m ON m.id = v.memory_id "
+               "WHERE v.gen_key=? AND COALESCE(m.muted,0)=0")
         args: list[Any] = [str(gen_key)]
-        if include_stale:
+        if include_archived:
+            sql += " AND m.status NOT IN ('forgotten','deleted')"
+        elif include_stale:
             sql += " AND m.status NOT IN ('archived','forgotten','deleted')"
         else:
             sql += " AND m.status='active'"
@@ -6361,6 +6376,18 @@ class Store:
         args.append(limit)
         rows = await (await self._db.execute(sql, args)).fetchall()
         return [dict(r) for r in rows]
+
+    async def gen_missing_count(self, gen_key: str, persona_id: str = "") -> int:
+        """某代还缺多少条可召回记忆（0 = 这一代已经建完，可以切过去）。"""
+        sql = ("SELECT COUNT(*) FROM hf_memories m"
+               " WHERE m.status NOT IN ('archived','forgotten','deleted')"
+               " AND NOT EXISTS (SELECT 1 FROM hf_vectors v WHERE v.memory_id=m.id AND v.gen_key=?)")
+        args: list[Any] = [str(gen_key)]
+        if persona_id:
+            sql += " AND m.persona_id=?"
+            args.append(persona_id)
+        row = await (await self._db.execute(sql, args)).fetchone()
+        return int(row[0] or 0) if row else 0
 
     async def drop_gen(self, gen_key: str) -> int:
         cur = await self._db.execute("DELETE FROM hf_vectors WHERE gen_key=?", (str(gen_key),))

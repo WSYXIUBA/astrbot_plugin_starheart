@@ -109,6 +109,8 @@ def _clean_text(v: Any, limit: int = 400) -> str:
     # 这样 emoji、♥ 这类合法昵称字符不会被误杀（红队实测过），坏转义残渣仍会被丢弃。
     if not any(unicodedata.category(ch)[0] in ("L", "N", "S") for ch in s):
         return ""
+    if s in {"无", "暂无", "未知", "没有", "不详", "待补充", "暂无信息", "n/a", "N/A", "N/A.", "-", "—", "null", "None"}:
+        return ""
     if s.count(chr(92)) >= max(4, len(s) // 3):     # 反斜杠密度过高才算坏转义
         s = s.replace(chr(92), "")
     s = s.strip()
@@ -125,11 +127,19 @@ def _clean_list(v: Any, limit: int = 30) -> list[str]:
 
 
 def _clean_events(v: Any, limit: int = 24) -> list[dict[str, str]]:
-    """events 必须是对象数组；模型常给「字符串化的 JSON 对象」或纯字符串（真机实测）。"""
+    """events 必须是对象数组；模型常给「字符串化的 JSON 对象」或纯字符串（真机实测）。
+
+    兼容中文字段：时间/日期 + 内容/事件/描述（provider 偶尔不按英文 schema 输出）。
+    """
+    def _fields(d: dict[str, Any]) -> tuple[str, str]:
+        when = _clean_text(_flatten_text(_pick_value(d, ("when", "时间", "日期", "time", "at", "date"))), 60)
+        what = _clean_text(_flatten_text(_pick_value(d, ("what", "内容", "事件", "描述", "detail", "text", "摘要"))), 240)
+        return when, what
+
     out: list[dict[str, str]] = []
     for x in (v if isinstance(v, list) else ([v] if v else [])):
         if isinstance(x, dict):
-            when, what = _clean_text(x.get("when"), 60), _clean_text(x.get("what"), 240)
+            when, what = _fields(x)
         elif isinstance(x, str):
             s = x.strip()
             when = what = ""
@@ -137,7 +147,7 @@ def _clean_events(v: Any, limit: int = 24) -> list[dict[str, str]]:
                 try:
                     d = json.loads(s)
                     if isinstance(d, dict):
-                        when, what = _clean_text(d.get("when"), 60), _clean_text(d.get("what"), 240)
+                        when, what = _fields(d)
                 except Exception:
                     what = ""
             what = what or _clean_text(s, 240)
@@ -148,19 +158,111 @@ def _clean_events(v: Any, limit: int = 24) -> list[dict[str, str]]:
     return out[:limit]
 
 
-def _sanitize_profile(body: Any, pid: str = "", name: str = "") -> dict[str, Any]:
-    """画像落库前的最后一道闸：字段级清洗 + 不泄漏内部 id（人物 id 不该出现在给人看的正文里）。"""
+def _pick_value(body: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    """按别名顺序取第一个非空字段（兼容模型自创的中文键）。"""
+    for key in keys:
+        if key in body:
+            value = body.get(key)
+            if value not in (None, "", [], {}):
+                return value
+    return None
+
+
+def _flatten_text(value: Any) -> str:
+    """把字符串 / 数字 / dict / list 压成一段可读文本（中文键兜底用）。"""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, dict):
+        parts = []
+        for key, val in value.items():
+            text = _flatten_text(val)
+            if text:
+                parts.append(f"{key}：{text}")
+        return "；".join(parts)
+    if isinstance(value, (list, tuple)):
+        parts = [_flatten_text(item) for item in value]
+        return "；".join(part for part in parts if part)
+    return str(value)
+
+
+def _flatten_list(value: Any) -> list[str]:
+    """把 list / dict / 标量压成字符串列表（嵌套 list/dict 递归展开，不留『a；b』这种合体项）。"""
+    if value is None:
+        return []
+    if isinstance(value, dict):
+        out: list[str] = []
+        for val in value.values():
+            out.extend(_flatten_list(val))
+        return out
+    if isinstance(value, (list, tuple)):
+        out: list[str] = []
+        for item in value:
+            out.extend(_flatten_list(item))
+        return out
+    text = _flatten_text(value)
+    return [text] if text else []
+
+
+def _unwrap_profile(body: Any) -> dict[str, Any]:
+    """模型常把画像塞进 {"人物画像": {...}} / {"profile": {...}}，先拆一层。"""
     b = body if isinstance(body, dict) else {}
+    for wrapper in ("人物画像", "profile", "画像", "person_profile", "人物档案"):
+        inner = b.get(wrapper)
+        if isinstance(inner, dict):
+            merged = dict(inner)
+            for key, value in b.items():
+                if key != wrapper and key not in merged:
+                    merged[key] = value
+            return merged
+    return b
+
+
+def _sanitize_profile(body: Any, pid: str = "", name: str = "") -> dict[str, Any]:
+    """画像落库前的最后一道闸：字段级清洗 + 不泄漏内部 id（人物 id 不该出现在给人看的正文里）。
+
+    兼容两套 schema：
+    - 插件内置的英文字段（one_line / identity / ...），这是首选；
+    - 模型自己发挥的中文键（画像摘要 / 性格与互动风格 / 偏好与习惯 / 关系动态 ...）。
+      真机踩过：provider 偶尔不按内置 schema 输出，旧实现会把整份画像判成「坏字段」扔掉。
+    """
+    b = _unwrap_profile(body)
+    likes_raw = _pick_value(b, ("likes", "喜欢", "偏好", "喜好", "内容偏好", "偏好与习惯"))
+    dislikes_raw = _pick_value(b, ("dislikes", "讨厌", "雷区", "忌讳", "雷点", "雷点与不满"))
+    if isinstance(likes_raw, dict):
+        # 偏好与习惯：只取「偏好/喜欢」相关子项，其余别混进 likes；其中的雷点单独喂给 dislikes
+        if not dislikes_raw:
+            dislikes_raw = {k: v for k, v in likes_raw.items() if ("雷" in k or "忌" in k or "不满" in k)}
+        likes_raw = [v for k, v in likes_raw.items() if ("偏好" in k or "喜欢" in k)]
+    if isinstance(dislikes_raw, dict):
+        dislikes_raw = [v for k, v in dislikes_raw.items() if ("雷" in k or "忌" in k or "不满" in k)]
+    identity_raw = _pick_value(b, ("identity",))
+    if identity_raw:
+        identity_text = _flatten_text(identity_raw)
+    else:
+        ident_parts: list[str] = []
+        for key in ("称呼", "身份", "身份/称呼/关系", "基础信息", "基本信息"):
+            val = _pick_value(b, (key,))
+            if val is None:
+                continue
+            text = _flatten_text(val)
+            if not text:
+                continue
+            ident_parts.append(f"{key}：{text}" if key in ("基础信息", "基本信息") else text)
+        identity_text = "；".join(ident_parts)
     out: dict[str, Any] = {
-        "one_line": _clean_text(b.get("one_line"), 120),
-        "identity": _clean_text(b.get("identity"), 200),
-        "traits": _clean_list(b.get("traits")),
-        "likes": _clean_list(b.get("likes")),
-        "dislikes": _clean_list(b.get("dislikes")),
-        "topics": _clean_list(b.get("topics")),
-        "relation": _clean_text(b.get("relation"), 500),
-        "events": _clean_events(b.get("events")),
-        "notes": _clean_text(b.get("notes"), 500),
+        "one_line": _clean_text(_flatten_text(_pick_value(b, ("one_line", "一句话", "画像摘要", "摘要", "一句话概括", "核心画像", "概况"))), 120),
+        "identity": _clean_text(identity_text, 200),
+        "traits": _clean_list(_flatten_list(_pick_value(b, ("traits", "性格", "性格特点", "性格与互动风格", "性格特征", "行为特征")))),
+        "likes": _clean_list(_flatten_list(likes_raw)),
+        "dislikes": _clean_list(_flatten_list(dislikes_raw)),
+        "topics": _clean_list(_flatten_list(_pick_value(b, ("topics", "话题", "常聊话题", "常聊话题与行为模式")))),
+        "relation": _clean_text(_flatten_text(_pick_value(b, ("relation", "关系", "关系动态", "与助手关系", "互动风格", "关系类型"))), 500),
+        "events": _clean_events(_pick_value(b, ("events", "事件", "关键事件", "关键事件摘要", "重要事件"))),
+        "notes": _clean_text(_flatten_text(_pick_value(b, ("notes", "备注", "注意", "安全与边界备注", "建议回应策略", "关键线索", "边界与风险"))), 500),
     }
     pid = str(pid or "")
     if pid:
@@ -179,24 +281,44 @@ def _sanitize_profile(body: Any, pid: str = "", name: str = "") -> dict[str, Any
 def _sanitize_group_profile(body: Any, gid: str = "", name: str = "") -> dict[str, Any]:
     """群聊画像落库前的字段级清洗（与人物画像同思路：只留白名单字段，号不进正文）。"""
     b = body if isinstance(body, dict) else {}
+    for wrapper in ("群聊画像", "group_profile", "群画像", "群档案"):
+        inner = b.get(wrapper)
+        if isinstance(inner, dict):
+            merged = dict(inner)
+            for key, value in b.items():
+                if key != wrapper and key not in merged:
+                    merged[key] = value
+            b = merged
+            break
     members: list[dict[str, Any]] = []
-    for m in (b.get("members") or [])[:40]:
-        if not isinstance(m, dict):
-            continue
-        who = _clean_text(m.get("who"), 60)
+    members_raw = _pick_value(b, ("members", "成员", "活跃成员", "群成员"))
+    for m in (members_raw if isinstance(members_raw, list) else [])[:40]:
+        if isinstance(m, dict):
+            who = _clean_text(_flatten_text(m.get("who") or m.get("称呼") or m.get("member") or m.get("name")), 60)
+            role = _clean_text(_flatten_text(m.get("role") or m.get("角色") or m.get("定位")), 160)
+            n = _clean_text(_flatten_text(m.get("n") or m.get("发言量") or m.get("数量")), 20)
+        else:
+            who = _clean_text(_flatten_text(m), 60)
+            role = n = ""
         if not who:
             continue
-        members.append({"who": who, "role": _clean_text(m.get("role"), 160),
-                        "n": _clean_text(m.get("n"), 20)})
+        members.append({"who": who, "role": role, "n": n})
+    group_name = _clean_text(_flatten_text(_pick_value(b, ("群名", "群名称", "name"))), 60) or str(name or "")
+    kind = _clean_text(_flatten_text(_pick_value(b, ("kind", "类型", "群性质", "性质", "群类型"))), 80)
+    atmosphere = _clean_text(_flatten_text(_pick_value(b, ("atmosphere", "氛围", "群氛围", "互动风格", "氛围与说话风格"))), 400)
+    one_line = _clean_text(_flatten_text(_pick_value(b, ("one_line", "一句话", "群画像摘要", "摘要", "一句话概括", "核心画像"))), 120)
+    if not one_line:
+        # 中文 schema 常常没有「摘要」，只给群名/性质/氛围；用它们拼一句，避免整份画像被判空。
+        one_line = _clean_text(f"{group_name}：{kind or '群聊'}" if group_name else (kind or atmosphere), 120)
     out: dict[str, Any] = {
-        "one_line": _clean_text(b.get("one_line"), 120),
-        "kind": _clean_text(b.get("kind"), 80),
-        "atmosphere": _clean_text(b.get("atmosphere"), 400),
-        "topics": _clean_list(b.get("topics")),
+        "one_line": one_line,
+        "kind": kind,
+        "atmosphere": atmosphere,
+        "topics": _clean_list(_flatten_list(_pick_value(b, ("topics", "话题", "常聊话题")))),
         "members": members,
-        "norms": _clean_list(b.get("norms")),
-        "relation": _clean_text(b.get("relation"), 500),
-        "notes": _clean_text(b.get("notes"), 500),
+        "norms": _clean_list(_flatten_list(_pick_value(b, ("norms", "默契", "规矩", "忌讳", "群规")))),
+        "relation": _clean_text(_flatten_text(_pick_value(b, ("relation", "关系", "与用户关系", "和用户的关系"))), 500),
+        "notes": _clean_text(_flatten_text(_pick_value(b, ("notes", "备注", "注意", "其他", "其他要注意的"))), 500),
     }
     gid = str(gid or "")
     if gid:
@@ -3263,24 +3385,54 @@ class StarHeartService:
         text = str(raw or "").strip()
         if not text:
             return {"ok": False, "error": "模型没有返回内容（可能是模型通道限流或超时）"}
-        body = _json_block(text)
-        if body is None:
-            # 模型返回数组/标量时，_json_block 拿不到对象 → 以前会把原文塞进 one_line 当画像存下来
-            # （面板上就出现「一句话」是 ["a","b"] 这种垃圾）。这类输出明确拒绝，不当画像。
-            if text.lstrip()[:1] in ("[", "\"") or text.strip() in ("true", "false", "null"):
-                return {"ok": False, "code": "unparseable_output",
-                        "error": "模型没有按要求返回 JSON 对象（返回的是数组/标量），已拒绝入库 —— 请重试或换模型"}
-            body = {"one_line": text[:200], "notes": "（模型未按要求返回 JSON，这里原样保留输出）"}
-        nm = str(dossier.get("name") or "")
-        if k == "group":
-            body = _sanitize_group_profile(body, gid=pid, name=nm)
-            thin = not body.get("one_line") and not body.get("kind") and not body.get("notes")
-        else:
-            body = _sanitize_profile(body, pid=pid, name=nm)
-            thin = not body.get("one_line") and not body.get("identity") and not body.get("notes")
-        if thin:
-            return {"ok": False, "code": "empty_profile",
-                    "error": "模型返回的画像全是坏字段（清洗后为空），已拒绝入库 —— 请重试或换一个模型"}
+
+        def _parse(candidate: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+            """返回 (清洗后的画像, 错误信息)；错误信息为 None 表示可用。"""
+            body = _json_block(candidate)
+            if body is None:
+                # 模型返回数组/标量时，_json_block 拿不到对象 → 以前会把原文塞进 one_line 当画像存下来
+                # （面板上就出现「一句话」是 ["a","b"] 这种垃圾）。这类输出明确拒绝，不当画像。
+                if candidate.lstrip()[:1] in ("[", "\"") or candidate.strip() in ("true", "false", "null"):
+                    return None, {"ok": False, "code": "unparseable_output",
+                                  "error": "模型没有按要求返回 JSON 对象（返回的是数组/标量），已拒绝入库 —— 请重试或换模型"}
+                body = {"one_line": candidate[:200], "notes": "（模型未按要求返回 JSON，这里原样保留输出）"}
+            nm = str(dossier.get("name") or "")
+            if k == "group":
+                body = _sanitize_group_profile(body, gid=pid, name=nm)
+                thin = not body.get("one_line") and not body.get("kind") and not body.get("notes")
+            else:
+                body = _sanitize_profile(body, pid=pid, name=nm)
+                thin = not body.get("one_line") and not body.get("identity") and not body.get("notes")
+            if thin:
+                return None, {"ok": False, "code": "empty_profile",
+                              "error": "模型返回的画像全是坏字段（清洗后为空），已拒绝入库 —— 请重试或换一个模型",
+                              "raw_head": candidate[:160]}
+            return body, None
+
+        body, err = _parse(text)
+        if err is not None and err.get("code") == "empty_profile":
+            # provider 偶尔不按 system 里的 schema 输出（真机踩过：自创中文键、内容还挺全）。
+            # 再给一次机会：把格式要求直接压进 user 消息末尾，比只在 system 里说更硬。
+            retry_prompt = prompt + (
+                "\n\n【输出格式（必须严格遵守）】\n"
+                "只输出一个 JSON 对象，不要解释、不要 markdown 代码块、不要多余文字。"
+                "键名必须用英文，且只能是：one_line, identity, traits, likes, dislikes, topics, relation, events, notes。"
+                "traits/likes/dislikes/topics 是字符串数组，events 是 [{\"when\":\"…\",\"what\":\"…\"}]。"
+            )
+            try:
+                raw2 = await gen(retry_prompt, "group_profile" if k == "group" else "person_profile",
+                                 self.GROUP_PROFILE_SYSTEM if k == "group" else self.PROFILE_SYSTEM)
+                text2 = str(raw2 or "").strip()
+                if text2:
+                    body2, err2 = _parse(text2)
+                    if err2 is None:
+                        body, err = body2, None
+                    else:
+                        err = err2
+            except Exception:
+                pass
+        if err is not None:
+            return err
         await self.store.profile_save(pid, body, mem_count=len(mems), msg_count=int(dossier.get("msgs") or 0),
                                       built_by="llm", subject_kind=k, persona_id=persona_id)
         try:      # 画像生成必须留审计（以前只 log；出问题时无法追溯是谁在什么人格下生成的）
@@ -5452,7 +5604,7 @@ class StarHeartService:
         active = next((g for g in gens if g["active"]), None)
         src = (await self.config()).get("model_embedding") or ""
         return {"ok": True, "items": gens, "active": active, "current_model": src,
-                "note": "换模型/维度会新建一代，旧代保留（暂停使用），新代建好再切换；换回来立刻可用，不用重算"}
+                "note": "换模型会按「模型|维度」新建一代并自动回填；新代覆盖满可召回记忆后自动切换，旧代保留不删；换回旧模型会直接切回旧代，不重算"}
 
     async def vector_switch(self, gen_key: str) -> dict[str, Any]:
         gens = await self.store.gen_stats()

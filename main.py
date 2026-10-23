@@ -87,7 +87,7 @@ _CONTACT_SHAPE_KEYS = {
     "StarHeart",
     "肆一纸心",
     "记忆增强：把对话记成长期记忆，聊天时自动想起相关的；附带人物画像、关系与表达习惯，自带可视化面板。",
-    "1.0.4",
+    "1.0.5",
     "https://github.com/WSYXIUBA/astrbot_plugin_starheart",
 )
 class StarHeartPlugin(Star):
@@ -543,22 +543,36 @@ class StarHeartPlugin(Star):
             return str(active.get("gen") or active.get("gen_key") or "")
         return str(active or "")
 
-    def _embed_model_name(self, cfg: dict[str, Any]) -> str:
-        """取当前**实际会用**的嵌入模型名（槽位锁定就用它，留空就用跟随到的那个 provider）。
+    def _embed_target(self, cfg: dict[str, Any]) -> tuple[str, int, Any]:
+        """当前 embedding 模型的真实身份： (模型名, 维度, provider)。
 
-        为什么不能写死：写入向量要按真实模型名分代（gen_key），写死会在用户换模型后把向量标到
-        错误的代上（红线④：不写死模型）。
+        维度必须从 provider 拿（不是猜），因为 gen_key 是「模型|维度」；
+        只有模型名没有维度时，回填层会先用一条短文本探一次再定代。
         """
         pid = str(cfg.get("model_embedding") or "")
         provider = self.context.get_provider_by_id(pid) if pid else self._first_tool_provider("embedding")
         if provider is None:
-            return ""
+            return "", 0, None
+        model = ""
         try:
             meta = provider.meta()
-            name = str(getattr(meta, "model", "") or getattr(meta, "id", "") or "")
-        except Exception:
-            name = ""
-        return name or pid
+            model = str(getattr(meta, "model", "") or getattr(meta, "id", "") or "")
+        except Exception:                                  # noqa: BLE001
+            model = ""
+        if not model:
+            model = pid
+        dim = 0
+        try:
+            get_dim = getattr(provider, "get_dim", None)
+            if callable(get_dim):
+                dim = int(get_dim() or 0)
+        except Exception:                                  # noqa: BLE001
+            dim = 0
+        return model, dim, provider
+
+    def _embed_model_name(self, cfg: dict[str, Any]) -> str:
+        """取当前**实际会用**的嵌入模型名（槽位锁定就用它，留空就用跟随到的那个 provider）。"""
+        return self._embed_target(cfg)[0]
 
     async def _embed(self, text: str) -> list[float] | None:
         """用「模型分配 → 向量嵌入」指定的模型算向量。
@@ -573,12 +587,18 @@ class StarHeartPlugin(Star):
         provider = self.context.get_provider_by_id(pid) if pid else self._first_tool_provider("embedding")
         if provider is None:
             return None
-        try:
-            vec = await provider.get_embedding(text[:512])
-            return [float(x) for x in vec] if vec else None
-        except Exception as exc:
-            logger.warning(f"[StarHeart] 嵌入失败（{pid}）：{exc}")
-            return None
+        last_exc: Exception | None = None
+        for attempt in range(2):                       # 真机踩过：上游 503 抖动 + client closed，重试一次能救回
+            try:
+                vec = await provider.get_embedding(text[:512])
+                return [float(x) for x in vec] if vec else None
+            except Exception as exc:                  # noqa: BLE001
+                last_exc = exc
+                if attempt == 0:
+                    await asyncio.sleep(1.0)
+                    continue
+        logger.warning(f"[StarHeart] 嵌入失败（{pid}）：{last_exc}")
+        return None
 
     @staticmethod
     def _cosine(a: list[float], b_blob: bytes) -> float:
@@ -818,7 +838,7 @@ class StarHeartPlugin(Star):
     # 单次后台 LLM 调用的上限。以前是裸 await provider.text_chat(...)：没有超时，
     # 而 proactive_scan / 总结 / 画像都在 _background_loop 里 await 它 ——
     # 一次网络挂起就会把整条后台链（衰减、遗忘、画像、主动扫描）全部堵死到进程重启。
-    LLM_TIMEOUT_SECONDS = 60.0
+    LLM_TIMEOUT_SECONDS = 90.0
 
     # 初始化重试：一次失败（数据库被占用、目录还没挂载好）不该让插件永久失活。
     INIT_MAX_ATTEMPTS = 3
@@ -1361,18 +1381,23 @@ class StarHeartPlugin(Star):
                 f"[StarHeart] 记忆总结：写入 {res.get('saved')} 条（扫 {res.get('scanned')} 轮）"
             )
             cfg_emb = await self.service.config()
-            model_name = self._embed_model_name(cfg_emb)
-            if not model_name:
+            model_name, emb_dim, emb_provider = self._embed_target(cfg_emb)
+            if not model_name or emb_provider is None:
                 logger.warning("[StarHeart] 没有可用的嵌入提供商（槽位留空且 AstrBot 里也没配）→ 跳过补向量")
                 return res          # 必须回结果：调用方按 res["ok"] 决定是否删除 pending
-            for row in await self.store.memories_without_embedding(limit=5, persona_id=persona_id):
+            if emb_dim <= 0:
+                logger.warning("[StarHeart] 嵌入模型没有返回维度 → 跳过本轮补向量")
+                return res
+            target_gen = self.store.gen_key(model_name, emb_dim)
+            # 按「当前模型的目标代」补，而不是旧列 NULL：换模型时也能继续补新代
+            for row in await self.store.memories_missing_gen(target_gen, limit=5, persona_id=persona_id):
                 text = f"{row['summary']} {row['content'] or ''}".strip()[:512]
                 if not text:
                     continue
                 vec = await self._embed(text)
                 if vec:
-                    # 用当次真实模型名写入（不再写死 bge-m3）
-                    await self.store.set_embedding(row["id"], vec, model_name)
+                    actual_gen = self.store.gen_key(model_name, len(vec))
+                    await self.store.set_embedding_gen(row["id"], vec, model_name, gen_key=actual_gen)
             return res
         except asyncio.CancelledError:
             raise
@@ -1593,7 +1618,19 @@ class StarHeartPlugin(Star):
         旧行为是双重伤害：余弦 0.36 的沾边命中会顶掉整条关键词臂（`if not picked` 短路），
         而 0.34 的真命中连候选都进不来。阈值交给融合与重排，召回本身不做生死判断。
         """
-        pairs = await self.store.all_active_embeddings(persona_id=persona_id)
+        pairs: list[tuple[str, bytes]] = []
+        try:
+            gen = await self.store.active_gen()
+        except Exception:                                   # noqa: BLE001
+            gen = ""
+        if gen:
+            # 多代向量库：只读当前代，天然不会混维度；归档记忆也带上（被提及要能拉回）
+            pairs = await self.store.all_embeddings_gen(
+                gen, persona_id=persona_id, include_stale=True, include_archived=True
+            )
+        if not pairs:
+            # 老库/还没建代时的兜底：读旧列（只会在没有当前代时走到）
+            pairs = await self.store.all_active_embeddings(persona_id=persona_id)
         if not pairs:
             return []
         scored = [(mid, self._cosine(query_vec, blob)) for mid, blob in pairs]
@@ -1655,23 +1692,84 @@ class StarHeartPlugin(Star):
         return ordered[: max(1, top_k)]
 
     async def _backfill_embeddings(self) -> None:
-        """后台给存量记忆补向量（每轮最多 20 条，避免占满嵌入模型）。"""
+        """后台补向量：**按当前 embedding 模型的目标代回填**，建满后自动切换，旧代不删。
+
+        旧实现只看旧列 `embedding IS NULL`：换模型后旧列全有值 → 新代永远补不到，
+        而且 `set_embedding` 会无条件写旧列，导致旧列混维度、召回静默归零。
+        """
+        lock = getattr(self, "_embed_lock", None)
+        if lock is None:
+            lock = self._embed_lock = asyncio.Lock()
+        if lock.locked():                                  # 上一轮还没跑完，不叠加
+            return
+        async with lock:
+            await self._backfill_embeddings_locked()
+
+    async def _backfill_embeddings_locked(self) -> None:
         cfg = await self.service.config()
-        # 槽位留空也要能补（跟随 AstrBot 已配的嵌入提供商）；模型名按真实 provider 取，不能写死
-        model_name = self._embed_model_name(cfg)
-        if not model_name:
+        model, dim, provider = self._embed_target(cfg)
+        if not model or provider is None:
             logger.warning("[StarHeart] 没有可用的嵌入提供商 → 跳过后台补向量")
             return
-        # 补向量是维护任务，**不按当前人格收窄**：切到人格 B 之后，人格 A 的记忆
-        # 永远进不了补向量队列（真机实测：265 条 archived 全卡在「无向量」，覆盖率停在 71%）。
-        rows = await self.store.memories_without_embedding(limit=20, persona_id="")
+        if dim <= 0:
+            try:
+                probe = await provider.get_embedding("dimension probe")
+                dim = len(probe or [])
+            except Exception as exc:                       # noqa: BLE001
+                logger.warning(f"[StarHeart] 嵌入维度探测失败，跳过本轮补向量：{exc}")
+                return
+        if dim <= 0:
+            logger.warning("[StarHeart] 嵌入模型没有返回维度，跳过本轮补向量")
+            return
+
+        active = await self.store.active_gen()
+        target = self.store.gen_key(model, dim)
+
+        # 目标代已经建满 → 直接切过去（旧代保留）；没建满就继续补
+        if target != active:
+            missing = await self.store.gen_missing_count(target)
+            if missing == 0:
+                await self.store.set_active_gen(target)
+                try:
+                    await self.store.audit("vector.autoswitch", target, f"model={model} dim={dim}")
+                except Exception:                          # noqa: BLE001
+                    pass
+                logger.info(f"[StarHeart] 向量库自动切换 → {target}（旧代 {active or '无'} 保留）")
+                return
+
+        rows = await self.store.memories_missing_gen(target, limit=40)
+        if not rows:
+            return
+        done = 0
         for row in rows:
             text = f"{row['summary']} {row['content'] or ''}".strip()[:512]
             if not text:
                 continue
             vec = await self._embed(text)
-            if vec:
-                await self.store.set_embedding(row["id"], vec, model_name)
+            if not vec:
+                continue
+            actual = self.store.gen_key(model, len(vec))
+            if actual != target:                           # provider 实际维度与 get_dim 不一致：以真实为准
+                logger.warning(f"[StarHeart] 嵌入维度与声明不一致（声明 {dim}，实际 {len(vec)}），改用 {actual}")
+                target = actual
+            # 写目标代；set_embedding_gen 只在目标代==当前代时同步旧列
+            await self.store.set_embedding_gen(row["id"], vec, model, gen_key=target)
+            done += 1
+            await asyncio.sleep(0.3)                       # 限速：别把 embedding 上游打满
+
+        if target != active:
+            missing = await self.store.gen_missing_count(target)
+            if missing == 0:
+                await self.store.set_active_gen(target)
+                try:
+                    await self.store.audit("vector.autoswitch", target, f"model={model} dim={dim}")
+                except Exception:                          # noqa: BLE001
+                    pass
+                logger.info(f"[StarHeart] 向量库建满并切换 → {target}（旧代 {active or '无'} 保留）")
+            else:
+                logger.info(f"[StarHeart] 向量库回填 {target}：本批 +{done}，还缺 {missing} 条")
+        else:
+            logger.debug(f"[StarHeart] 向量库回填 {target}：本批 +{done}")
 
     def _timezone(self) -> str:
         """AstrBot 配置里的时区（面板的静默时段按这个算）。"""
@@ -2220,14 +2318,23 @@ class StarHeartPlugin(Star):
             kwargs["image_urls"] = list(image_urls)
         # 必须带超时：调用方有 _background_loop 里的 proactive_scan / 总结 / 画像，
         # 裸 await 一旦网络挂起会把整条后台链堵死到进程重启。
-        try:
-            _to = float(timeout or self.LLM_TIMEOUT_SECONDS)
-            resp = await asyncio.wait_for(provider.text_chat(**kwargs), timeout=_to)
-        except TimeoutError:
-            logger.warning(
-                f"[StarHeart] 模型调用超时（{float(timeout or self.LLM_TIMEOUT_SECONDS):.0f}s，task={task or 'chat'}）"
-                "：放弃本轮结果（返回空串），不让它拖住后台循环"
-            )
+        _to = float(timeout or self.LLM_TIMEOUT_SECONDS)
+        attempts = 2 if task == "memory_extract" else 1   # 抽取偶发 60s 超时（真机 6 次），给它一次重试
+        resp = None
+        for attempt in range(attempts):
+            try:
+                resp = await asyncio.wait_for(provider.text_chat(**kwargs), timeout=_to)
+                break
+            except TimeoutError:
+                if attempt + 1 < attempts:
+                    logger.warning(f"[StarHeart] 模型调用超时（{_to:.0f}s，task={task}）：重试一次")
+                    continue
+                logger.warning(
+                    f"[StarHeart] 模型调用超时（{_to:.0f}s，task={task or 'chat'}）"
+                    "：放弃本轮结果（返回空串），不让它拖住后台循环"
+                )
+                return ""
+        if resp is None:
             return ""
         chain = getattr(getattr(resp, "result_chain", None), "chain", None) or []
         text = "".join(getattr(part, "text", "") or "" for part in chain)
@@ -4843,22 +4950,62 @@ class StarHeartPlugin(Star):
                 "failed": failed, "remaining": remaining, "model": model, "batch": len(chunk)}
 
     async def embed_backfill(self, limit: int = 16) -> dict:
-        """批量补向量。返回实时覆盖度，前端可以边跑边看进度。"""
-        cfg = await self.service.config()
-        # 不能再拿 provider id 当模型名（否则同一模型分裂成两代，覆盖率/召回都看不见）
-        model = self._embed_model_name(cfg) or str(cfg.get("model_embedding") or "")
-        if not model:
-            return {"ok": False, "error": "没配「向量嵌入」模型：设置 → 模型分配 → 向量嵌入"}
-        rows = await self.store.memories_without_embedding_any(limit=limit)
-        done = failed = 0
-        for row in rows:
-            text = (row.get("summary") or "") + " " + (row.get("content") or "")
-            vec = await self._embed(text.strip() or row.get("summary") or "")
-            if vec:
-                await self.store.set_embedding(row["id"], vec, model)
-                done += 1
-            else:
-                failed += 1
-            await asyncio.sleep(0.25)                       # 限速：保护 embedding 提供商与事件循环
-        cov = await self.store.embedding_coverage()
-        return {"ok": True, "embedded": done, "failed": failed, "model": model, "coverage": cov}
+        """批量补向量（面板按钮）。
+
+        多代语义：按当前嵌入模型算出目标代，只补这一代缺的；建满后自动切过去。
+        旧代一条不删，换回旧模型时直接切回、不重算。
+        """
+        lock = getattr(self, "_embed_lock", None)
+        if lock is None:
+            lock = self._embed_lock = asyncio.Lock()
+        if lock.locked():
+            return {"ok": False, "error": "后台正在补向量，稍后再点（不会重复叠加）"}
+        async with lock:
+            cfg = await self.service.config()
+            model, dim, provider = self._embed_target(cfg)
+            if not model or provider is None:
+                return {"ok": False, "error": "没配「向量嵌入」模型：设置 → 模型分配 → 向量嵌入"}
+            if dim <= 0:
+                try:
+                    probe = await provider.get_embedding("dimension probe")
+                    dim = len(probe or [])
+                except Exception as exc:                   # noqa: BLE001
+                    return {"ok": False, "error": f"嵌入维度探测失败：{exc}"}
+            if dim <= 0:
+                return {"ok": False, "error": "嵌入模型没有返回维度"}
+
+            active = await self.store.active_gen()
+            target = self.store.gen_key(model, dim)
+            rows = await self.store.memories_missing_gen(target, limit=limit)
+            done = failed = 0
+            for row in rows:
+                text = (row.get("summary") or "") + " " + (row.get("content") or "")
+                vec = await self._embed(text.strip() or row.get("summary") or "")
+                if not vec:
+                    failed += 1
+                else:
+                    actual = self.store.gen_key(model, len(vec))
+                    if actual != target:
+                        logger.warning(f"[StarHeart] 嵌入维度与声明不一致（声明 {dim}，实际 {len(vec)}），改用 {actual}")
+                        target = actual
+                    await self.store.set_embedding_gen(row["id"], vec, model, gen_key=target)
+                    done += 1
+                await asyncio.sleep(0.25)                   # 限速：保护 embedding 提供商与事件循环
+
+            if target != active:
+                missing = await self.store.gen_missing_count(target)
+                if missing == 0:
+                    await self.store.set_active_gen(target)
+                    try:
+                        await self.store.audit("vector.autoswitch", target, f"model={model} dim={dim} manual")
+                    except Exception:                      # noqa: BLE001
+                        pass
+                    logger.info(f"[StarHeart] 向量库手动回填后自动切换 → {target}（旧代 {active or '无'} 保留）")
+            target_missing = await self.store.gen_missing_count(target)
+            return {
+                "ok": True, "embedded": done, "failed": failed, "model": model,
+                "target": target, "active": await self.store.active_gen(),
+                "target_missing": target_missing,
+                "items": await self.store.gen_stats(),
+                "coverage": await self.service.embedding_coverage(),
+            }

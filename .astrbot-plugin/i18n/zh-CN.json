@@ -386,22 +386,22 @@
       "description": "主动开口复用 AstrBot 完整提示词的缓存时效（分钟），超时降级为只吃人格并在流水标注"
     },
     "conn_mode_group": {
-      "description": "群聊可见性：black=黑名单（空=谁都不回）/ white=白名单（空=谁都不回）"
+      "description": "群聊可见性：black=黑名单（空=谁都不回）/ white=白名单（空=全部放行）"
     },
     "conn_mode_private": {
-      "description": "私聊可见性：black=黑名单（空=谁都不回）/ white=白名单（空=谁都不回）"
+      "description": "私聊可见性：black=黑名单（空=谁都不回）/ white=白名单（空=全部放行）"
     },
     "conn_black_group": {
       "description": "群聊可见性黑名单（群号）"
     },
     "conn_white_group": {
-      "description": "群聊可见性白名单（群号；空白名单=谁都不回）"
+      "description": "群聊可见性白名单（群号；空白名单=全部放行）"
     },
     "conn_black_private": {
       "description": "私聊可见性黑名单（QQ 号）"
     },
     "conn_white_private": {
-      "description": "私聊可见性白名单（QQ 号；空白名单=谁都不回）"
+      "description": "私聊可见性白名单（QQ 号；空白名单=全部放行）"
     },
     "persona_active_id": {
       "description": "当前人格 id；留空=跟随 AstrBot 原生当前人格"

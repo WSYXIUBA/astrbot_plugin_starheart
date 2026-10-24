@@ -8,17 +8,17 @@
  * - 设置：模块开关 + 数据治理（破坏性操作集中卡），模块卡带状态灯。
  */
 
-import * as C from "./charts.js?v=1.0.5-3";
+import * as C from "./charts.js?v=1.0.6";
 import {
   $, $$, api, apiSafe, apiPostSafe, esc, fmtNum, fmtPct, fmt1, fmtTime, timeAgo, toast, openDrawer, closeDrawer,
   confirmModal, formModal, pageHead, card, kpiCard, kpis, secTitle, mount, emptyBlock, skelBlock, jsStr, STATE, segmentHtml,
   syncSeg, bridge, EP, refreshCurrent, goPage, countUp, configTouchedAt, noteConfigTouched, recentFirstKeys, takeConfigDirty, nativeWriteError,
-} from "./store.js?v=1.0.5-3";
-import { renderDomainConf, domainRowsHtml, CONFIG_META } from "./views-conf.js?v=1.0.5-3";
+} from "./store.js?v=1.0.6";
+import { renderDomainConf, domainRowsHtml, CONFIG_META } from "./views-conf.js?v=1.0.6";
 // 收尾批：四个消息域的参数渲染器（原页底折叠区）——原样迁进本文件的「设置 · 模块与参数」页
-import { renderGateConf, renderProactiveConf, renderRecallConf, renderFavourConf } from "./views-events.js?v=1.0.5-3";
-import { ATOM_LABEL } from "./views-memory.js?v=1.0.5-3";
-import { GRAPH_PALETTE } from "./graph.js?v=1.0.5-3";
+import { renderGateConf, renderProactiveConf, renderRecallConf, renderFavourConf } from "./views-events.js?v=1.0.6";
+import { ATOM_LABEL } from "./views-memory.js?v=1.0.6";
+import { GRAPH_PALETTE } from "./graph.js?v=1.0.6";
 
 // S4-2：「先审后用」开关挂语言学习域。CONFIG_META 由 views-conf.js 定义并被域页过滤读取，
 // 新键必须登记在这里，否则参数页不渲染、保存也会被 CONFIG_META 过滤掉（静默丢键）。
@@ -1968,7 +1968,7 @@ export async function hfPurge(scope) {
 }
 
 const CONN_MODES = [
-  { v: "white", label: "白名单", hint: "只有名单里的群/人能被StarHeart看到；其余全部当不存在。白名单为空 = 谁都不回。只写插件本地，不改 AstrBot 全局白名单。" },
+  { v: "white", label: "白名单", hint: "只有名单里的群/人能被StarHeart看到；白名单清空 = 全部放行（保存时会连同 AstrBot 全局白名单一起放开）。" },
   { v: "black", label: "黑名单", hint: "勾选 = 对 StarHeart 不存在：不记忆、不学说话、不算好感、不进主动候选。只写插件本地，不改 AstrBot 全局白名单。" },
 ];
 
@@ -2014,10 +2014,10 @@ function connCard(kind, title, list, filter) {
     </div>
     ${
       mode === "white" && !picked.size
-        ? `<div class="noteblock" style="border-left-color:var(--error);margin-bottom:8px">
-             ⚠ <b>白名单是空的</b>：<b>不能直接保存</b>（fail-closed，避免误点后整类静默）。
-             想放行谁就勾上它，再点「保存」；也可以
-             <button class="btn xs" onclick="hfConnSeedAll('${kind}', this)">全部放行</button>（把列出来的 ${list.length} 项一次加进白名单，之后慢慢删）。
+        ? `<div class="noteblock" style="border-left-color:var(--warning);margin-bottom:8px">
+             <b>白名单是空的</b>：直接点「保存」就是<b>全部放行</b>（不限制任何群/人，同时放开 AstrBot 全局白名单）。
+             只想放行一部分就勾上它们再保存；也可以
+             <button class="btn xs" onclick="hfConnSeedAll('${kind}', this)">只放行列出的 ${list.length} 项</button>（先能用，再慢慢删）。
            </div>`
         : ""
     }
@@ -2064,7 +2064,7 @@ export async function renderContacts() {
   const html = `
   ${pageHead(
     "名单与可见性",
-    "这里是「StarHeart能看到谁」的总闸门，只有<b>黑名单</b>和<b>白名单</b>两种：黑名单内 = 对 bot 不存在；白名单 = 只有名单内可见，<b>白名单为空 = 谁都不回</b>（fail-closed）。主动消息的黑白名单是在这之上的收窄；管理员名单读的是 AstrBot 原生配置；<b>这里的名单只写插件本地</b>，不改 AstrBot 全局「平台配置 → 白名单」，避免影响其他插件与私聊。",
+    "这里是「StarHeart能看到谁」的总闸门，只有<b>黑名单</b>和<b>白名单</b>两种：黑名单内 = 对 bot 不存在；白名单 = 只有名单内可见，<b>白名单清空 = 全部放行</b>。主动消息的黑白名单是在这之上的收窄；管理员名单读的是 AstrBot 原生配置。<b>保存空白白名单时会同步清空 AstrBot 全局「平台配置 → 白名单」</b> —— 否则原生白名单会在消息入口就拦下非名单用户，插件根本收不到消息。",
     `<button class="btn" onclick="hfContactsRefresh(this)">重新拉取</button>
      <button class="btn s" onclick="goPage('messages','proactive')">主动设置 →</button>`,
     "☰"
@@ -2160,15 +2160,16 @@ export async function hfConnSave(kind, btn) {
   const mode = raw === "black" ? "black" : "white";
   const ids = Array.from((STATE.pick && STATE.pick[`${kind}:${mode}`]) || []);
   if (btn) btn.classList.add("loading");
-  const res = await apiPostSafe("contacts/set", { kind, mode, ids });
+  const res = await apiPostSafe("contacts/set", { kind, mode, ids, sync_native: mode === "white" && !ids.length });
   if (btn) btn.classList.remove("loading");
   if (!res.ok) {
     toast("写入失败：" + res.error, "err");
     return;
   }
   STATE.filter = res.data || STATE.filter;
-  const warn = mode === "white" && !ids.length ? "（白名单为空 = 谁都不回）" : "";
-  toast(`已保存${kind === "group" ? "群聊" : "私聊"}${mode === "black" ? "黑名单" : "白名单"}：${ids.length} 项${warn}`, mode === "black" || ids.length ? "ok" : "err");
+  const warn = mode === "white" && !ids.length ? "（白名单为空 = 全部放行）" : "";
+  const note = (res.data && res.data.note) ? ` · ${res.data.note}` : "";
+  toast(`已保存${kind === "group" ? "群聊" : "私聊"}${mode === "black" ? "黑名单" : "白名单"}：${ids.length} 项${warn}${note}`, note && /失败|不可用/.test(note) ? "err" : "ok");
   refreshCurrent();
 }
 

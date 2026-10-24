@@ -62,6 +62,21 @@ _ATOM_TYPES = frozenset(
     {"episodic", "factual", "relational", "preference", "planned", "routine", "opinion"}
 )
 
+
+def _uid_for_quote(quote: str, turns: list[dict[str, Any]]) -> str:
+    """按引文反查是哪一轮说的 → 该轮说话人 uid（群聊归属靠它，session_id 只到群）。
+
+    引文可能出自「我」那半句：群聊里我回应的是那一轮的人，取该轮 uid 仍然正确。
+    """
+    q = engine.norm_quote(quote)
+    if not q:
+        return ""
+    for t in reversed(turns or []):
+        if q in engine.norm_quote(t.get("user") or "") or q in engine.norm_quote(t.get("bot") or ""):
+            return str(t.get("uid") or "")
+    return ""
+
+
 def _salvage_fields(cand: str) -> dict[str, Any] | None:
     """最后一招：JSON 语法坏了也把常见字段抠出来（宁可要半成品，也不要"画像没生成"）。
 
@@ -389,7 +404,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "memory_inject_top_k": 8,
     "memory_inject_budget_tokens": 1200,   # 实为字符数（键名沿用旧版，改键名会丢老配置）
     "memory_decay_half_life_days": 45,
-    "memory_evict_below": 0.05,
+    "memory_evict_below": 0.0,   # 0 = 不降态（P0-4：只降强度，不翻 stale）
     "memory_persona_isolated": True,
     "session_context_enabled": True,
     "memory_capture_enabled": True,
@@ -402,6 +417,26 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "cross_session_ttl_min": 120,
     "cross_session_memory": True,
     "memory_summary_prompt": "",     # 记忆总结自定义提示词（空 = 用内置；支持 {transcript} 占位）
+    # ---- 记忆归属与隔离（2026-10-24）：群/私记忆可见方向、在场成员窗口、画像注入、冲突保持 ----
+    # 群里的记忆私聊也能想起来（渲染带「在群里听 XX 说过」渠道标注）。默认开：记忆不贫瘠。
+    "memory_group_to_private": True,
+    # 私聊记忆进群聊上下文：默认关（隐私档）。打开也只是 0.4× 降权 + 标注「私下说的」，数据不删。
+    "memory_private_to_group": False,
+    # 群聊记忆进**别的群**：默认关（P0-2 复查发现：群聊记忆 subject 恒空会被当无主全局，
+    # 旧逻辑在任意群放行 = A 群的私事被念到 B 群）。开 = 放行（不降权，面板可关）。
+    "memory_group_to_group": False,
+    # 本人私聊记忆进群（跨会话串通）：默认开——群里你问「我私聊跟你说过的那个事」，
+    # bot 能想起来（标「私下说的」并降权）。只放当前说话人自己的，别人的私聊仍受上面 p2g 控制。
+    "memory_private_to_group_self": True,
+    # 群聊「在场成员」窗口：当前说话人 + @对象 + 被回复人 + 最近 N 轮出现过的 uid。0 = 只认 @/回复。
+    "memory_group_cast_size": 5,
+    # 画像注入闭环：私聊注入本人画像，群聊注入在场成员（≤memory_profile_inject_cast 人）。零 LLM（只读现成画像）。
+    "memory_profile_inject": True,
+    "memory_profile_inject_cast": 3,
+    # 某人新记忆攒够 N 条 → 自动入画像刷新队列（复用 auto_profile_tick；0 = 沿用原刷新节奏）
+    "memory_profile_refresh_new": 5,
+    # v2 逐字冲突保持：新旧都带逐字引文且互斥 → 不静默 SUPERSEDE，新条进「冲突待审」由面板裁决
+    "memory_conflict_hold": True,
     # 插件自管任务的系统提示词覆盖（留空 = 用内置默认；面板「模型分配」可展开编辑）
     "sys_prompt_memory_summary": "",
     "sys_prompt_expression_extract": "",
@@ -418,6 +453,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "favour_daily_cap": 15,              # 好感日上限：当天正增量累计到此封顶（0 = 不限）
     "favour_daily_half_life_days": 0,    # 好感 daily 的半衰期天数（0 = 关闭衰减；库里配了值就以库里的为准）
     "favour_tag_required": True,         # 必须带好感标签才结算；关掉则无标签也按 +1
+    # 好感分群分档：同一个人在群里和私聊各记一份温度（hf_favour_zones，group_id=''=全局/私聊档）。
+    # 开启后旧表双写保留（主动开口的 min_zone 等旧消费方不受影响）；关掉回旧表读。
+    "favour_per_group": True,
     "expression_enabled": True,
     "expression_min_uses": 3,            # 表达习惯至少生效过 N 次才算"已验证"（没达标的只在名额没用满时补位）
     "expression_auto_min_corpus": 20,    # 未学语料攒够 N 条就自动提取一次（0 = 关自动，只留面板手动）
@@ -512,6 +550,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "recall_react_group": "related",      # 群聊范围：related=只对与 bot 有互动的消息 / all=群里任何人都触发 / off=群聊不触发
     "recall_react_images": True,          # 把被撤回的图片一并交给模型看（原生多模态，最多 2 张）
     "recall_react_extra": "",             # 追加在撤回通知后面的自定义指示（留空=不加）
+    # —— QQ 事件面（P1-2）：戳一戳 / 群成员变动 ——
+    "poke_react_enabled": False,          # 被戳一戳时当场回一句（默认关：只感知+记忆，不抢话）
+    "member_event_enabled": True,         # 入群/退群/被踢进事件知会与记忆（关闭=完全无感）
+    # —— 记忆检索 LLM 工具（P1-1）——
+    "memory_tools_enabled": True,         # bot 可主动调 starheart_* 工具查自己的记忆
     "import_layers": ["documents", "atoms"],
     # 六个任务的模型分配：空字符串 = 跟随会话当前模型，只有显式选择才锁定
     # 人格自动进化（详细说明在 _conf_schema.json；面板也能改）
@@ -531,8 +574,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "model_persona_evolve": "",   # 人格进化提案：留空 = 跟随会话当前模型（可锁便宜模型，不影响对话链路）
     "model_embedding": "",
     # 自动遗忘：久未被提及 → 归档；归档后再久未被提及且不重要 → 遗忘
-    "forget_enabled": True,
-    "archive_after_days": 90,
+    # 2026-10-24 复查 P0-4：默认改成「不丢记忆」口径——遗忘默认关、归档 0=关
+    # （陪伴 bot 的价值就是半年前随口说的话还记得；旧默认 90/180 天 = 事实丢弃）
+    "forget_enabled": False,
+    "archive_after_days": 0,          # 0 = 不归档（不是「立刻归档」）
     "forget_after_days": 180,
     "forget_min_strength": 0.2,
     "forget_keep_poignancy": 6,
@@ -591,8 +636,8 @@ PARAM_GUARDS: dict[str, dict[str, Any]] = {
     "memory_capture_min_interval": {"label": "总结最小间隔(秒)", "min": 0, "max": 3600},
     "forget_after_days": {"label": "遗忘周期(天)", "min": 1, "max": 365, "hard": True,
                           "why": "低于 1 天等于归档就遗忘，记忆当场清空"},
-    "archive_after_days": {"label": "归档周期(天)", "min": 1, "max": 3650, "hard": True,
-                           "why": "低于 1 天等于一次 tick 归档全库（旧版无护栏，填 0/负数会当场扫空）"},
+    "archive_after_days": {"label": "归档周期(天)", "min": 0, "max": 3650, "hard": True,
+                           "why": "0 = 不归档（P0-4 起 0 是「关」不是「立刻」；旧版填 0 会当场扫描全库）"},
     "forget_min_strength": {"label": "遗忘强度下限", "min": 0, "max": 1},
     "forget_keep_poignancy": {"label": "情绪保护线", "min": 0, "max": 10},
     "favour_daily_cap": {"label": "好感日上限", "min": 0, "max": 100},
@@ -621,10 +666,18 @@ PARAM_GUARDS: dict[str, dict[str, Any]] = {
     "expression_min_uses": {"label": "表达验证次数", "min": 1, "max": 50},
     "gate_window_seconds": {"label": "门控统计窗口(秒)", "min": 5, "max": 600},
     "memory_capture_turns": {"label": "每次总结轮数", "min": 1, "max": 50},
-    "memory_decay_half_life_days": {"label": "记忆半衰期(天)", "min": 1, "max": 3650},
+    "memory_decay_half_life_days": {"label": "记忆半衰期(天)", "min": 0, "max": 3650,
+                                   "why": "0 = 关闭衰减（记忆强度不再随时间下降）"},
     "memory_evict_below": {"label": "记忆淘汰阈值", "min": 0, "max": 1},
     "memory_inject_budget_tokens": {"label": "注入预算(tokens)", "min": 100, "max": 8000},
     "memory_inject_top_k": {"label": "注入条数", "min": 1, "max": 50},
+    # 记忆归属与隔离（2026-10-24）
+    "memory_group_cast_size": {"label": "在场成员窗口(轮)", "min": 0, "max": 30,
+                               "why": "窗口越大群聊召回越准，但候选集也越大；0 = 只认 @/回复对象"},
+    "memory_profile_inject_cast": {"label": "画像注入人数", "min": 0, "max": 6,
+                                   "why": "0 = 群聊不注入画像；高于 6 会挤占记忆预算"},
+    "memory_profile_refresh_new": {"label": "画像刷新阈值(条)", "min": 0, "max": 100,
+                                   "why": "0 = 关增量触发（沿用原 72h 节奏）；太小会频繁调画像模型"},
     "proactive_context_memories": {"label": "主动参考记忆条数", "min": 0, "max": 20},
     "proactive_daily_cap": {"label": "每日主动上限", "min": 0, "max": 50},
     "proactive_idle_min": {"label": "主动静默时长(分钟)", "min": 0, "max": 1440},
@@ -1028,16 +1081,24 @@ CONFIG_DOMAINS: dict[str, list[str]] = {
                "memory_decay_half_life_days", "memory_evict_below",
                "memory_capture_enabled", "memory_capture_turns",
                "memory_capture_min_interval", "memory_capture_max_per_run",
-               "cross_session_enabled", "cross_session_ttl_min", "cross_session_memory"],
+               "cross_session_enabled", "cross_session_ttl_min", "cross_session_memory",
+               # 记忆归属与隔离（2026-10-24）：群/私方向开关、在场成员窗口、画像注入、冲突保持
+               "memory_group_to_private", "memory_private_to_group", "memory_group_to_group",
+               "memory_private_to_group_self", "memory_group_cast_size",
+               "memory_profile_inject", "memory_profile_inject_cast", "memory_profile_refresh_new",
+               "memory_conflict_hold"],
     "expression": ["expression_enabled", "expression_min_uses", "expression_auto_min_corpus",
                    "output_expr_max_inject", "expression_review_first",
                    # S5 黑话（同一「语言学习」页的块② 与同域参数；阈值/配额拍-16/19 可调）
                    "jargon_enabled", "jargon_name_filter", "jargon_candidate_min_sessions",
                    "jargon_candidate_min_hits", "jargon_infer_daily_batches", "jargon_try_daily_quota"],
-    "favour": ["favour_enabled", "favour_settle_mode", "favour_daily_cap", "favour_daily_half_life_days", "favour_tag_required"],
+    "favour": ["favour_enabled", "favour_settle_mode", "favour_daily_cap", "favour_daily_half_life_days",
+               "favour_tag_required", "favour_per_group"],
     "recall": ["recall_handling", "recall_weaken_factor", "recall_keep_days", "recall_withdraw_reply",
                "recall_interrupt_reply",
-               "recall_react_enabled", "recall_react_group", "recall_react_images", "recall_react_extra"],
+               "recall_react_enabled", "recall_react_group", "recall_react_images", "recall_react_extra",
+               # QQ 事件面（P1-2）：撤回之外的通知——戳一戳回应 / 成员变动感知
+               "poke_react_enabled", "member_event_enabled"],
     "proactive": ["proactive_enabled", "proactive_shadow", "proactive_idle_min", "proactive_daily_cap",
                   "proactive_min_interval_min", "proactive_quiet_start", "proactive_quiet_end",
                   "proactive_min_zone", "proactive_last_only", "proactive_style",
@@ -1327,10 +1388,10 @@ class StarHeartService:
 
         判定来源：群聊只读尊重 AstrBot 原生白名单；私聊只看插件本地名单。
         原生语义：**未启用 / 名单为空 = 全部放行（等于不触发）**；启用且非空 = 仅名单内可见。
-        本地名单永远优先：黑名单内直接不可见；白名单为空 = 谁都不回（fail-closed）。
+        本地名单永远优先：黑名单内直接不可见；白名单为空 = 全部放行（与原生语义一致）。
 
         黑名单：名单内 → 不存在（不论当前是 black 还是 white 模式）；
-        白名单：名单外 → 不存在（名单为空 = 谁都不回，fail-closed）；
+        白名单：名单外 → 不存在（名单为空 = 全部放行）；
         off：全都存在。
         """
         if kind not in ("group", "private"):
@@ -1347,9 +1408,10 @@ class StarHeartService:
         if ident in black_ids:
             return False, "在可见性黑名单里"
         ids = _as_id_list(cfg.get(cls._conn_keys(kind, mode)))
-        # 本地白名单为空 = 谁都不回：这条要压过原生白名单（用户在本插件里的显式选择）
+        # 本地白名单为空 = 全部放行：用户口径「清空名单 = 全放行」，
+        # 与 AstrBot 原生白名单「名单为空 = 不检查」一致（旧实现按 fail-closed 当成谁都不回）。
         if mode == "white" and not ids:
-            return False, "可见性白名单为空（谁都不回）"
+            return True, "可见性白名单为空（全部放行）"
         nat = _native_vis()
         # 只有群聊用原生白名单：原生名单是「群号+QQ 号」一份平表，
         # 私聊若也套它，只填了群号时会把所有私聊判成名单外。私聊一律走本地名单。
@@ -1359,10 +1421,8 @@ class StarHeartService:
             if _native_id_match(ident, platform, kind, nat["ids"]):
                 return True, "在原生白名单里"
             return False, "不在原生白名单里"
-        # 原生桥不可用：按本地名单退回
+        # 原生桥不可用：按本地名单退回（空名单已在上面按「全部放行」判过）
         if mode == "white":
-            if not ids:
-                return False, "可见性白名单为空（谁都不回）"
             if ident in ids:
                 return True, ""
             return False, "不在可见性白名单里"
@@ -1382,8 +1442,9 @@ class StarHeartService:
             out["black"][kind] = black
             out["white"][kind] = white
             out["counts"][kind] = {"black": len(black), "white": len(white)}
-            # 白名单为空 = 谁都不回：面板要能一眼看见这个「静默」状态
-            out.setdefault("silent", {})[kind] = bool(mode == "white" and not white)
+            # 白名单为空 = 全部放行：面板要能一眼看见这个「不拦人」状态
+            out.setdefault("silent", {})[kind] = False
+            out.setdefault("open_all", {})[kind] = bool(mode == "white" and not white)
         try:
             hidden = await self.store.hidden_contacts()
             out["hidden"] = {"group": hidden.get("group", []), "private": hidden.get("private", [])}
@@ -1411,12 +1472,13 @@ class StarHeartService:
         out["names"] = names
         return out
 
-    async def set_contact_filter(self, kind: str, mode: str, ids: list[str]) -> dict[str, Any]:
+    async def set_contact_filter(self, kind: str, mode: str, ids: list[str], sync_native: bool = False) -> dict[str, Any]:
         """整表写入某一边的名单（面板就是「多选 → 确定」这一步）。
 
-        只写插件本地：AstrBot 原生白名单是全局的（群号 + QQ 号共用一份，还会
-        影响其他插件与私聊），从面板替用户改它太容易把别的会话一起挡掉。
-        原生名单仍会被只读尊重（visible 里对群聊生效），但插件不再写它。
+        默认只写插件本地：AstrBot 原生白名单是全局的（群号 + QQ 号共用一份，还会影响
+        其他插件与私聊），替用户改它容易把别的会话一起挡掉。例外：白名单被清空
+        （= 要求全部放行）且调用方显式传 sync_native 时，会把原生名单一并清空 ——
+        否则插件这边放行了，消息仍会在入口被原生白名单拦掉。
         """
         if kind not in ("group", "private"):
             raise ValueError(f"unknown kind: {kind}")
@@ -1438,14 +1500,52 @@ class StarHeartService:
             logger.warning(
                 f"[StarHeart] 名单里混进了联系人结构体键名，已丢弃：{', '.join(_junk)}"
             )
-        if mode == "white" and not clean:
-            # fail-closed 之后「白名单+空」= 该类全局静默；这不该由一次误点写入。
-            raise ValueError("可见性白名单不能为空；想静音请用「不主动」或关掉总开关")
         await self.store.set_config(f"conn_mode_{kind}", mode)
         await self.store.set_config(self._conn_keys(kind, mode), clean)
         await self.store.audit(f"contacts.set_{kind}_{mode}", f"{len(clean)} 项（本地）")
-        return await self.contact_filter()
+        note = ""
+        if mode == "white" and not clean and sync_native:
+            # 用户口径：白名单清空 = 全部放行。只清本地没用 —— AstrBot 原生白名单
+            # 仍会在消息入口就拦下非名单用户，插件根本收不到消息，所以一并放开原生那份。
+            note = await self._native_open_all()
+        out = await self.contact_filter()
+        if note:
+            out["note"] = note
+        return out
 
+    async def _native_open_all(self) -> str:
+        """把 AstrBot 全局白名单置为空（原生语义：名单为空 = 不检查 = 全部放行）。
+
+        只在用户显式清空本插件白名单并保存时调用；写失败必须带回可见提示，不许静默。
+        """
+        fn = self.system.get("native_visibility_write")
+        if not callable(fn):
+            return "原生白名单桥不可用；AstrBot 全局白名单若仍开着，入口还会拦人"
+        nat = _native_vis()
+        enable = bool(nat.get("enable")) if nat is not None else True
+        try:
+            r = fn(enable, [])
+            if asyncio.iscoroutine(r):
+                r = await r
+        except Exception as exc:                                  # noqa: BLE001
+            logger.warning(f"[StarHeart] 清空原生白名单失败：{exc}")
+            return f"原生白名单同步失败：{str(exc)[:120]}"
+        if isinstance(r, dict) and not r.get("ok"):
+            return f"原生白名单同步失败：{r.get('error')}"
+        await self.store.audit("contacts.native_open_all", "清空 AstrBot 原生白名单（全部放行）")
+        # 入口白名单是 stage 初始化时缓存进实例的，改配置不会自己重读 —— 必须重建流水线。
+        reload_note = ""
+        fn2 = self.system.get("reload_message_pipeline")
+        if callable(fn2):
+            try:
+                r2 = fn2()
+                if asyncio.iscoroutine(r2):
+                    r2 = await r2
+                reload_note = str(r2 or "")
+            except Exception as exc:                              # noqa: BLE001
+                reload_note = f"流水线重载失败（{str(exc)[:80]}）；重启 AstrBot 后入口才放开"
+        base = "已同步清空 AstrBot 全局白名单"
+        return f"{base}；{reload_note}" if reload_note else base
 
     def _list_key(self, kind: str, mode: str) -> str:
         return f"proactive_{'wl' if mode == 'allow' else 'bl'}_{'group' if kind == 'group' else 'private'}"
@@ -1801,7 +1901,19 @@ class StarHeartService:
                 return ZoneInfo(tz_name)
             except Exception:
                 pass
-        return None
+        # P2-25：未配置时区时不再静默退容器本地时间（UTC 容器会让「今天/昨天」差 8h、
+        # 静默时段与日上限边界全错）。兜底 Asia/Shanghai 并只 warning 一次。
+        if not getattr(self, "_tz_warned", False):
+            self._tz_warned = True
+            logger.warning(
+                "[StarHeart] 未配置时区（AstrBot 全局与插件都为空），按 Asia/Shanghai 兜底；"
+                "若实际不在东八区请在 AstrBot 设置里配 timezone")
+        try:
+            from zoneinfo import ZoneInfo
+
+            return ZoneInfo("Asia/Shanghai")
+        except Exception:
+            return None
 
     def timezone(self, cfg: dict[str, Any]):
         """对外别名：插件各处要「按 AstrBot 时区」算时间时统一走它（容器时区常见是 UTC）。"""
@@ -2242,7 +2354,7 @@ class StarHeartService:
             subject_id = str(ident or "") if kind == "private" else ""
             base_sql = (
                 "SELECT id, summary, occurred_at, created_at, atom_type, strength, status, "
-                "poignancy, tags, source_mode "
+                "poignancy, tags, source_mode, said_by " 
                 "FROM hf_memories WHERE status NOT IN ('deleted','forgotten') AND COALESCE(muted,0)=0 AND summary!='' "
                 "AND (session_id=?"
             )
@@ -2532,16 +2644,21 @@ class StarHeartService:
             return {"ok": False, "skipped": "disabled"}
         sid = str(info.get("session_id") or "")
         mid = str(info.get("message_id") or "")
-        if not sid or not mid:
+        if not sid:
+            return {"ok": False, "skipped": "no-session"}
+        # 事件模式（戳一戳/成员变动借道）：没有 message_id，跳过撤回专属的前置
+        event_mode = bool(info.get("event_mode"))
+        if not mid and not event_mode:
             return {"ok": False, "skipped": "no-session"}
         # 同一条只反应一次（防重复触发，不是频率限制——用户要求不限频）
         seen = getattr(self, "_recall_reacted", None)
         if seen is None:
             seen = self._recall_reacted = []
-        if mid in seen:
+        if mid and mid in seen:
             return {"ok": False, "skipped": "dup"}
-        seen.append(mid)
-        del seen[:-64]
+        if mid:
+            seen.append(mid)
+            del seen[:-64]
         kind, ident = self.session_kind(sid)
         # 可见性：原生的名单判定照常走（webchat 例外在 visible 内部处理）—— 不破原生限制
         try:
@@ -2552,7 +2669,8 @@ class StarHeartService:
             logger.info(f"[StarHeart] 撤回反应跳过：该目标{why}")
             return {"ok": False, "skipped": "invisible"}
         # 群聊范围：related = 只对与 bot 有互动的消息反应（前后一条是 bot 发言）
-        if kind == "group":
+        # 事件模式（戳一戳等）不走这套：它不是「撤回了某条消息」，没有前后文可判
+        if kind == "group" and not event_mode:
             mode = str(cfg.get("recall_react_group") or "related").lower()
             if mode in ("off", "none", "false"):
                 return {"ok": False, "skipped": "group-off"}
@@ -2596,15 +2714,24 @@ class StarHeartService:
             return {"ok": False, "skipped": "no-prompt"}
         what = text or (f"（图片 {len(img_all)} 张）" if img_all else "（内容未留存）")
         extra = str(cfg.get("recall_react_extra") or "").strip()
-        notice = (
-            "【系统通知】当前消息已被用户撤回 —— 它已经不算数了，不要再当成有效上下文。\n"
-            f"撤回的人：{who or '对方'}\n"
-            f"被撤回的内容：{what}\n"
-            + (f"（随本轮附上被撤回的图片 {len(imgs)} 张，你可以直接看）\n" if imgs else "")
-            + (extra + "\n" if extra else "")
-            + "要不要回应、怎么回应（装没看见 / 追问 / 调侃 / 认错 / 什么都不说）完全由你决定；"
-              "想说话就直接输出要发的那句话（口语化、别解释）；不想说话就只输出 " + self.RECALL_REACT_SILENT + "。"
-        )
+        if event_mode:
+            # 事件模式：text 就是完整事件描述（含「像真人一样回应」的指引）
+            notice = (
+                "【系统通知】" + what + "\n"
+                + (extra + "\n" if extra else "")
+                + "要不要回应完全由你决定；想说话就直接输出要发的那句话（口语化、别解释）；"
+                  "不想说话就只输出 " + self.RECALL_REACT_SILENT + "。"
+            )
+        else:
+            notice = (
+                "【系统通知】当前消息已被用户撤回 —— 它已经不算数了，不要再当成有效上下文。\n"
+                f"撤回的人：{who or '对方'}\n"
+                f"被撤回的内容：{what}\n"
+                + (f"（随本轮附上被撤回的图片 {len(imgs)} 张，你可以直接看）\n" if imgs else "")
+                + (extra + "\n" if extra else "")
+                + "要不要回应、怎么回应（装没看见 / 追问 / 调侃 / 认错 / 什么都不说）完全由你决定；"
+                  "想说话就直接输出要发的那句话（口语化、别解释）；不想说话就只输出 " + self.RECALL_REACT_SILENT + "。"
+            )
         gen = self.system.get("llm_generate")
         if not callable(gen):
             return {"ok": False, "error": "模型通道不可用"}
@@ -3079,8 +3206,11 @@ class StarHeartService:
         "亲密/性相关互动照实记录双方意愿、边界、称呼与偏好；不做道德评判、不删减。\n"
         "主语可以不写；要写就用「TA」指对方、「我」指你自己。\n"
         "不写：逐字流水账、没有信息量的客套、你猜的（材料不够就少写，写「无」也行）。\n"
-        "每条一行：摘要|类型|强度|情绪浓度；"
+        "每条一行：摘要|类型|强度|情绪浓度|归属|引文；"
         "类型 ∈ planned/factual/preference/routine/episodic/relational/opinion；强度与情绪浓度 0-1。"
+        "归属 ∈ TA / 我 / 双方 / 无：这条记忆说的是谁的事——对方说的或做的写「TA」，"
+        "我说过的话或我做的事写「我」，两人一起的写「双方」，没有主语的客观事实写「无」。"
+        "引文 = 从对话里逐字复制的一段原文（≤30 字），必须能证明上面的归属；不许改写，找不到就留空。"
     )
     EXPRESSION_SYSTEM = (
         "你是语言风格分析器。从真实聊天记录里提取「可复用的说话方式」：口头禅、句尾语气词、"
@@ -3274,11 +3404,16 @@ class StarHeartService:
                                "避免写入无归属画像；修复后会自动继续",
                     "personas": 0, "built": []}
         done: list[dict[str, Any]] = []
+        try:
+            _new_min = int(cfg.get("memory_profile_refresh_new", 5) or 0)
+        except Exception:
+            _new_min = 5
         for persona_id in personas:
             for kind in ("user", "group"):
                 try:
                     todo = await self.store.subjects_needing_profile(
-                        kind, min_memories=min_mem, refresh_hours=hours, limit=limit, persona_id=persona_id)
+                        kind, min_memories=min_mem, refresh_hours=hours, limit=limit, persona_id=persona_id,
+                        new_mems_min=_new_min)
                 except Exception as exc:                     # 单个人格出错不影响其余
                     done.append({"persona": persona_id, "kind": kind, "ok": False, "err": str(exc)})
                     continue
@@ -4119,14 +4254,22 @@ class StarHeartService:
             # cleaned 非空但全是空白：真·无内容（图片轮次已在上面保留）。
             return {"ok": True, "outcome": "skipped", "reason": "empty_batch"}
         who = f"对话对象：{user_name}（{user_id}）" if user_id else ""
+        # 行号 ↔ 轮次对照（确定性）：行 i = ordered[i-1]，说话人 uid/昵称/真实时间都从这里反解
+        ordered = list(reversed(kept))
         prompt = (
             f"下面是一段人机对话。请提取值得长期记住的信息，最多 {limit} 条。每条一行，格式：\n"
-            "摘要|类型|强度|情绪浓度\n"
+            "摘要|类型|强度|情绪浓度|归属|引文|行号\n"
             "类型 ∈ planned/factual/preference/routine/episodic/relational/opinion；"
             "强度与情绪浓度 0-1。\n"
+            "归属 ∈ TA / 我 / 双方 / 无：这条记忆说的是谁的事 —— TA 说的话或 TA 做的事写「TA」，"
+            "我说过的话或我做的事写「我」，两人一起的写「双方」，没有主语的客观事实写「无」。\n"
+            "引文 = 从对话里逐字复制的一段原文（不超过 30 字），必须能证明上面的「归属」；"
+            "不许改写、不许拼接、不许概括；找不到就留空。\n"
+            "行号 = 对话内容里每行开头的编号（如 3 或 3-5）：这条信息出自哪一行就抄哪个编号。"
+            "行号必须原样抄，不许自己编；这是「谁说的」的唯一可信来源。\n"
             "写法：\n"
             "1. 双方都写：用户做了什么、助手怎么回、助手答应了什么；关系是双向的。\n"
-            "2. 尽量写清谁对谁；主语可省略，要写就用「TA」指对方、「我」指助手自己。\n"
+            "2. 主语用「TA」指对方、「我」指助手自己；归属标「TA」的，摘要里就不能是「我说/我送/我要求」。\n"
             "3. 称呼、调情、亲密/性相关互动照实记：双方意愿、边界、称呼、偏好；不做道德评判、不删减。\n"
             "4. 不编造；材料不够就少写；没有值得记的就输出「无」。\n"
             "5. 不要编号、不要 markdown、不要解释；只写内容本身。\n\n"
@@ -4161,6 +4304,17 @@ class StarHeartService:
                 "scanned": len(kept), "turns_total": len(cleaned),
             }
         items: list[dict[str, Any]] = []
+        # 归属校验底稿：本批完整对话（不是入库那份 80 字截断的 evidence）
+        user_all = "\n".join(str(t.get("user") or "") for t in cleaned)
+        bot_all = "\n".join(str(t.get("bot") or "") for t in cleaned)
+        # 确定性判定用的逐条对话（带 role）：模型不给引文时的兜底证据
+        dialog_turns: list[tuple[str, str]] = []
+        for t in cleaned:
+            if str(t.get("user") or "").strip():
+                dialog_turns.append(("user", str(t.get("user") or "")))
+            if str(t.get("bot") or "").strip():
+                dialog_turns.append(("assistant", str(t.get("bot") or "")))
+        owner_dropped: list[str] = []
         for line in str(out or "").splitlines():
             line = line.strip().lstrip("-*0123456789. ").strip()
             if not line or "|" not in line:
@@ -4186,16 +4340,69 @@ class StarHeartService:
             if 0 < poignancy <= 1.0:      # 旧输出是 0-1 制：≤1 一律放大成 0-10，否则 0.7→1 让「情绪保护」永不生效
                 poignancy *= 10.0
             poignancy = int(round(min(10.0, max(0.0, poignancy))))
+            said_by, quote, verdict = engine.verify_memory_owner(
+                summary,
+                parts[4] if len(parts) > 4 else "",
+                parts[5] if len(parts) > 5 else "",
+                user_all, bot_all, user_name,
+            )
+            if verdict == "owner_conflict":
+                # 引文证明这话是我说的，摘要却把动作写成 TA 做的 ——
+                # 留着以后必被当成「TA 的原话」，宁可这条不记。
+                owner_dropped.append(summary[:40])
+                continue
+            if verdict in ("no_quote", "quote_not_found"):
+                # 模型没给证据（或给了对不上的引文）：改用原对话 role 的确定性判定，
+                # 拿摘要的字符 3-gram 去比本批每一句，谁覆盖得多就是谁的事。
+                infer_said, infer_quote, _cov = engine.infer_owner(summary, dialog_turns)
+                if infer_said != "none":
+                    said_by, quote, verdict = infer_said, infer_quote, "inferred"
+            # 说话人反解（确定性，2026-10-24）：行号 → 该轮 uid/昵称/真实时间。
+            # 模型只负责抄行号；uid 永远不信模型给的。行号缺失/越界 → 引文反查兜底 → 留空不猜。
+            _spk_uid, _spk_name, _spk_ts = "", "", 0.0
+            m_ln = re.match(r"(\d+)", str(parts[6] if len(parts) > 6 else "").strip())
+            if m_ln:
+                _ln = int(m_ln.group(1))
+                if 1 <= _ln <= len(ordered):
+                    _t = ordered[_ln - 1]
+                    _spk_uid = str(_t.get("uid") or "")
+                    _spk_name = str(_t.get("name") or "")
+                    try:
+                        _spk_ts = float(_t.get("real_ts") or _t.get("ts") or 0)
+                    except (TypeError, ValueError):
+                        _spk_ts = 0.0
+            if not _spk_uid and said_by != "bot" and quote:
+                _spk_uid = _uid_for_quote(quote, cleaned)
+                _spk_name = ""
+            if said_by == "bot":
+                # bot 自己说的话/做的事：说话人不是「人」，留空（said_by 已记录归属）
+                _spk_uid, _spk_name = "", ""
             items.append(
                 {
                     "summary": summary,
                     "atom_type": atom,
                     "strength": strength,
                     "poignancy": poignancy,
+                    "said_by": said_by,
+                    "evidence_quote": quote,
+                    "owner_verdict": verdict,
+                    "speaker_id": _spk_uid,
+                    "speaker_name": _spk_name,
+                    "occurred_hint": _spk_ts,
                 }
             )
             if len(items) >= limit:
                 break
+        if not items and owner_dropped:
+            # 全批都被归属校验挡下：这是「没有可记的」，不是模型输出格式坏了，别重试。
+            await self.store.audit(
+                "memory.capture",
+                f"owner_conflict dropped={len(owner_dropped)} " + " / ".join(owner_dropped[:3]),
+            )
+            return {
+                "ok": True, "outcome": "skipped", "reason": "owner_conflict", "saved": 0,
+                "scanned": len(kept), "turns_total": len(cleaned),
+            }
         if not items:
             if self._is_no_memory_reply(raw):
                 await self.store.audit(
@@ -4269,11 +4476,12 @@ class StarHeartService:
                     now = time.time()
                     await self.store.db.execute(
                         "UPDATE hf_memories SET summary=?, content=?, cues=?, "
+                        "said_by=COALESCE(NULLIF(?, ''), said_by), "
                         "strength=MIN(1.0, COALESCE(strength,0)+0.15), "
                         "recalls=COALESCE(recalls,0)+1, updated_at=? WHERE id=?",
                         (new_summary, new_summary,
                          json.dumps([new_summary[:24]], ensure_ascii=False),
-                         now, did),
+                         it.get("said_by") or "", now, did),
                     )
                     await self.store.db.commit()
                 except Exception as exc:            # noqa: BLE001
@@ -4293,6 +4501,18 @@ class StarHeartService:
                 deduped += 1
                 logger.info(f"[StarHeart] 记忆去重：{new_summary[:40]} → 刷新 #{dup_id}")
                 continue
+            # 归属主体与说话人（2026-10-24）：
+            # - subject_id：私聊=对方（同人格多私聊不串人）；群聊仍为空串（主体是群），但 speaker_id 落到具体人
+            # - speaker_id/speaker_name：行号/引文反解的确定性说话人（此前写入后无消费方，现在渲染/召回都用）
+            # - channel/group_id：会话维度直取，召回 scope 收敛靠它
+            _sess_kind, _sess_ident = session_kind(session_id)
+            _is_group = _sess_kind != "private"
+            speaker_id = str(it.get("speaker_id") or "")
+            speaker_name = str(it.get("speaker_name") or "")
+            if not speaker_id and not _is_group:
+                # 私聊兜底：说话人=对方
+                speaker_id = str(user_id or "")
+                speaker_name = speaker_name or str(user_name or "")
             mid = await self.store.insert_memory(
                 {
                     "summary": it["summary"],
@@ -4310,15 +4530,29 @@ class StarHeartService:
                     "evidence": evidence,
                     "recalls": 0,
                     "status": "active",
-                    # 时间锚：这批对话第一轮的真实时间，而不是总结完成时刻（P0-9）
-                    "occurred_at": float((kept[-1] or {}).get("ts") or 0) or None,
+                    # 时间锚：这条信息所在那轮的真实消息时间（行号反解），退回批末轮
+                    "occurred_at": float(it.get("occurred_hint") or 0)
+                    or float((kept[-1] or {}).get("ts") or 0) or None,
                     # 归属主体：同人格多个私聊时，A 的记忆不该原样注入给 B（P0-10）。
                     # 群聊不写：那里的「主体」是群，不是最后说话的那个人。
-                    "subject_id": str(user_id or "") if session_kind(session_id)[0] == "private" else "",
+                    "subject_id": "" if _is_group else str(user_id or ""),
+                    # 归属（谁说的/是谁的事）：抽取值 + 引文硬校验的结果
+                    "said_by": it.get("said_by") or "",
+                    # 说话人：行号/引文反解（群聊到具体的人），私聊=对方
+                    "speaker_id": speaker_id,
+                    "speaker_name": speaker_name,
+                    "channel": "group" if _is_group else "private",
+                    "group_id": str(_sess_ident or "") if _is_group else "",
                 }
             )
             if mid:
                 saved += 1
+                # 原对话全文挂到这条记忆上：以后判「谁说的」不再靠模型，直接读 role。
+                # 存整批（不是只存匹配上的那几轮），避免摘要改写后对不上。
+                try:
+                    await self.store.add_memory_src(mid, kept)
+                except Exception as exc:            # noqa: BLE001 证据写入失败不影响记忆本身
+                    logger.debug(f"[StarHeart] 原对话挂载跳过：{exc}")
                 if msg_ids:
                     await self.store.link_memory_messages(mid, msg_ids)
                 existing.append((str(mid), it["summary"], it["summary"]))
@@ -4400,7 +4634,7 @@ class StarHeartService:
                 if new_s >= cur:
                     continue
                 decayed += 1
-                if new_s < floor:
+                if floor > 0 and new_s < floor:
                     evicted += 1
                     await self.store.db.execute(
                         "UPDATE hf_memories SET strength=?, strength_updated_at=?, status='stale', updated_at=? WHERE id=?",
@@ -4763,6 +4997,20 @@ class StarHeartService:
         await self.store.audit("memory.delete", str(mid), "soft")
         return {"deleted": bool(ok), "soft": True}
 
+    async def v2_conflicts(self, limit: int = 50, persona_id: str = "") -> dict[str, Any]:
+        try:
+            items = await self.store.v2_conflicts(limit=limit, persona_id=persona_id)
+        except Exception as exc:                            # noqa: BLE001 列还没建（老库）= 没有队列
+            return {"items": [], "note": f"v2 冲突队列不可用：{str(exc)[:80]}"}
+        return {"items": items}
+
+    async def v2_conflict_resolve(self, cid: str, action: str) -> dict[str, Any]:
+        try:
+            nid = int(str(cid).lstrip("m"))
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "无效的记忆 id"}
+        return await self.store.v2_conflict_resolve(nid, action)
+
     async def memory_restore(self, mid: str) -> dict[str, Any]:
         """撤销删除（回收站恢复）。"""
         ok = await self.store.restore_memory(mid)
@@ -4804,18 +5052,58 @@ class StarHeartService:
 
     # ---------------- 好感 ----------------
     async def favours(self) -> dict[str, Any]:
-        items = await self.store.list_favours()
+        cfg = await self.config()
+        if bool(cfg.get("favour_per_group", True)):
+            # 分档视图：同一人可能多行（全局/私聊档 + 各群档）；行带 group_id 供前端标注
+            try:
+                items = await self.store.list_favour_zones()
+            except Exception:                               # noqa: BLE001 表还没建（老库）→ 回旧表
+                items = await self.store.list_favours()
+        else:
+            items = await self.store.list_favours()
         for it in items:
             it["zone_text"] = ZONE_TEXT.get(it.get("zone", "NEUTRAL"), "")
         return {"items": items}
 
-    async def favour_adjust(self, user_id: str, delta: float, reason: str = "", scope: str = "both", name: str = "") -> dict[str, Any]:
+    def _favour_group_of(self, cfg: dict[str, Any], session_id: str) -> str:
+        """当前会话对应的好感分档群号：分群开=群号（私聊 ''）；分群关=恒 ''（全局档）。"""
+        if not bool(cfg.get("favour_per_group", True)):
+            return ""
+        try:
+            kind, ident = self.session_kind(str(session_id or ""))
+            return str(ident or "") if kind == "group" else ""
+        except Exception:                                   # noqa: BLE001 解析不出按全局档
+            return ""
+
+    async def favour_zone_for(self, user_id: str, session_id: str, cfg: dict[str, Any] | None = None) -> dict[str, Any]:
+        """注入用的当前档：分群开=精确档（群档缺行回退全局档）；分群关/无行=旧表全局行。"""
+        cfg = cfg if cfg is not None else await self.config()
+        gid = self._favour_group_of(cfg, session_id)
+        if bool(cfg.get("favour_per_group", True)):
+            row = await self.store.get_favour_zone(user_id, gid) if gid else None
+            if row is None:
+                row = await self.store.get_favour_zone(user_id, "")
+            if row is not None:
+                return row
+        return {f["user_id"]: f for f in await self.store.list_favours()}.get(user_id, {})
+
+    async def favour_adjust(self, user_id: str, delta: float, reason: str = "", scope: str = "both",
+                            name: str = "", session_id: str = "") -> dict[str, Any]:
         if not user_id:
             raise ValueError("user_id required")
         cfg = await self.config()
         daily_only = scope == "daily"
         lifetime_only = scope == "lifetime"
-        cur = {f["user_id"]: f for f in await self.store.list_favours()}.get(user_id, {})
+        gid = self._favour_group_of(cfg, session_id)
+        # 分档读数：分群开且有群号 → 群档；否则全局档（分群关 = 旧行为，读旧表）
+        # P1-7①：群档行可能还不存在（首次在该群结算）——旧实现 cur={} 让 daily/lifetime
+        # 从 0 起算，随后 upsert_favour 把旧表真实累计整行覆盖清零。现在缺群档时先读全局行做基线。
+        if bool(cfg.get("favour_per_group", True)) and gid:
+            cur = dict(await self.store.get_favour_zone(user_id, gid) or {})
+            if not cur:
+                cur = dict({f["user_id"]: f for f in await self.store.list_favours()}.get(user_id, {}))
+        else:
+            cur = {f["user_id"]: f for f in await self.store.list_favours()}.get(user_id, {})
         ev = list(cur.get("evidence") or [])
         day = self._day_str(cfg)     # 自然日（AstrBot 时区）0:00–23:59，与主动额度同一口径
         # 「好感日上限」：当天正增量累计到 cap 就封顶（0 = 不限）。日记账写进 evidence（面板"依据"列可见）。
@@ -4836,14 +5124,30 @@ class StarHeartService:
         lifetime = float(cur.get("lifetime", 0)) + (0 if daily_only else delta)
         patch = {
             "name": name or cur.get("name", user_id),
-            "session_id": cur.get("session_id", ""),
+            "session_id": session_id or cur.get("session_id", ""),
             "daily": daily,
             "lifetime": lifetime,
             "zone": self.store.zone_of(daily),
             "evidence": ev[-40:],
         }
         out = await self.store.upsert_favour(user_id, patch)
-        await self.store.audit("favour.adjust", user_id, f"delta={delta} reason={reason} scope={scope}")
+        # 分群开：同步写「本轮所在群」的档 + 全局档 (user,'')。
+        # P1-7②：全局档原来只在回填时快照一次，私聊结算不写它，而 favour_zone_for 私聊
+        # 优先读它 → 私聊温度冻结在首次群聊那一刻。现在每次结算都刷新全局档。
+        if bool(cfg.get("favour_per_group", True)):
+            try:
+                await self.store.backfill_favour_zones()
+            except Exception:                               # noqa: BLE001 回填失败不挡结算
+                pass
+            try:
+                await self.store.upsert_favour_zone(user_id, "", patch)
+            except Exception as exc:                        # noqa: BLE001
+                logger.debug(f"[StarHeart] 全局好感档同步跳过：{exc}")
+            if gid:
+                out_zone = await self.store.upsert_favour_zone(user_id, gid, patch)
+                out["zone_row"] = {"group_id": gid, "zone": out_zone.get("zone", "")}
+        await self.store.audit("favour.adjust", user_id,
+                               f"delta={delta} reason={reason} scope={scope} group={gid or '-'}")
         return out
 
     async def favour_decay_tick(self) -> int:
@@ -4861,6 +5165,34 @@ class StarHeartService:
             return 0
         ts = time.time()
         n = 0
+        # P1-7③：分档模式（favour_per_group 默认开）下真正生效的是 zone 行，
+        # 旧实现只衰减 hf_favours → 「很久没聊还满好感」在分档模式下原样存在。
+        per_group = bool(cfg.get("favour_per_group", True))
+        zone_rows: list[dict[str, Any]] = []
+        if per_group:
+            try:
+                zone_rows = await self.store.list_favour_zones()
+            except Exception as exc:                        # noqa: BLE001
+                logger.debug(f"[StarHeart] 分档好感衰减读取跳过：{exc}")
+                zone_rows = []
+            for z in zone_rows:
+                daily = float(z.get("daily") or 0)
+                # zone 表没有 updated_at 列时用 evidence 末条日期近似；有就用
+                last = float(z.get("updated_at") or 0) or ts
+                days = max(0.0, (ts - last) / 86400.0)
+                if daily == 0 or days < 0.5:
+                    continue
+                new = daily * (0.5 ** (days / hl))
+                if abs(new - daily) < 0.01:
+                    continue
+                try:
+                    await self.store.upsert_favour_zone(
+                        str(z.get("user_id") or ""), str(z.get("group_id") or ""),
+                        {**z, "daily": new, "zone": self.store.zone_of(new),
+                         "evidence": z.get("evidence") or []})
+                    n += 1
+                except Exception as exc:                    # noqa: BLE001
+                    logger.debug(f"[StarHeart] 分档好感衰减写入跳过：{exc}")
         for r in await self.store.list_favours():
             daily = float(r.get("daily") or 0)
             last = float(r.get("updated_at") or 0)
@@ -5689,6 +6021,10 @@ class StarHeartService:
     async def messages_list(self, session_id: str, q: str = "", limit: int = 200, offset: int = 0) -> dict[str, Any]:
         return await self.store.messages_for_session(session_id=session_id, q=q, limit=limit, offset=offset)
 
+    async def message_sessions(self, limit: int = 100) -> list[dict[str, Any]]:
+        """消息浏览页会话清单（P2-2）。"""
+        return await self.store.message_sessions(limit=limit)
+
     async def memory_evidence(self, mid: str) -> dict[str, Any]:
         """详情页的"详细对话"：① 记忆学自哪几句（精确）② 原文（不截断）③ 那一刻前后的真实对话。"""
         raw = str(mid).lstrip("m")
@@ -5733,11 +6069,15 @@ class StarHeartService:
     async def lifecycle_preview(self) -> dict[str, Any]:
         """面板要看的两条队列 + 现状统计（只读）。"""
         cfg = await self.config()
-        arch = 90.0 if cfg.get("archive_after_days") is None else float(cfg["archive_after_days"])
+        arch = 0.0 if cfg.get("archive_after_days") is None else float(cfg["archive_after_days"])
         forg = 180.0 if cfg.get("forget_after_days") is None else float(cfg["forget_after_days"])
-        queue = await self.store.memory_lifecycle_scan(archive_days=arch, forget_days=forg)
-        nowt = __import__("time").time()
-        arch_cut = nowt - arch * 86400
+        # P0-4：0 = 关。旧实现 arch=0 → arch_cut=now → 预览显示「全库待归档」（误导）。
+        if arch <= 0:
+            queue = []
+            arch_cut = 0.0
+        else:
+            queue = await self.store.memory_lifecycle_scan(archive_days=arch, forget_days=forg)
+            arch_cut = __import__("time").time() - arch * 86400
         return {
             "ok": True,
             "enabled": bool(cfg.get("forget_enabled", True)),
@@ -5755,16 +6095,24 @@ class StarHeartService:
         cfg = await self.config()
         if not cfg.get("forget_enabled", True):
             return {"ok": True, "skipped": "自动遗忘已关闭"}
-        # 0 是合法值（= 立刻归档），不能被 `or` 吞成默认值；只有 None 才取默认。
-        # 默认值同步上调：30/30 太短，两个月的沉默不该等于死亡。
-        arch = 90.0 if cfg.get("archive_after_days") is None else float(cfg["archive_after_days"])
+        # P1-9：v2_enabled 时 v1 只是双写影子（读路径全走 v2 表），对 v1 行做时间归档
+        # 等于「同一句话在 v2 永生、在 v1 被判死」——灰度回退时近三月 v1 库已被静默处理。
+        # 因此 v2 开着的期间只做强度衰减，不归档不遗忘（真正的生命周期将来统一到 v2 口径）。
+        if bool(cfg.get("v2_enabled", False)) and not dry:
+            return {"ok": True, "skipped": "v2 已启用：v1 影子库不做时间归档（P1-9）"}
+        # 0 是合法值（= 不归档），不能被 `or` 吞成默认值；只有 None 才取默认。
+        # 2026-10-24 P0-4：0 语义从「立刻归档」改为「不归档」——旧实现 0 会让
+        # arch_cut = now，全库瞬间归档（用户把「关掉」理解成 0 时就是灾难）。
+        arch = 0.0 if cfg.get("archive_after_days") is None else float(cfg["archive_after_days"])
         forg = 180.0 if cfg.get("forget_after_days") is None else float(cfg["forget_after_days"])
         min_s = 0.2 if cfg.get("forget_min_strength") is None else float(cfg["forget_min_strength"])
         keep_p = 6.0 if cfg.get("forget_keep_poignancy") is None else float(cfg["forget_keep_poignancy"])
         limit = int(limit or cfg.get("forget_batch_per_tick") or 20)
         pv = await self.lifecycle_preview()
-        arch_ids = [int(x["id"]) for x in pv["archive_queue"][:limit]]
+        # P0-4：arch=0 = 不归档（不是「立刻归档」）。旧语义下 0 会把全库 active 归档。
+        arch_ids = [] if arch <= 0 else [int(x["id"]) for x in pv["archive_queue"][:limit]]
         # 遗忘只针对"不重要"的：强度低于阈值 且 情绪强度不高（重要记忆受保护）
+        # 归档关了（arch=0）时队列里没有 archived 行，forget_queue 自然为空
         forget_ids = [
             int(x["id"])
             for x in pv["forget_queue"]

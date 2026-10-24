@@ -13,7 +13,7 @@
  * 世界尺度与参考实现一致（约 ±10，相机距离 ~21，FOV 48°），12 种布局的公式可以照着搬。
  */
 
-import { Graph3D as Graph3DCanvas } from "./graph3d-fallback.js?v=1.0.5-3";
+import { Graph3D as Graph3DCanvas } from "./graph3d-fallback.js?v=1.0.6";
 
 const TAU = Math.PI * 2;
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));

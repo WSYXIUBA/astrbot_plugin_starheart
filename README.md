@@ -7,7 +7,7 @@ AstrBot 的长期记忆插件：把对话整理成本地记忆，在需要时提
 | | |
 | --- | --- |
 | 插件名 | `astrbot_plugin_starheart` |
-| 版本 | `1.0.5` |
+| 版本 | `1.0.6` |
 | 作者 | 肆一纸心 |
 | 仓库 | <https://github.com/WSYXIUBA/astrbot_plugin_starheart> |
 | 适配器 | `aiocqhttp`（OneBot v11） |

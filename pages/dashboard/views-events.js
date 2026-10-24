@@ -9,13 +9,13 @@
  * - 好感：关系是连续量 → 区间色带 + 数值环，而不是只写一个数字。
  */
 
-import * as C from "./charts.js?v=1.0.5-3";
+import * as C from "./charts.js?v=1.0.6";
 import {
   $, $$, api, apiSafe, contactLabel, apiPostSafe, esc, fmtNum, fmt1, fmtPct, fmtTime, timeAgo, toast, openDrawer, closeDrawer,
   pageHead, card, kpiCard, kpis, mount, emptyBlock, skelBlock, jsStr, STATE, segmentHtml, syncSeg, countUp,
   refreshCurrent, goPage, noteConfigTouched, takeConfigDirty, nativeWriteError,
-} from "./store.js?v=1.0.5-3";
-import { renderDomainConf } from "./views-conf.js?v=1.0.5-3";
+} from "./store.js?v=1.0.6";
+import { renderDomainConf } from "./views-conf.js?v=1.0.6";
 
 const ZONE_RANK = { HOSTILE: 0, COLD: 1, NEUTRAL: 2, FAMILIAR: 3, CLOSE: 4, DEVOTED: 5 };
 const ZONE_COLOR = { HOSTILE: "#f44336", COLD: "#90a4ae", NEUTRAL: "#8e8e93", FAMILIAR: "#03c9d7", CLOSE: "#3c96ca", DEVOTED: "#e0559a" };
@@ -1788,9 +1788,16 @@ export async function renderFavourList() {
 
   const concl = items.length
     ? `跟踪 <b>${fmtNum(items.length)}</b> 人 · 今天变暖 <b>${fmtNum(warm)}</b> 人 / 变冷 <b>${fmtNum(cold)}</b> 人` +
-      (best && Number(best.daily) ? ` · 今天最暖：<b>${esc(best.name || best.user_id)}</b>（+${fmt1(best.daily)}）` : "") +
-      (worst && Number(worst.daily) < 0 ? ` · 降温最快：<b>${esc(worst.name || worst.user_id)}</b>（${fmt1(worst.daily)}）` : "")
+      (best && Number(best.daily) ? ` · 今天最暖：<b>${esc(best.name || best.user_id)}${best.group_id ? "（群" + esc(String(best.group_id)) + "）" : ""}</b>（+${fmt1(best.daily)}）` : "") +
+      (worst && Number(worst.daily) < 0 ? ` · 降温最快：<b>${esc(worst.name || worst.user_id)}${worst.group_id ? "（群" + esc(String(worst.group_id)) + "）" : ""}</b>（${fmt1(worst.daily)}）` : "")
     : `还没有结算过好感：聊上几轮、或跑一轮好感结算就会出现关系记录`;
+
+  /** 分档行标签：开启「好感分群分档」后同一人会有多行（全局档/各群档），行尾标出属于哪个群 */
+  const favLabel = (f) => {
+    const base = String(f.name || f.user_id || "");
+    const g = String(f.group_id || "").trim();
+    return g ? `${base} · 群${g}` : base;
+  };
 
   const html = `
   ${pageHead(
@@ -1828,9 +1835,9 @@ export async function renderFavourList() {
       mount(host, "#fvMatrix", (el) =>
         C.matrix(el, {
           rows: rows.map((f) => ({
-            label: f.name || f.user_id,
+            label: favLabel(f),
             sub: esc(String(f.zone || "")),
-            tip: `${f.session_id || f.user_id} · 档位 ${f.zone || "未结算"} · 今日 ${fmt1(f.daily)} · 累计 ${fmt1(f.lifetime)}`,
+            tip: `${f.session_id || f.user_id}${f.group_id ? " · 群档" : ""} · 档位 ${f.zone || "未结算"} · 今日 ${fmt1(f.daily)} · 累计 ${fmt1(f.lifetime)}`,
           })),
           cols: days.map((d) => ({ label: mxDayShort(d), tip: d })).concat([{ label: "累计" }, { label: "今日" }]),
           cells: (r, c) => {
@@ -1862,6 +1869,7 @@ export async function renderFavourList() {
               `<div class="kv">档位<span>${esc(f.zone || "未结算")}</span></div>
                <div class="kv">今日 / 累计<span class="mono">${fmt1(f.daily)} / ${fmt1(f.lifetime)}</span></div>
                <div class="kv">会话<span class="mono">${esc(f.session_id || f.user_id)}</span></div>
+               ${f.group_id !== undefined ? `<div class="kv">分档<span>${f.group_id ? esc("群 " + String(f.group_id)) : "全局 / 私聊档"}</span></div>` : ""}
                <div class="sec" style="margin:10px 0 6px;font-size:12px"><b>结算依据</b>（最近 12 条）</div>
                ${ev.length ? ev.map((e) => `<div class="kv"><span style="min-width:0;overflow:hidden;text-overflow:ellipsis">${esc(String(e).slice(0, 80))}</span></div>`).join("") : '<div class="mut">没有留下依据记录</div>'}
                <div class="row" style="gap:6px;margin-top:12px">
@@ -1886,7 +1894,7 @@ export async function renderFavourList() {
           const col = v >= 0 ? "var(--success,#22a06b)" : "var(--error,#e05555)";
           return `<div class="hfline" style="border-bottom:0;padding:7px 0">
             <div class="row bt" style="font-size:12px;margin-bottom:4px">
-              <span>${esc(f.name || f.user_id)}</span>
+              <span>${esc(favLabel(f))}</span>
               <span class="mono" style="color:${v >= 0 ? "inherit" : "var(--error,#e05555)"}">${v > 0 ? "+" : ""}${fmt1(v)}</span></div>
             <div class="hfbar" style="height:8px"><i style="width:${w}%;background:${col}"></i></div>
           </div>`;

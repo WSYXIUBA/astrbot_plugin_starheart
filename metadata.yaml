@@ -1,7 +1,7 @@
 name: astrbot_plugin_starheart
 display_name: StarHeart
 author: 肆一纸心
-version: 1.0.5
+version: 1.0.6
 desc: 记忆增强：把对话记成长期记忆，聊天时自动想起相关的；附带人物 / 群聊画像、关系与表达习惯学习；可选主动开口与撤回记录；自带可视化面板。
 short_desc: 记忆增强：把聊天记成记忆，需要时自动想起来
 repo: https://github.com/WSYXIUBA/astrbot_plugin_starheart

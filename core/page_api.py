@@ -115,6 +115,9 @@ class PageApi:
             ("memory/maintenance", self.memory_maintenance, "POST"),
             ("expression/extract", self.expression_extract, "POST"),
             ("memory/purge_stale", self.memory_purge_stale, "POST"),
+            # v2 逐字冲突待审（memory_conflict_hold）：GET 队列 + POST 裁决（采纳新条 / 两条都保留）
+            ("v2/conflicts", self.v2_conflicts, "GET"),
+            ("v2/conflict/resolve", self.v2_conflict_resolve, "POST"),
             ("memory/edges", self.memory_edges, "GET"),
             ("edge/save", self.edge_save, "POST"),
             ("contacts", self.contacts, "GET"),
@@ -152,6 +155,7 @@ class PageApi:
             ("memory/sessions", self.memory_sessions, "GET"),
             ("memory/evidence", self.memory_evidence, "GET"),
             ("messages", self.messages, "GET"),
+            ("messages/sessions", self.messages_sessions, "GET"),
             ("recall", self.recall, "POST"),
             ("embed/coverage", self.embed_coverage, "GET"),
             ("vector/gens", self.vector_gens, "GET"),
@@ -440,6 +444,7 @@ class PageApi:
             str(payload.get("kind") or ""),
             str(payload.get("mode") or "off"),
             [str(x) for x in (payload.get("ids") or [])],
+            sync_native=bool(payload.get("sync_native")),
         ))
 
     async def contacts_hide(self):
@@ -533,6 +538,19 @@ class PageApi:
 
     async def favours(self):
         return json_response(await self.service.favours())
+
+    async def v2_conflicts(self):
+        limit = _int_q("limit", 50, 1, 200)
+        persona_id = request.query.get("persona_id", "") or ""
+        return json_response(await self.service.v2_conflicts(limit=limit, persona_id=persona_id))
+
+    async def v2_conflict_resolve(self):
+        payload = await request.json(default={})
+        cid = str(payload.get("id") or "").strip()
+        action = str(payload.get("action") or "").strip().lower()
+        if not cid or action not in ("accept", "keep_both"):
+            return error_response("需要 id 与 action（accept / keep_both）")
+        return json_response(await self.service.v2_conflict_resolve(cid, action))
 
     async def favour_adjust(self):
         payload = await request.json(default={})
@@ -969,6 +987,11 @@ class PageApi:
         limit = min(500, max(1, request.query.get("limit", 200, type=int) or 200))
         offset = max(0, request.query.get("offset", 0, type=int) or 0)
         return json_response(await self.service.messages_list(session_id=session_id, q=q, limit=limit, offset=offset))
+
+    async def messages_sessions(self):
+        """消息浏览页会话清单（P2-2）：按最近说话排序。"""
+        limit = min(200, max(1, request.query.get("limit", 100, type=int) or 100))
+        return json_response({"items": await self.service.message_sessions(limit=limit)})
 
     async def recall(self):
         """召回测试：关键词路 + 向量路 → RRF 融合。没有向量也能用（只跑关键词路并如实回报）。"""

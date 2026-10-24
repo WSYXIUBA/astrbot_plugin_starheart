@@ -313,6 +313,11 @@
     "description": "是否必须带好感标签才结算（关闭则无标签也 +1）",
     "default": true
   },
+  "favour_per_group": {
+    "type": "bool",
+    "description": "好感分群分档：同一个人在群里和私聊各记一份温度（旧数据自动成为全局档；关掉回旧表读）",
+    "default": true
+  },
   "expression_min_uses": {
     "type": "int",
     "description": "表达习惯至少生效过 N 次才算已验证",
@@ -367,6 +372,41 @@
     "type": "string",
     "description": "记忆总结自定义提示词（空=内置；支持 {transcript} 占位）",
     "default": ""
+  },
+  "memory_group_to_private": {
+    "type": "bool",
+    "description": "群记忆→私聊可见：在群里发生的事私聊也能想起来（渲染带「在群里听 XX 说过」）；关掉后群记忆只在群里出现",
+    "default": true
+  },
+  "memory_private_to_group": {
+    "type": "bool",
+    "description": "私聊记忆→群聊可见：默认关（隐私档）。打开也只是 0.4× 降权并标注「私下说的」，数据不删",
+    "default": false
+  },
+  "memory_group_cast_size": {
+    "type": "int",
+    "description": "在场成员窗口(轮)：群聊召回的「在场成员」=当前说话人+@对象+被回复对象+最近 N 轮出现的人（0=只认 @/回复）",
+    "default": 5
+  },
+  "memory_profile_inject": {
+    "type": "bool",
+    "description": "画像注入：把已生成的人物/群聊画像带进对话（私聊=本人，群聊=在场成员），只读现成画像、不额外调模型",
+    "default": true
+  },
+  "memory_profile_inject_cast": {
+    "type": "int",
+    "description": "画像注入人数：群聊里最多给几个人注入画像（被回复 > @ > 发言频次 取前 N）；私聊恒为 1",
+    "default": 3
+  },
+  "memory_profile_refresh_new": {
+    "type": "int",
+    "description": "画像刷新阈值(条)：某人新记忆攒够 N 条就自动重算画像（0=沿用原刷新节奏）",
+    "default": 5
+  },
+  "memory_conflict_hold": {
+    "type": "bool",
+    "description": "逐字冲突不静默覆盖：新旧两条都带逐字引文且互相矛盾时，不自动覆盖旧记忆，新条进「冲突待审」由面板裁决",
+    "default": true
   },
   "recall_withdraw_reply": {
     "type": "bool",
@@ -677,7 +717,7 @@
   },
   "conn_mode_group": {
     "type": "string",
-    "description": "群聊可见性：black=黑名单（空=谁都不回）/ white=白名单（空=谁都不回）",
+    "description": "群聊可见性：black=黑名单（空=谁都不回）/ white=白名单（空=全部放行）",
     "default": "black",
     "options": [
       "black",
@@ -686,7 +726,7 @@
   },
   "conn_mode_private": {
     "type": "string",
-    "description": "私聊可见性：black=黑名单（空=谁都不回）/ white=白名单（空=谁都不回）",
+    "description": "私聊可见性：black=黑名单（空=谁都不回）/ white=白名单（空=全部放行）",
     "default": "black",
     "options": [
       "black",
@@ -700,7 +740,7 @@
   },
   "conn_white_group": {
     "type": "list",
-    "description": "群聊可见性白名单（群号；空白名单=谁都不回）",
+    "description": "群聊可见性白名单（群号；空白名单=全部放行）",
     "default": []
   },
   "conn_black_private": {
@@ -710,12 +750,37 @@
   },
   "conn_white_private": {
     "type": "list",
-    "description": "私聊可见性白名单（QQ 号；空白名单=谁都不回）",
+    "description": "私聊可见性白名单（QQ 号；空白名单=全部放行）",
     "default": []
   },
   "persona_active_id": {
     "type": "string",
     "description": "当前人格 id；留空=跟随 AstrBot 原生当前人格",
     "default": ""
+  },
+  "poke_react_enabled": {
+    "type": "bool",
+    "description": "被戳一戳时当场回一句（默认关：平时只感知并记住，不抢话）",
+    "default": false
+  },
+  "member_event_enabled": {
+    "type": "bool",
+    "description": "入群/退群/被踢进事件知会与记忆（关闭=对这些事完全无感）",
+    "default": true
+  },
+  "memory_tools_enabled": {
+    "type": "bool",
+    "description": "允许 bot 主动调用 starheart_* 记忆检索工具（搜记忆/查人/翻聊天记录）",
+    "default": true
+  },
+  "memory_group_to_group": {
+    "type": "bool",
+    "description": "群聊记忆能否进『别的群』的上下文（默认关：A 群的私事不念到 B 群）",
+    "default": false
+  },
+  "memory_private_to_group_self": {
+    "type": "bool",
+    "description": "本人的私聊记忆在群里也能想起（跨会话串通，默认开；别人的私聊仍按「私聊进群」开关）",
+    "default": true
   }
 }

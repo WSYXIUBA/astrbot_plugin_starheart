@@ -83,6 +83,10 @@ _LATE_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_hf_mem_persona ON hf_memories(persona_id)",
     "CREATE INDEX IF NOT EXISTS idx_hf_mem_lifecycle ON hf_memories(status, last_used_at)",
     "CREATE INDEX IF NOT EXISTS idx_hf_edge_dst ON hf_edges(dst_type, dst_id)",
+    # 记忆归属优化：群聊召回 scope 收敛（group_id/speaker_id 列在列升级段才可能存在）
+    "CREATE INDEX IF NOT EXISTS idx_hf_mem_group ON hf_memories(group_id, status)",
+    "CREATE INDEX IF NOT EXISTS idx_mem_speaker ON memories(speaker_id) WHERE speaker_id!=''",
+    "CREATE INDEX IF NOT EXISTS idx_mem_group ON memories(group_id, status, is_current)",
 )
 
 SCHEMA = (
@@ -318,16 +322,18 @@ SCHEMA = (
     )
     """,
     """CREATE TABLE IF NOT EXISTS hf_messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        session_id TEXT NOT NULL DEFAULT '',
-        role TEXT NOT NULL DEFAULT '',
-        content TEXT NOT NULL DEFAULT '',
-        sender_id TEXT NOT NULL DEFAULT '',
-        sender_name TEXT NOT NULL DEFAULT '',
-        platform TEXT NOT NULL DEFAULT '',
-        ts REAL NOT NULL DEFAULT 0,
-        is_bot INTEGER NOT NULL DEFAULT 0,
-        ext_id TEXT UNIQUE
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL DEFAULT '',
+    role TEXT NOT NULL DEFAULT '',
+    content TEXT NOT NULL DEFAULT '',
+    sender_id TEXT NOT NULL DEFAULT '',
+    sender_name TEXT NOT NULL DEFAULT '',
+    platform TEXT NOT NULL DEFAULT '',
+    ts REAL NOT NULL DEFAULT 0,
+    is_bot INTEGER NOT NULL DEFAULT 0,
+    ext_id TEXT UNIQUE,
+    imgs TEXT NOT NULL DEFAULT '[]',
+    recalled INTEGER NOT NULL DEFAULT 0
     )""",
     """CREATE INDEX IF NOT EXISTS idx_hf_msg_sess ON hf_messages(session_id, ts)""",
     """CREATE TABLE IF NOT EXISTS hf_vectors (
@@ -672,7 +678,11 @@ SCHEMA = (
         tags TEXT NOT NULL DEFAULT '[]',
         entities TEXT NOT NULL DEFAULT '[]',
         created_at REAL NOT NULL DEFAULT 0,
-        updated_at REAL NOT NULL DEFAULT 0
+        updated_at REAL NOT NULL DEFAULT 0,
+        speaker_id TEXT DEFAULT '',
+        speaker_name TEXT DEFAULT '',
+        channel TEXT DEFAULT '',
+        group_id TEXT DEFAULT ''
     )""",
     """CREATE UNIQUE INDEX IF NOT EXISTS ux_mem_hash ON memories(subject_id, content_hash)
         WHERE status='active' AND is_current=1""",
@@ -681,6 +691,36 @@ SCHEMA = (
     "CREATE INDEX IF NOT EXISTS idx_mem_time ON memories(status, is_current, occurred_start)",
     "CREATE INDEX IF NOT EXISTS idx_mem_consol ON memories(consolidated, importance DESC) WHERE consolidated=0",
     "CREATE INDEX IF NOT EXISTS idx_mem_due ON memories(due_at) WHERE kind='commitment' AND status='active'",
+    # 注意：idx_mem_speaker / idx_mem_group（memories 的归属索引）**不能写在这里**——
+    # SCHEMA 是 connect() 最先执行的批次，老库此刻还没有 speaker_id/group_id 列，
+    # 会直接 `no such column` 把建库流程打断（hf_memories 侧同理，见 _LATE_INDEXES 注释）。
+    # 这两条统一挪到列升级完成之后，见 _LATE_INDEXES。
+
+    # ---- 记忆归属优化（2026-10-24）：好感分档 + 合并迁移台账 ----
+    # 好感分档：同一个人在群里和私聊各一份温度；group_id='' 即「全局/私聊档」。
+    # 旧表 hf_favours 保留不动（回滚开关 favour_per_group 关掉就回旧表读）。
+    """CREATE TABLE IF NOT EXISTS hf_favour_zones (
+        user_id TEXT NOT NULL,
+        group_id TEXT NOT NULL DEFAULT '',
+        name TEXT DEFAULT '',
+        session_id TEXT DEFAULT '',
+        daily REAL NOT NULL DEFAULT 0,
+        lifetime REAL NOT NULL DEFAULT 0,
+        zone TEXT NOT NULL DEFAULT 'NEUTRAL',
+        evidence TEXT DEFAULT '[]',
+        updated_at REAL NOT NULL DEFAULT 0,
+        PRIMARY KEY (user_id, group_id)
+    )""",
+    # person_merge 的记忆归属迁移台账：unmerge 时按它反向恢复（记忆行只记 canonical，回滚要靠这张表）
+    """CREATE TABLE IF NOT EXISTS attribution_merge_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        alias_id TEXT NOT NULL,
+        canonical_id TEXT NOT NULL,
+        moved_memories INTEGER NOT NULL DEFAULT 0,
+        moved_v2 INTEGER NOT NULL DEFAULT 0,
+        moved_zones INTEGER NOT NULL DEFAULT 0,
+        ts REAL NOT NULL DEFAULT 0
+    )""",
 
     # FTS 必须在 memories/episodes 之后建（external content 要求宿主表存在）
     """CREATE VIRTUAL TABLE IF NOT EXISTS fts_mem USING fts5(
@@ -1039,8 +1079,23 @@ class Store:
         # synchronous=NORMAL 是 WAL 下的官方推荐档：掉电最多丢最近一个事务，换取大幅减少 fsync。
         await self._db.execute("PRAGMA busy_timeout=5000")
         await self._db.execute("PRAGMA synchronous=NORMAL")
+        # P2-35：逐条执行 + 单条失败不挡启动。FTS5 trigram 需要 SQLite>=3.34，
+        # 老环境上整条 SCHEMA 裸循环会让插件完全起不来；失败只降级词法路（LIKE 兜底）。
+        schema_failed: list[str] = []
         for stmt in SCHEMA:
-            await self._db.execute(stmt)
+            try:
+                await self._db.execute(stmt)
+            except Exception as exc:                            # noqa: BLE001
+                head = " ".join(str(stmt).split())[:90]
+                # 只对 FTS/索引类语句降级；核心表建不出来必须炸（否则后续全是空跑）
+                if "VIRTUAL TABLE" in head.upper() or "INDEX" in head.upper():
+                    schema_failed.append(head)
+                    logger.warning(f"[StarHeart] 结构降级（{exc}）：{head}")
+                else:
+                    raise
+        if schema_failed:
+            logger.warning(
+                f"[StarHeart] {len(schema_failed)} 条结构未建立（FTS/索引缺失，词法路降级为 LIKE）")
         # 门控改判（S1）：决策流水补三列 —— 门控页行内「该回 / 判定正确」的落点。
         # PRAGMA 探测 + ALTER，幂等：老库升级与新建库走同一条路（新库此时还没有这三列）。
         try:
@@ -1071,6 +1126,36 @@ class Store:
             await self._db.commit()
         except Exception as exc:                            # noqa: BLE001 列升级失败不该挡住启动
             logger.warning(f"[StarHeart] 捕获队列列升级跳过：{exc}")
+        # hf_messages 图片列（消息浏览页要看图）：老库补列，新库建表已带。
+        # imgs 存 JSON 数组（缩略图 data-url / 外链），收到那一刻嵌好——AstrBot 的临时
+        # 媒体文件事后会被清理，事后取就永远没了（撤回取证同款约束）。
+        try:
+            msg_cols = {str(r[1]) for r in await (await self._db.execute(
+                "PRAGMA table_info(hf_messages)")).fetchall()}
+            if msg_cols and "imgs" not in msg_cols:
+                await self._db.execute(
+                    "ALTER TABLE hf_messages ADD COLUMN imgs TEXT NOT NULL DEFAULT '[]'")
+                await self._db.commit()
+        except Exception as exc:                            # noqa: BLE001
+            logger.warning(f"[StarHeart] 消息图片列升级跳过：{exc}")
+        # hf_messages 撤回标记列：撤回发生时回写 1，消息浏览页据此打「已撤回」标签。
+        # 存量回填在 startup_backfill_recalls()（撤回流水 → ext_id=qq:<message_id> 反查）。
+        try:
+            msg_cols = {str(r[1]) for r in await (await self._db.execute(
+                "PRAGMA table_info(hf_messages)")).fetchall()}
+            if msg_cols and "recalled" not in msg_cols:
+                await self._db.execute(
+                    "ALTER TABLE hf_messages ADD COLUMN recalled INTEGER NOT NULL DEFAULT 0")
+                await self._db.commit()
+                # 新列刚加：立即按撤回流水回填历史（只跑这一次，幂等）
+                try:
+                    n = await self.backfill_recalled()
+                    if n:
+                        logger.info(f"[StarHeart] 撤回标记回填：{n} 条历史消息标为已撤回")
+                except Exception as exc:                    # noqa: BLE001
+                    logger.warning(f"[StarHeart] 撤回标记回填跳过：{exc}")
+        except Exception as exc:                            # noqa: BLE001
+            logger.warning(f"[StarHeart] 消息撤回列升级跳过：{exc}")
         # 向量列（旧库平滑升级）
         cols = [r[1] for r in await (await self._db.execute("PRAGMA table_info(hf_memories)")).fetchall()]
         if "embedding" not in cols:
@@ -1091,6 +1176,34 @@ class Store:
         # 旧库一律空串 = 未标注，召回时按「不惩罚」处理（不做猜测回填）。
         if "subject_id" not in cols:
             await self._db.execute("ALTER TABLE hf_memories ADD COLUMN subject_id TEXT DEFAULT ''")
+        # 记忆归属（谁说的 / 是谁的事）：'user' / 'bot' / 'both' / 'none' / ''（未标注）。
+        # 为什么要这一列：摘要是一句话，主语写「TA」还是「我」全靠模型自觉，
+        # 没有校验时 bot 自己的话会被记成对方的原话，隔天拿「原话」去怼用户。
+        if "said_by" not in cols:
+            await self._db.execute("ALTER TABLE hf_memories ADD COLUMN said_by TEXT DEFAULT ''")
+        # 说话人（群聊关键）：群会话里 session_id 只到群，一条记忆是群里谁说的此前无处安放，
+        # 按 session 反查必然把同群其他人的记忆串进来。
+        if "speaker_id" not in cols:
+            await self._db.execute("ALTER TABLE hf_memories ADD COLUMN speaker_id TEXT DEFAULT ''")
+        # ---- 记忆归属优化（2026-10-24）：说话人快照 / 渠道 / 群号 ----
+        # speaker_name：写入时刻的昵称快照（群名片会改，渲染时用快照才不会「人名漂移」）
+        if "speaker_name" not in cols:
+            await self._db.execute("ALTER TABLE hf_memories ADD COLUMN speaker_name TEXT DEFAULT ''")
+        # channel：这条记忆产生在私聊还是群聊（session_id 能推出来，但独立成列召回才过滤得动）
+        if "channel" not in cols:
+            await self._db.execute("ALTER TABLE hf_memories ADD COLUMN channel TEXT DEFAULT ''")
+        # group_id：群聊记忆所属的群（私聊空串）；群聊召回的 scope 收敛靠它
+        if "group_id" not in cols:
+            await self._db.execute("ALTER TABLE hf_memories ADD COLUMN group_id TEXT DEFAULT ''")
+        # ---- v2 memories 同步加列（批 A 建的老库没有这四列；全新库走 CREATE 已带）----
+        try:
+            v2_cols = [r[1] for r in await (await self._db.execute("PRAGMA table_info(memories)")).fetchall()]
+        except Exception:                                   # noqa: BLE001 v2 表还没建（极老库）
+            v2_cols = []
+        if v2_cols:
+            for _col in ("speaker_id", "speaker_name", "channel", "group_id"):
+                if _col not in v2_cols:
+                    await self._db.execute(f"ALTER TABLE memories ADD COLUMN {_col} TEXT DEFAULT ''")
         # 「别再提」冷处理：muted=1 的记忆不进召回、不进主动池，但保留在库里可随时恢复。
         # 为什么要这一列：用户对某条旧记忆说「我从没提过这个」时，除了删掉没有别的动作 ——
         # 删就丢了，留着又会一直被注入。这是负反馈的唯一落点。
@@ -1199,8 +1312,9 @@ class Store:
                     (summary, content, atom_type, strength, poignancy, source_mode, source_ref,
                      session_id, persona_id, tags, entities, cues, evidence, recalls, status,
                      occurred_at, created_at, updated_at, external_source, external_id, import_batch,
-                     last_used_at, strength_updated_at, subject_id)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                     last_used_at, strength_updated_at, subject_id, said_by, speaker_id,
+                     speaker_name, channel, group_id)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     mem.get("summary", ""),
@@ -1231,6 +1345,12 @@ class Store:
                     # 直到下一次启动 repair_memory_timebase 才补上（真机每次启动 base_filled>0）。
                     float(mem.get("strength_updated_at") or ts),
                     str(mem.get("subject_id") or ""),
+                    str(mem.get("said_by") or ""),
+                    str(mem.get("speaker_id") or ""),
+                    # 归属优化（2026-10-24）：昵称快照 + 渠道 + 群号，全部调用方确定性传入
+                    str(mem.get("speaker_name") or ""),
+                    str(mem.get("channel") or ""),
+                    str(mem.get("group_id") or ""),
                 ),
             )
             await self.db.commit()
@@ -1340,8 +1460,9 @@ class Store:
                 "time_granularity, anchor_memory_id, anchor_state, valid_from, is_current, "
                 "source_msg_ids, evidence_quote, evidence_kind, stance, origin, confidence, intimacy, due_at, "
                 "importance, arousal, valence, proof_count, source_ids, consolidated, migrated, "
-                "needs_review, status, tags, entities, created_at, updated_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "needs_review, status, tags, entities, created_at, updated_at, "
+                "speaker_id, speaker_name, channel, group_id) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     mem.get("episode_id"),
                     str(mem.get("persona_id") or ""),
@@ -1380,6 +1501,11 @@ class Store:
                     json.dumps(mem.get("entities") or [], ensure_ascii=False),
                     ts,
                     ts,
+                    # 归属优化（2026-10-24）：说话人 + 昵称快照 + 渠道 + 群号
+                    str(mem.get("speaker_id") or ""),
+                    str(mem.get("speaker_name") or ""),
+                    str(mem.get("channel") or ""),
+                    str(mem.get("group_id") or ""),
                 ),
             )
             await self.db.commit()
@@ -1514,6 +1640,53 @@ class Store:
             except Exception:                               # noqa: BLE001 表不存在时给 -1
                 out[tbl] = -1
         return out
+
+    # ---------------- v2 逐字冲突待审（memory_conflict_hold） ----------------
+
+    async def v2_conflicts(self, limit: int = 50, persona_id: str = "") -> list[dict[str, Any]]:
+        """needs_review=2 的待裁决行（新条），带它冲突的旧行文本（anchor_memory_id 指回旧条）。"""
+        where = "WHERE m.needs_review=2 AND m.status='active'"
+        args: list[Any] = []
+        if persona_id:
+            where += " AND (m.persona_id=? OR m.persona_id='')"
+            args.append(persona_id)
+        rows = await (await self.db.execute(
+            f"SELECT m.id, m.text, m.kind, m.evidence_quote, m.subject_id, m.speaker_name, "
+            f"m.created_at, m.anchor_memory_id, m.persona_id "
+            f"FROM memories m {where} ORDER BY m.created_at DESC LIMIT ?",
+            (*args, max(1, int(limit))),
+        )).fetchall()
+        items: list[dict[str, Any]] = []
+        for r in rows:
+            d = dict(r)
+            old_id = int(d.pop("anchor_memory_id") or 0)
+            d["old_id"] = old_id
+            d["old_text"] = ""
+            if old_id:
+                orow = await (await self.db.execute(
+                    "SELECT text FROM memories WHERE id=?", (old_id,))).fetchone()
+                d["old_text"] = str(orow["text"]) if orow else ""
+            items.append(d)
+        return items
+
+    async def v2_conflict_resolve(self, new_id: int, action: str) -> dict[str, Any]:
+        """裁决：accept=旧行转被取代（is_current=0, superseded_by=新行）；keep_both=两条都保留。"""
+        nid = int(new_id)
+        nrow = await (await self.db.execute(
+            "SELECT id, anchor_memory_id FROM memories WHERE id=? AND needs_review=2", (nid,))).fetchone()
+        if not nrow:
+            return {"ok": False, "error": "待审条不存在或已处理"}
+        old_id = int(nrow["anchor_memory_id"] or 0)
+        now = time.time()
+        if action == "accept" and old_id:
+            await self.db.execute(
+                "UPDATE memories SET is_current=0, valid_to=?, superseded_by=?, updated_at=? WHERE id=?",
+                (now, nid, now, old_id))
+        await self.db.execute(
+            "UPDATE memories SET needs_review=0, updated_at=? WHERE id=?", (now, nid))
+        await self.db.commit()
+        await self.audit("v2.conflict_resolve", f"new={nid} old={old_id} action={action}")
+        return {"ok": True, "new_id": nid, "old_id": old_id, "action": action}
 
     @staticmethod
     def _mem_row(row: aiosqlite.Row) -> dict[str, Any]:
@@ -2888,6 +3061,95 @@ class Store:
                 d["evidence"] = json.loads(d.get("evidence") or "[]")
             except (TypeError, ValueError):
                 d["evidence"] = []
+        return out
+
+    # ---------------- 好感分档（hf_favour_zones：user × group，''=全局/私聊档） ----------------
+
+    async def backfill_favour_zones(self) -> int:
+        """旧表 → 分档表幂等回填：旧数据成为 (user,'') 全局档；已有分档行不覆盖。"""
+        cur = await self.db.execute(
+            "INSERT OR IGNORE INTO hf_favour_zones "
+            "(user_id, group_id, name, session_id, daily, lifetime, zone, evidence, updated_at) "
+            "SELECT user_id, '', name, session_id, daily, lifetime, zone, evidence, updated_at FROM hf_favours"
+        )
+        await self.db.commit()
+        return int(cur.rowcount or 0)
+
+    async def list_favour_zones(self) -> list[dict[str, Any]]:
+        rows = await (await self.db.execute(
+            "SELECT * FROM hf_favour_zones ORDER BY daily DESC")).fetchall()
+        out = [dict(r) for r in rows]
+        for d in out:
+            try:
+                d["evidence"] = json.loads(d.get("evidence") or "[]")
+            except (TypeError, ValueError):
+                d["evidence"] = []
+        return out
+
+    async def get_favour_zone(self, user_id: str, group_id: str = "") -> dict[str, Any] | None:
+        row = await (await self.db.execute(
+            "SELECT * FROM hf_favour_zones WHERE user_id=? AND group_id=?",
+            (str(user_id), str(group_id or "")),
+        )).fetchone()
+        if row is None:
+            return None
+        d = dict(row)
+        try:
+            d["evidence"] = json.loads(d.get("evidence") or "[]")
+        except (TypeError, ValueError):
+            d["evidence"] = []
+        return d
+
+    async def upsert_favour_zone(self, user_id: str, group_id: str, patch: dict[str, Any]) -> dict[str, Any]:
+        """分档行 upsert：语义与 upsert_favour 一致（evidence 兜底、zone 由分数推导）。"""
+        ts = now()
+        gid = str(group_id or "")
+        row = await (await self.db.execute(
+            "SELECT * FROM hf_favour_zones WHERE user_id=? AND group_id=?",
+            (str(user_id), gid))).fetchone()
+        if row is None:
+            await self.db.execute(
+                "INSERT INTO hf_favour_zones(user_id,group_id,name,session_id,daily,lifetime,zone,evidence,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    str(user_id), gid,
+                    patch.get("name", str(user_id)),
+                    patch.get("session_id", ""),
+                    float(patch.get("daily", 0)),
+                    float(patch.get("lifetime", 0)),
+                    patch.get("zone", "NEUTRAL"),
+                    json.dumps(patch.get("evidence", []), ensure_ascii=False),
+                    ts,
+                ),
+            )
+        else:
+            daily = float(patch.get("daily", row["daily"]))
+            zone = patch.get("zone") or engine.zone_of(daily)
+            patch_ev = patch.get("evidence")
+            await self.db.execute(
+                "UPDATE hf_favour_zones SET daily=?, lifetime=?, zone=?, updated_at=?,"
+                " name=COALESCE(NULLIF(?,''),name), evidence=COALESCE(?, evidence) "
+                "WHERE user_id=? AND group_id=?",
+                (
+                    daily,
+                    float(patch.get("lifetime", row["lifetime"])),
+                    zone,
+                    ts,
+                    patch.get("name", ""),
+                    (json.dumps(patch_ev, ensure_ascii=False) if patch_ev is not None else None),
+                    str(user_id), gid,
+                ),
+            )
+        await self.db.commit()
+        fresh = await (await self.db.execute(
+            "SELECT * FROM hf_favour_zones WHERE user_id=? AND group_id=?",
+            (str(user_id), gid))).fetchone()
+        out = dict(fresh) if fresh else {}
+        if "evidence" in out:
+            try:
+                out["evidence"] = json.loads(out.get("evidence") or "[]")
+            except (TypeError, ValueError):
+                out["evidence"] = []
         return out
 
     async def upsert_favour(self, user_id: str, patch: dict[str, Any]) -> dict[str, Any]:
@@ -4319,6 +4581,43 @@ class Store:
             out.append(item)
         return out
 
+    async def add_memory_src(self, memory_id: Any, turns: list[dict[str, Any]]) -> int:
+        """把这条记忆对应的**完整原对话**挂上去（hf_memory_src，逐条带 role，不截断）。
+
+        为什么必须存全文：归属（谁说的）只能靠原对话的 role 判定。旧实现只在
+        evidence 里留最近 3 轮、每段 80 字，剪掉之后就再也判不出这句话是谁说的 ——
+        真机事故里 bot 自己的话被记成对方的原话，靠的就是这条缺失的证据链。
+        """
+        raw = str(memory_id or "").lstrip("m")
+        if not raw.isdigit():
+            return 0
+        seq = 0
+        rows: list[tuple[Any, ...]] = []
+        for t in turns or []:
+            ts = float(t.get("ts") or 0)
+            u = str(t.get("user") or "").strip()
+            b = str(t.get("bot") or "").strip()
+            speaker = str(t.get("name") or t.get("uid") or "")
+            if u:
+                rows.append((int(raw), seq, "user", speaker, u, ts))
+                seq += 1
+            if b:
+                rows.append((int(raw), seq, "assistant", "", b, ts))
+                seq += 1
+        if not rows:
+            return 0
+        try:
+            await self.db.executemany(
+                "INSERT OR REPLACE INTO hf_memory_src (memory_id, seq, role, speaker, content, ts) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+            await self.db.commit()
+        except Exception as exc:                            # noqa: BLE001 老库没这张表不影响记忆本身
+            logger.debug(f"[StarHeart] 记忆原对话写入跳过：{exc}")
+            return 0
+        return len(rows)
+
     async def link_memory_messages(self, memory_id: Any, message_ids: list[str]) -> int:
         """把一批消息 id 挂到一条记忆上（侧车表 hf_memory_msg）。返回新写入条数。"""
         raw = str(memory_id or "").lstrip("m")
@@ -4792,9 +5091,40 @@ class Store:
         for row in await self.person_name_detail(alias_id):
             await self.upsert_person_name(final, row.get("name") or "", source="manual",
                                           platform=str(row.get("platform") or ""))
+        # 记忆归属迁移（2026-10-24）：别名号的记忆/好感/日志一并改挂主号 ——
+        # 只并昵称表的话，旧记忆还挂在 alias 下，召回永远对不上人。
+        moved = {"v1": 0, "v2": 0, "zones": 0}
+        try:
+            cur = await self.db.execute(
+                "UPDATE hf_memories SET subject_id=? WHERE subject_id=?", (final, alias_id))
+            moved["v1"] = int(cur.rowcount or 0)
+            cur = await self.db.execute(
+                "UPDATE hf_memories SET speaker_id=? WHERE speaker_id=?", (final, alias_id))
+            cur = await self.db.execute(
+                "UPDATE memories SET subject_id=? WHERE subject_id=?", (final, alias_id))
+            moved["v2"] = int(cur.rowcount or 0)
+            await self.db.execute(
+                "UPDATE memories SET speaker_id=? WHERE speaker_id=?", (final, alias_id))
+            cur = await self.db.execute(
+                "INSERT INTO hf_favour_zones (user_id, group_id, name, session_id, daily, lifetime, zone, evidence, updated_at) "
+                "SELECT ?, group_id, name, session_id, daily, lifetime, zone, evidence, updated_at "
+                "FROM hf_favour_zones WHERE user_id=? "
+                "ON CONFLICT(user_id, group_id) DO UPDATE SET daily=excluded.daily, lifetime=excluded.lifetime, "
+                "zone=excluded.zone, evidence=excluded.evidence, updated_at=excluded.updated_at",
+                (final, alias_id))
+            moved["zones"] = int(cur.rowcount or 0)
+            await self.db.execute("DELETE FROM hf_favour_zones WHERE user_id=?", (alias_id,))
+            await self.db.execute(
+                "UPDATE access_log SET subject_id=? WHERE subject_id=?", (final, alias_id))
+            await self.db.execute(
+                "INSERT INTO attribution_merge_log (alias_id, canonical_id, moved_memories, moved_v2, moved_zones, ts) "
+                "VALUES (?,?,?,?,?,?)",
+                (alias_id, final, moved["v1"], moved["v2"], moved["zones"], now()))
+        except Exception as exc:                                # noqa: BLE001 迁移失败不挡合并本身
+            logger.warning(f"[StarHeart] person_merge 记忆迁移失败（昵称已并）：{exc}")
         await self.db.commit()
-        await self.audit("person.merge", f"{alias_id} → {final} ({reason})")
-        return {"ok": True, "alias_id": alias_id, "canonical_id": final}
+        await self.audit("person.merge", f"{alias_id} → {final} ({reason}) moved={moved}")
+        return {"ok": True, "alias_id": alias_id, "canonical_id": final, "moved": moved}
 
     async def unmerge_person(self, alias_id: str) -> dict[str, Any]:
         await self._ensure_person_tables()
@@ -5229,19 +5559,22 @@ class Store:
 
     async def subjects_needing_profile(self, subject_kind: str = "user", min_memories: int = 5,
                                        refresh_hours: int = 72, limit: int = 2,
-                                       persona_id: str = "") -> list[dict[str, Any]]:
+                                       persona_id: str = "", new_mems_min: int = 0) -> list[dict[str, Any]]:
         """挑出"该生成 / 该刷新画像"的主体：L0 人物（默认）或 L1 群聊。
 
         为什么按"记忆数"卡阈值：材料太少的画像就是模型瞎猜，宁可先不生成（面板会说明原因）。
         人物材料来自门控流水（谁说了多少话）；群聊材料来自群会话里的记忆与语料（带人格过滤，天然隔离）。
+        new_mems_min > 0 时（2026-10-24 B1）：画像生成后新增记忆 ≥N 条也触发刷新 ——
+        不用等 refresh_hours 到点，画像跟着新记忆走（确定性计数，不调 LLM 判断）。
         """
         import time as _t
         now = _t.time()
         stale_before = now - max(1, int(refresh_hours)) * 3600
         k = self._kind_of(subject_kind)
         cand: list[tuple[str, int, float]] = []
+        # 两种 kind 的 B1 增量计数都要用（user 分支的候选查询走 hf_gate_log 不需要，但计数段必须有人格过滤）
+        pwhere, pargs = self._persona_where(persona_id)
         if k == "group":
-            pwhere, pargs = self._persona_where(persona_id)
             for row in (await (await self.db.execute(
                 "SELECT session_id, COUNT(*) AS n, MAX(COALESCE(occurred_at, created_at)) AS last_ts "
                 "FROM hf_memories WHERE status IN ('active','stale') AND session_id LIKE '%:GroupMessage:%'" + pwhere +
@@ -5268,6 +5601,23 @@ class Store:
             existing = await self.profile_get(sid, k, persona_id)
             updated = float((existing or {}).get("updated_at") or 0)
             p_mem = int((existing or {}).get("mem_count") or 0)
+            # 增量触发（B1）：画像生成后新记忆攒够 N 条 → 即使没到 refresh_hours 也刷新
+            if new_mems_min > 0 and updated and p_mem > 0:
+                if k == "group":
+                    _esc = self._like_escape(sid)
+                    nrow = await (await self.db.execute(
+                        "SELECT COUNT(*) c FROM hf_memories WHERE status IN ('active','stale') "
+                        "AND session_id LIKE ? ESCAPE '" + self.LIKE_ESC + "' "
+                        "AND COALESCE(occurred_at, created_at) > ?" + pwhere,
+                        (f"%:GroupMessage:{_esc}", updated, *pargs))).fetchone()
+                else:
+                    nrow = await (await self.db.execute(
+                        "SELECT COUNT(*) c FROM hf_memories WHERE status IN ('active','stale') "
+                        "AND subject_id=? AND COALESCE(occurred_at, created_at) > ?" + pwhere,
+                        (sid, updated, *pargs))).fetchone()
+                if nrow and int(nrow["c"] or 0) >= max(1, int(new_mems_min)):
+                    out.append({"person_id": sid, "msgs": msgs, "last_ts": last_ts, "reason": "new_mems"})
+                    continue
             # 从没生成过 或 过期（且有新互动）→ 需要生成。
             # 特别注意：p_mem=0 说明库里那份画像没有材料依据（真机出现过「身份未知，仅知为人物 id」），
             # 这种必须允许重建，否则"最近更新过"会把它永远钉死在库里。
@@ -5384,8 +5734,10 @@ class Store:
                     sessions.append(str(row["session_id"] or ""))
             except Exception:                                  # noqa: BLE001 补全失败不影响门控那一路
                 pass
-            # 私聊会话（有可能门控日志里还没记上）
-            sessions.append(f"private:{sid}" if not str(sid).startswith("private:") else sid)
+            # 私聊会话（有可能门控日志里还没记上）。
+            # ⚠️ 不能拼 "private:{sid}"（P3-1）：session_kind 对两段式 "private:xxx" 返回
+            # ("other", ...)，匹配 0 条记忆 → dossier 里多一个永远为空的幽灵会话。
+            # 真实私聊会话串是三段式 "平台:FriendMessage:号"，由上面门控/记忆两路补全。
             sessions = [x for x in dict.fromkeys(sessions) if x]
 
         name = ""
@@ -5768,6 +6120,44 @@ class Store:
             "from_db": True,
         }
 
+    async def mark_recalled(self, mid: str, session_id: str = "") -> int:
+        """把一条已留档消息标记为已撤回（recalled=1，幂等）。
+
+        消息浏览页据此打「已撤回」标签。mid 是平台 message_id（ext_id 存的是 qq:<mid>）。
+        精确 ext_id 不命中时不硬猜（不按时间兜底——那是取证链路的策略，标记必须确定）。
+        """
+        mid = str(mid or "").strip()
+        if not mid:
+            return 0
+        try:
+            cur = await self.db.execute(
+                "UPDATE hf_messages SET recalled=1 WHERE ext_id=? AND recalled=0",
+                (f"qq:{mid}",),
+            )
+            n = int(cur.rowcount or 0)
+            if n:
+                await self.db.commit()
+            return n
+        except Exception:                                      # noqa: BLE001 标记失败不影响撤回主链路
+            return 0
+
+    async def backfill_recalled(self) -> int:
+        """按撤回流水回填历史消息的 recalled 标记（幂等，可反复跑）。
+
+        供列升级后一次性补历史：hf_recall_log.message_id → ext_id=qq:<message_id>。
+        """
+        try:
+            rows = await (await self.db.execute(
+                "SELECT DISTINCT message_id FROM hf_recall_log "
+                "WHERE message_id!='' AND notice_type LIKE '%recall%'"
+            )).fetchall()
+        except Exception:                                      # noqa: BLE001
+            return 0
+        n = 0
+        for r in rows:
+            n += await self.mark_recalled(str(r["message_id"] or ""))
+        return n
+
     async def purge_live_messages(self, keep_days: int = 30) -> int:
         """直播留档的保留期清理：只清 qq:<mid>（导入的 lmmsg: 不属于本次留档）。
 
@@ -5776,8 +6166,13 @@ class Store:
         days = max(1, int(keep_days or 30))
         cutoff = now() - days * 86400.0
         try:
+            # P2-21：旧谓词只清 qq:<mid>（用户侧），bot 侧（ext_id IS NULL）永不清 →
+            # 磁盘与隐私双风险（含撤回过的内容）。现在按「平台会话 + 超期」全清：
+            # 有 ext_id 的（qq:/lmmsg: 导入）按会话前缀，无 ext_id 的 bot 行按 ts。
             cur = await self.db.execute(
-                "DELETE FROM hf_messages WHERE ext_id LIKE 'qq:%' AND ts < ?", (cutoff,)
+                "DELETE FROM hf_messages WHERE ts < ? "
+                "AND (ext_id IS NULL OR ext_id LIKE 'qq:%' OR ext_id='')",
+                (cutoff,),
             )
             await self.db.commit()
             return int(cur.rowcount or 0)
@@ -5786,32 +6181,61 @@ class Store:
             return 0
 
     async def add_messages(self, rows: list[dict[str, Any]]) -> int:
-        """批量写会话消息。ext_id 唯一 → 重复导入幂等，返回新增条数。"""
+        """批量写会话消息。ext_id 唯一 → 重复导入幂等，返回新增条数。
+
+        ext_id 为 None 时跳过去重（bot 侧消息没有平台消息 id，允许多条共存）。
+        imgs（JSON 数组字符串）落库，消息浏览页靠它显示图片。
+        """
         if not rows:
             return 0
+        dedup_rows = [r for r in rows if str(r.get("ext_id") or "") != ""]
+        plain_rows = [r for r in rows if str(r.get("ext_id") or "") == ""]
         before = (await (await self._db.execute("SELECT COUNT(*) FROM hf_messages")).fetchone())[0]
-        await self._db.executemany(
-            """INSERT OR IGNORE INTO hf_messages
-               (session_id, role, content, sender_id, sender_name, platform, ts, is_bot, ext_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            [
-                (
-                    str(r.get("session_id") or ""),
-                    str(r.get("role") or ""),
-                    str(r.get("content") or ""),
-                    str(r.get("sender_id") or ""),
-                    str(r.get("sender_name") or ""),
-                    str(r.get("platform") or ""),
-                    float(r.get("ts") or 0),
-                    1 if r.get("is_bot") else 0,
-                    str(r.get("ext_id")) if r.get("ext_id") is not None else None,
-                )
-                for r in rows
-            ],
-        )
+        if dedup_rows:
+            # 列序必须与 _msg_row 元组尾序一致：(…, is_bot, imgs, ext_id)——
+            # 之前写成 (…, ext_id, imgs) 导致 imgs 值落进 ext_id 列（冒烟测试抓到）
+            await self._db.executemany(
+                """INSERT OR IGNORE INTO hf_messages
+                   (session_id, role, content, sender_id, sender_name, platform, ts, is_bot, imgs, ext_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [self._msg_row(r) for r in dedup_rows],
+            )
+        if plain_rows:
+            # 注意：ext_id 列有 UNIQUE 约束——'' 与 '' 互斥（第二条 bot 消息就炸），
+            # 绑 NULL（UNIQUE 对 NULL 放行，多条共存）；9 个占位符 + NULL。
+            await self._db.executemany(
+                """INSERT INTO hf_messages
+                   (session_id, role, content, sender_id, sender_name, platform, ts, is_bot, ext_id, imgs)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)""",
+                [self._msg_row(r, with_ext=False) for r in plain_rows],
+            )
         await self._db.commit()
         after = (await (await self._db.execute("SELECT COUNT(*) FROM hf_messages")).fetchone())[0]
         return int(after - before)
+
+    @staticmethod
+    def _msg_row(r: dict[str, Any], with_ext: bool = True) -> tuple:
+        imgs = r.get("imgs")
+        if not isinstance(imgs, str):
+            try:
+                import json as _json
+                imgs = _json.dumps(list(imgs or []), ensure_ascii=False)
+            except Exception:                              # noqa: BLE001
+                imgs = "[]"
+        base = (
+            str(r.get("session_id") or ""),
+            str(r.get("role") or ""),
+            str(r.get("content") or ""),
+            str(r.get("sender_id") or ""),
+            str(r.get("sender_name") or ""),
+            str(r.get("platform") or ""),
+            float(r.get("ts") or 0),
+            1 if r.get("is_bot") else 0,
+            imgs,
+        )
+        if with_ext:
+            return (*base, str(r.get("ext_id")) if r.get("ext_id") is not None else None)
+        return base
 
     async def msg_stats(self) -> dict[str, Any]:
         total = (await (await self._db.execute("SELECT COUNT(*) FROM hf_messages")).fetchone())[0]
@@ -5834,7 +6258,59 @@ class Store:
                 f"SELECT * FROM hf_messages WHERE {w} ORDER BY ts ASC LIMIT ? OFFSET ?", [*args, limit, offset]
             )
         ).fetchall()
-        return {"items": [dict(r) for r in rows], "total": int(total)}
+        items = []
+        for r in rows:
+            d = dict(r)
+            # imgs：JSON 数组字符串 → 数组（消息浏览页渲染图）；坏值兜空数组
+            raw = d.get("imgs")
+            if isinstance(raw, str) and raw.strip():
+                try:
+                    import json as _json
+                    v = _json.loads(raw)
+                    d["imgs"] = [str(x) for x in v] if isinstance(v, list) else []
+                except Exception:                          # noqa: BLE001
+                    d["imgs"] = []
+            else:
+                d["imgs"] = []
+            items.append(d)
+        return {"items": items, "total": int(total)}
+
+    async def message_sessions(self, limit: int = 100) -> list[dict[str, Any]]:
+        """消息浏览页的会话清单（P2-2）：从 hf_messages 聚合，含 bot 侧占比与末条预览。
+
+        与 memory_sessions 的区别：那个按「记忆数」排序（没有记忆的会话不出现在清单里），
+        这个按「最近说话」排序——像 QQ 一样，最近聊过的排最前。
+        """
+        rows = await (
+            await self._db.execute(
+                """SELECT session_id,
+                          COUNT(*) AS msgs,
+                          SUM(CASE WHEN is_bot=1 THEN 1 ELSE 0 END) AS bot_msgs,
+                          MIN(ts) AS first_ts, MAX(ts) AS last_ts,
+                          MAX(CASE WHEN is_bot=0 AND sender_name!='' THEN sender_name END) AS peer_name
+                   FROM hf_messages WHERE session_id!=''
+                   GROUP BY session_id ORDER BY last_ts DESC LIMIT ?""",
+                (int(limit),),
+            )
+        ).fetchall()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            d = dict(r)
+            # 末条预览（含 bot 侧；纯图消息 content 为空就显示占位）
+            last = await (await self._db.execute(
+                "SELECT content, is_bot, imgs FROM hf_messages WHERE session_id=? ORDER BY ts DESC LIMIT 1",
+                (d["session_id"],),
+            )).fetchone()
+            if last:
+                preview = str(last["content"] or "")
+                n_img = len(_loads(last["imgs"] or "[]")) if isinstance(last["imgs"], str) else 0
+                d["last_preview"] = (preview or "（无文本）")[:40] + (f"　[{n_img} 图]" if n_img else "")
+                d["last_from_bot"] = bool(last["is_bot"])
+            else:
+                d["last_preview"] = ""
+                d["last_from_bot"] = False
+            out.append(d)
+        return out
 
     async def messages_around(self, session_id: str, ts: float, before: int = 6, after: int = 6) -> list[dict[str, Any]]:
         """某条记忆发生时刻前后的真实对话（详情页"原始对话"取这段）。"""
@@ -5906,27 +6382,40 @@ class Store:
         sort: str = "recent",
         limit: int = 20,
         offset: int = 0,
+        days: float = 0,
     ) -> dict[str, Any]:
-        """管理表用。关键词覆盖 摘要/内容/原文/证据/线索（就是 livingmemory 的"关键字（支持 memory_id/内容搜索）"）。"""
+        """管理表用。关键词覆盖 摘要/内容/原文/证据/线索（就是 livingmemory 的"关键字（支持 memory_id/内容搜索）"）。
+
+        2026-10-24（复查 P1-10）：
+        - 多关键词：`q` 按空白拆分，每个词都要命中（旧实现整串 LIKE，工具示例「猫 出差」
+          要求正文出现连续的「猫 出差」四字 —— 示例本身失效）；
+        - `days`：时间过滤下推到 SQL（旧实现取回 24 条后才过滤，结果被无关新条目挤爆）；
+        - `sort='relevance'`：按命中词数排序（旧实现只有时间倒序，工具要的是相关性）。
+        """
         where: list[str] = ["1=1"]
         args: list[Any] = []
-        if q.strip():
-            kw = q.strip()
+        kws = [k for k in str(q or "").split() if k.strip()][:6]
+        for kw in kws:
             like = "%" + kw + "%"
-            # 关键词宽匹配照旧（摘要/内容/原文/证据/线索/实体/会话），另外单独认一次「记忆 ID」：
-            # 面板摘要列显示的是 m{id}，用户会把整串粘进来，而 id 是 INTEGER —— 老写法
-            # CAST(id AS TEXT)='m865' 永不成立，所以搜 ID 一条也搜不到。剥掉前缀后按数字精确匹配，
-            # 用 OR 挂上去只可能多命中，不会把原来的关键词结果挤掉。
+            # 关键词宽匹配（摘要/内容/原文/证据/线索/实体）——注意**不含 session_id**：
+            # 平台名可能含常见字（如「猫咖-test」），会话串参与 LIKE 会让搜「猫」命中整个会话。
             conds = [
                 "summary LIKE ?", "content LIKE ?", "source_text LIKE ?", "evidence LIKE ?",
-                "cues LIKE ?", "entities LIKE ?", "session_id LIKE ?",
+                "cues LIKE ?", "entities LIKE ?",
             ]
             args += [like] * len(conds)
+            # 会话号只在「纯数字」时才按会话尾部匹配（搜 QQ 号/群号找该会话的记录）
+            if str(kw).isdigit():
+                conds.append("session_id LIKE ?")
+                args.append("%" + kw)
             mid = _query_memory_id(kw)
             if mid is not None:
                 conds.append("id=?")
                 args.append(mid)
             where.append("(" + " OR ".join(conds) + ")")
+        if days and float(days) > 0:
+            where.append("COALESCE(occurred_at, created_at) >= ?")
+            args.append(now() - float(days) * 86400.0)
         if session_id:
             where.append("session_id=?")
             args.append(session_id)
@@ -5960,18 +6449,34 @@ class Store:
         }.get(sort, "COALESCE(occurred_at, created_at) DESC")
         gen = await self.active_gen_cached()
         total = (await (await self._db.execute(f"SELECT COUNT(*) FROM hf_memories WHERE {w}", args)).fetchone())[0]
+        # relevance：先按时间取回 3 倍，再按「命中词数」在 Python 侧排序（旧实现只有时间倒序）
+        _fetch_limit = limit
+        if sort == "relevance" and kws:
+            _fetch_limit = max(limit * 3, 30)
+            if offset:
+                _fetch_limit += int(offset)
+            offset = 0
         rows = await (
             await self._db.execute(
                 f"""SELECT id, summary, content, source_text, atom_type, strength, poignancy, recalls,
-                           session_id, persona_id, cues, entities, occurred_at, created_at, status,
-                           external_source, external_id,
-                           CASE WHEN EXISTS (SELECT 1 FROM hf_vectors v WHERE v.memory_id=hf_memories.id AND v.gen_key=?)
-                                THEN 1 ELSE 0 END AS has_vec
-                    FROM hf_memories WHERE {w} ORDER BY {order} LIMIT ? OFFSET ?""",
-                [gen, *args, limit, offset],
+                                           session_id, persona_id, cues, entities, occurred_at, created_at, status,
+                                           external_source, external_id, said_by,
+                                           subject_id, speaker_id, speaker_name, channel, group_id,
+                                           CASE WHEN EXISTS (SELECT 1 FROM hf_vectors v WHERE v.memory_id=hf_memories.id AND v.gen_key=?)
+                                                THEN 1 ELSE 0 END AS has_vec
+                                    FROM hf_memories WHERE {w} ORDER BY {order} LIMIT ? OFFSET ?""",
+                [gen, *args, _fetch_limit, offset],
             )
         ).fetchall()
-        return {"items": [dict(r) for r in rows], "total": int(total), "limit": limit, "offset": offset, "gen": gen}
+        items = [dict(r) for r in rows]
+        if sort == "relevance" and kws:
+            def _hits(d: dict[str, Any]) -> int:
+                blob = " ".join(str(d.get(k) or "") for k in
+                                ("summary", "content", "source_text", "evidence", "cues", "entities"))
+                return sum(1 for kw in kws if kw in blob)
+            items.sort(key=lambda d: (-_hits(d), -(float(d.get("strength") or 0))))
+            items = items[:limit]
+        return {"items": items, "total": int(total), "limit": limit, "offset": offset, "gen": gen}
 
     async def memory_personas(self) -> list[dict[str, Any]]:
         """人格清单（记忆库按人格分类用）。"""

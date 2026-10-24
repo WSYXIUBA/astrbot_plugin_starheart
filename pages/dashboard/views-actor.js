@@ -8,7 +8,7 @@ import {
   $, esc, jsStr, fmtNum, fmtTime, timeAgo, apiSafe, apiPostSafe,
   pageHead, card, kpis, kpiCard, secTitle, toast,
   openDrawer, closeDrawer, refreshCurrent, goPage,
-} from "./store.js?v=1.0.5-3";
+} from "./store.js?v=1.0.6";
 
 // 页签 id 必须与 app.js 的 actor.subs 一致；这里只用来校验子路由，显示文案以 app.js 为准。
 const SUBS = ["review", "voice", "persona", "inject"];

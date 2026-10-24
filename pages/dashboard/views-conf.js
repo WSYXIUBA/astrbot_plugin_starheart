@@ -5,11 +5,11 @@
  * 保存时只提交本页出现过的键，避免误改别的域。
  */
 
-import * as C from "./charts.js?v=1.0.5-3";
+import * as C from "./charts.js?v=1.0.6";
 import {
   $, $$, api, apiSafe, apiPostSafe, esc, fmtNum, fmtTime, toast, confirmModal, pageHead, card, mount, emptyBlock,
   skelBlock, refreshCurrent, normList, jsStr, configTouchedAt, noteConfigTouched, recentFirstKeys, takeConfigDirty, nativeWriteError,
-} from "./store.js?v=1.0.5-3";
+} from "./store.js?v=1.0.6";
 
 /** key -> [标签, 说明, 类型, min, max, step, 选项] */
 export const CONFIG_META = {
@@ -35,6 +35,14 @@ export const CONFIG_META = {
   memory_evict_below: ["淘汰阈值", "强度低于此值的记忆会被标记 stale", "num", 0.01, 0.5, 0.01],
   memory_summary_prompt: ["总结自定义提示词", "空=内置；支持 {transcript} 占位", "text"],
   memory_persona_isolated: ["记忆人格隔离", "记忆按人格分开存放", "bool"],
+  // 归属与隔离（2026-10-24 记忆归属优化）：群/私记忆的可见方向与在场成员窗口
+  memory_group_to_private: ["群记忆→私聊可见", "在群里发生的事，私聊时也能想起来（渲染会标「在群里听 XX 说过」）；关掉后群记忆只在群里出现", "bool"],
+  memory_private_to_group: ["私聊记忆→群聊可见", "默认关：私聊内容不进群聊上下文。打开也只按 0.4× 降权并标注「私下说的」，数据不删", "bool"],
+  memory_group_cast_size: ["在场成员窗口(轮)", "群聊召回的「在场成员」= 当前说话人 + @对象 + 被回复人 + 最近 N 轮出现过的人；0 = 只认 @/回复对象", "num", 0, 30, 1],
+  memory_profile_inject: ["画像注入", "把已生成的人物/群聊画像带进对话（私聊=本人，群聊=在场成员），只读现成画像、不额外调模型", "bool"],
+  memory_profile_inject_cast: ["画像注入人数", "群聊里最多给几个人注入画像（按 被回复 > @ > 发言频次 取前 N）；私聊恒为 1", "num", 0, 6, 1],
+  memory_profile_refresh_new: ["画像刷新阈值(条)", "某人新记忆攒够 N 条就自动重算画像（复用画像模型；0 = 沿用原刷新节奏）", "num", 0, 100, 1],
+  memory_conflict_hold: ["逐字冲突不静默覆盖", "新旧两条都带逐字引文且互相矛盾时，不自动覆盖旧记忆，新条进「冲突待审」由你裁决", "bool"],
   gate_enabled: ["门控开关", "决定机器人「该不该开口」", "bool"],
   gate_shadow: ["影子模式", "只记录评分不真的拦，用来观察门控准不准", "bool"],
   gate_threshold: ["触发阈值", "总分 ≥ 阈值才开口（分数永不进 prompt）；超过 100 会永久沉默，保存时被拦下", "num", 1, 100, 1],
@@ -51,6 +59,7 @@ export const CONFIG_META = {
   favour_daily_cap: ["好感日上限", "当天正增量累计到这个值就封顶（0=不限）", "num", 0, 100, 1],
   favour_daily_half_life_days: ["每日半衰期(天)", "daily 按这个天数半衰；0=关闭衰减（lifetime 永不衰减）", "num", 0, 60, 0.5],
   favour_tag_required: ["需要标签才结算", "开=只有模型给出好感标签才结算；关=无标签也按 +1（仍受日上限约束）", "bool"],
+  favour_per_group: ["好感分群分档", "同一个人在群里和私聊各记一份温度：群内互动累积群内档，私聊累积私聊档；旧数据自动成为「全局档」", "bool"],
   recall_handling: ["撤回处理", "对方撤回消息时怎么处理相关记忆", "select", 0, 0, 0, ["log_only", "weaken", "delete"]],
   recall_weaken_factor: ["降权系数", "撤回命中记忆后强度乘这个系数", "num", 0.05, 1, 0.05],
   recall_keep_days: ["流水保留(天)", "撤回事件流水保留多久", "num", 1, 365, 1],

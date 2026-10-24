@@ -6,22 +6,62 @@
  * memory↔memory 的关系链（实体/时序/语义）。
  */
 
-import * as C from "./charts.js?v=1.0.5-3";
-import { GRAPH_PALETTE } from "./graph.js?v=1.0.5-3";
+import * as C from "./charts.js?v=1.0.6";
+import { GRAPH_PALETTE } from "./graph.js?v=1.0.6";
 import {
   createGraph3D, webglAvailable, LAYOUT_DEFS, LAYOUT_HOTKEYS, CAM_DEFS, PALETTE_DEFS, TIER_DEFS,
   PARA_DEFS, LEVEL_DEFS, ATOM_LABEL as ATOM_LABEL_3D,
-} from "./graph3d.js?v=1.0.5-3";
+} from "./graph3d.js?v=1.0.6";
 import {
   $, api, apiPost, apiPostSafe, apiSafe, esc, fmtNum, fmtPct, fmt1, fmtTime, timeAgo, toast, openDrawer, closeDrawer,
   confirmModal, formModal, pageHead, tabBar, card, kpiCard, kpis, secTitle, mount, emptyBlock, skelBlock, jsStr, STATE,
   segmentHtml, syncSeg, countUp, goPage, refreshCurrent,
-} from "./store.js?v=1.0.5-3";
+} from "./store.js?v=1.0.6";
 
 export const ATOM_LABEL = {
   factual: "事实", episodic: "经历", relational: "关系", preference: "偏好",
   planned: "待办", routine: "惯例", opinion: "看法",
 };
+// 记忆归属（谁说的 / 是谁的事）：said_by 由抽取时按引文硬校验写入
+export const OWNER_LABEL = { user: "TA 说的", bot: "我说的", both: "双方", none: "中性" };
+export function ownerTag(v) {
+  const k = String(v || "");
+  if (k === "user") return '<span class="tag ok" title="TA 说的 / TA 的事">TA</span>';
+  if (k === "bot") return '<span class="tag dg" title="我说的 / 我的事，不是 TA 的原话">我</span>';
+  if (k === "both") return '<span class="tag gy" title="双方一起的事">双方</span>';
+  return '<span class="mut" style="font-size:10.5px">—</span>';
+}
+
+// 归属明细行（2026-10-24 记忆归属优化）：说话人 / 渠道来自确定性字段（消息发送者、行号反查），不是模型猜的
+export function attributionLine(m) {
+  const spk = String(m.speaker_name || "").trim();
+  const spkId = String(m.speaker_id || "").trim();
+  const ch = String(m.channel || "").trim();
+  const gid = String(m.group_id || "").trim();
+  const bits = [];
+  if (spk) bits.push(`说话人 <b>${esc(spk)}</b>${spkId && spkId !== spk ? `<span class="mut">(${esc(spkId)})</span>` : ""}`);
+  else if (spkId) bits.push(`说话人 <b>${esc(spkId)}</b>`);
+  if (ch === "group") bits.push(`群聊${gid ? ` <span class="mono">${esc(gid)}</span>` : ""}`);
+  else if (ch === "private") bits.push("私聊");
+  return bits.length ? `<div class="mut" style="font-size:10.5px;margin-top:2px">${bits.join(" · ")}</div>` : "";
+}
+
+// 归属明细（记忆详情抽屉用）：字段级键值
+export function attributionDetailRow(M) {
+  const spk = String(M.speaker_name || "").trim();
+  const spkId = String(M.speaker_id || "").trim();
+  const ch = String(M.channel || "").trim();
+  const gid = String(M.group_id || "").trim();
+  const who = (spk || spkId)
+    ? `<span>说话人 <b>${esc(spk || spkId)}</b>${spk && spkId && spk !== spkId ? ` <span class="mut">(${esc(spkId)})</span>` : ""}</span>`
+    : '<span>说话人 <b class="mut">未定</b></span>';
+  const where = ch === "group"
+    ? `<span>渠道 <b>群聊</b>${gid ? ` · <span class="mono">${esc(gid)}</span>` : ""}</span>`
+    : ch === "private"
+      ? '<span>渠道 <b>私聊</b></span>'
+      : '<span>渠道 <b class="mut">未标</b></span>';
+  return `<div class="frow2">${who}${where}</div>`;
+}
 export const GROUP_LABEL = { memory: "记忆", person: "人物", topic: "话题", session: "会话" };
 const ATOM_COLOR = GRAPH_PALETTE.memory;
 const LINK_LABEL = { semantic: "语义同义", temporal: "时序相邻", entity: "实体共指",
@@ -719,6 +759,8 @@ async function memDetailHtml(m, edges, sid) {
            新对话产生的记忆都会带上原话（可核对）</div>`}
     <div class="fdet-h">简写（图谱上显示的那句）</div>
     <div class="fdet-tx">${esc(M.summary || m.summary || "(无摘要)")}</div>
+    <div class="mut" style="font-size:11px;margin-top:3px">归属：${esc(OWNER_LABEL[String(M.said_by || m.said_by || "")] || "未标注")}${String(M.said_by || m.said_by) === "bot" ? "（我自己说过的话，不是 TA 的原话）" : ""}</div>
+    ${attributionDetailRow(M)}
     ${content && content !== M.summary ? `<div class="fdet-h">补充内容</div><div class="fdet-q">${esc(content)}</div>` : ""}
     <div class="fdet-h">关键信息</div>
     <div class="frow2">
@@ -1513,6 +1555,19 @@ export async function hfMemOpen(id, sid) {
   return hfCardDet(sid || (String(id).startsWith("m") ? "g" : "p"), String(id));
 }
 
+/** v2 逐字冲突裁决：accept=新记忆对（旧行转被取代）；keep_both=两条都保留（都参与召回） */
+export async function hfConflictResolve(id, action) {
+  const res = await apiPostSafe("v2/conflict/resolve", { id: String(id), action: String(action) });
+  const ok = res && res.ok !== false;
+  toast(
+    ok
+      ? (String(action) === "accept" ? "已采纳新记忆，旧条转为被取代（可回溯）" : "两条都保留，都参与召回")
+      : "处理失败：" + ((res && res.error) || ""),
+    ok ? "ok" : "err",
+  );
+  if (ok) hfRerenderHook();
+}
+
 /** 打开某条记忆/人物的详细 */
 export async function hfMemDetail(id) {
   return hfCardDet(String(id).startsWith("m") ? "g" : "p", String(id));
@@ -1907,13 +1962,15 @@ let MB_GENS = [];
 
 /** 记忆库 = 记忆管理表（和「记忆图谱」是两张不同的东西：一个是管理，一个是关系网络）。 */
 export async function renderMemoryList() {
-  const [res, sess, cov, vg, lc] = await Promise.all([
+  const [res, sess, cov, vg, lc, cf] = await Promise.all([
     apiSafe("memory/search", { q: MB.q, session_id: MB.session_id, persona_id: MB.persona_id, status: MB.status, atom_type: MB.atom_type, source: MB.source, sort: MB.sort, limit: MB.limit, offset: MB.offset }, { items: [], total: 0 }),
     apiSafe("memory/sessions", {}, { items: [], msg: {} }),
     apiSafe("embed/coverage", {}, {}),
     apiSafe("vector/gens", {}, { items: [] }),
     // 记忆生命周期（接口早就有，之前前端 0 调用）：活跃 / 已归档 / 已遗忘
     apiSafe("memory/lifecycle", {}, {}),
+    // v2 逐字冲突待审队列（memory_conflict_hold 开启时产生；空数组=没有待裁决的）
+    apiSafe("v2/conflicts", {}, { items: [] }),
   ]);
   MB_DATA = { items: res.items || [], total: res.total || 0 };
   MB_SESS = sess;
@@ -1970,6 +2027,35 @@ export async function renderMemoryList() {
       : card(`<div class="mut" style="font-size:12px;line-height:1.8">生命周期计数暂不可用：接口没有返回 <span class="mono">counts</span>（这里不显示 0 顶替）。</div>`,
           { title: "记忆生命周期", sub: "活跃 / 已归档 / 已遗忘（自动归档与遗忘的现状）" });
 
+  // v2 逐字冲突待审卡：新旧两条都带逐字引文且互相矛盾时不自动覆盖，等人工裁决（memory_conflict_hold）
+  const conflicts = (cf && !cf.__err && Array.isArray(cf.items)) ? cf.items : [];
+  const conflictCard = cf && cf.__err
+    ? ""
+    : conflicts.length
+      ? card(
+          conflicts.map((c) => `
+            <div class="mb-rc" style="cursor:default">
+              <div class="mb-sum" style="overflow:visible;-webkit-line-clamp:unset"><b>新</b> ${esc(String(c.text || ""))}</div>
+              <div class="mut" style="font-size:11px;margin-top:4px">
+                原话：<span class="mono">「${esc(String(c.evidence_quote || ""))}」</span>
+                · 类型 ${esc(String(c.kind || "—"))}
+                ${c.speaker_name ? ` · 说话人 ${esc(String(c.speaker_name))}` : ""}
+                · <span class="mono">${esc(fmtTime(c.created_at))}</span>
+              </div>
+              <div class="mut" style="font-size:11px;margin-top:3px;color:var(--tx2)">
+                <b>旧</b> #${esc(String(c.old_id || "—"))} ${esc(String(c.old_text || ""))}
+              </div>
+              <div class="row" style="gap:6px;margin-top:7px">
+                <button class="btn xs p" onclick="hfConflictResolve(${esc(String(c.id))},'accept')">新记忆对，覆盖旧的</button>
+                <button class="btn xs" onclick="hfConflictResolve(${esc(String(c.id))},'keep_both')">两条都保留</button>
+              </div>
+            </div>`).join(""),
+          {
+            title: `v2 逐字冲突待审（${conflicts.length}）`,
+            sub: "新旧都声称有逐字原话且互相矛盾 —— 不自动覆盖，由你裁决；这里清空后自动消失",
+          })
+      : "";
+
   const html = `
   <style>
     .mbrow { cursor: pointer; }
@@ -2000,6 +2086,7 @@ export async function renderMemoryList() {
     "❑"
   )}
   ${lifeCard}
+  ${conflictCard}
   ${kpis(
     kpiCard("mbAll", fmtNum(MB_DATA.total), "当前筛选命中", `<span class="mut">共 ${fmtNum(st.active || 0)} 活跃 / ${fmtNum(cov.total || 0)} 条</span>`)
     + kpiCard("mbVec", `${fmtNum(cov.embedded || 0)}<span class="mut" style="font-size:12px">/${fmtNum(cov.total || 0)}</span>`, "已生成向量",
@@ -2105,6 +2192,7 @@ export async function renderMemoryList() {
     <table class="mbt">
       <thead><tr>
         <th style="width:54px">ID</th><th>记忆（点一行展开详细）</th><th style="width:74px">类型</th>
+        <th style="width:58px">归属</th>
         <th style="width:92px">强度</th><th style="width:70px">状态</th><th style="width:58px">向量</th>
         <th style="width:150px">人格</th><th style="width:132px">发生时间</th><th style="width:190px">会话</th>
       </tr></thead>
@@ -2115,8 +2203,10 @@ export async function renderMemoryList() {
             return `<tr class="mbrow${isOpen ? " on" : ""}" data-id="${esc(String(m.id).replace(/^m/, ""))}" onclick="hfMemOpenRow(${jsStr(String(m.id))})">
               <td><span class="mono" style="font-size:11px;color:var(--primary)">m${m.id}</span></td>
               <td><div class="mb-sum">${esc(String(m.summary || "(无摘要)"))}</div>
+                  ${attributionLine(m)}
                   ${String(m.source_text || "").length > String(m.summary || "").length + 20 ? `<div class="mut" style="font-size:10.5px;margin-top:2px">有完整原文 ${fmtNum(String(m.source_text).length)} 字</div>` : ""}</td>
               <td><span class="chip gy">${esc(ATOM_LABEL[m.atom_type] || m.atom_type || "—")}</span></td>
+              <td>${ownerTag(m.said_by)}</td>
               <td><span class="mb-bar"><i style="width:${Math.max(3, Math.min(100, Math.round((m.strength || 0) * 100)))}%"></i></span>
                   <span class="mut" style="font-size:10.5px;margin-left:5px">${fmt1(m.strength)}</span></td>
               <td><span class="tag ${m.status === "active" ? "ok" : (m.status === "archived" || m.status === "deleted") ? "dg" : "gy"}">${esc(STATUS_LABEL[m.status] || m.status || "—")}</span>
@@ -2128,10 +2218,10 @@ export async function renderMemoryList() {
               <td class="mut" style="font-size:11px">${esc(fmtTime(m.occurred_at || m.created_at))}</td>
               <td class="mut" style="font-size:10.5px" title="${esc(String(m.session_id || ""))}">${esc(sessLabel(m.session_id))}${m.external_source ? `<div class="chip gy" style="margin-top:3px">导入</div>` : ""}</td>
             </tr>
-            ${isOpen ? `<tr class="mb-det"><td colspan="9"><div class="fdet">${openHtml}</div></td></tr>` : ""}`;
+            ${isOpen ? `<tr class="mb-det"><td colspan="10"><div class="fdet">${openHtml}</div></td></tr>` : ""}`;
           })
           .join("")
-        : `<tr><td colspan="9" style="padding:26px;text-align:center">
+        : `<tr><td colspan="10" style="padding:26px;text-align:center">
              <div class="mut" style="font-size:12.5px">${MB.q || MB.session_id || MB.status || MB.atom_type || MB.source
                ? "当前筛选下没有记忆 —— 放宽条件试试"
                : "库里还没有记忆：让 bot 多聊几次，或去设置页导入 livingmemory 的历史记忆"}</div>
@@ -2387,7 +2477,7 @@ export async function hfMemReactivate(btn) {
 
 /** 导出当前页为 CSV（面板内可用，不依赖下载权限） */
 export function hfMemExport() {
-  const head = ["id", "summary", "content", "atom_type", "strength", "status", "has_vec", "session_id", "occurred_at"];
+  const head = ["id", "summary", "content", "atom_type", "said_by", "strength", "status", "has_vec", "session_id", "occurred_at"];
   const rows = (MB_DATA.items || []).map((m) => head.map((k) => `"${String(m[k] == null ? "" : m[k]).replace(/"/g, '""')}"`).join(","));
   const csv = "\ufeff" + head.join(",") + "\n" + rows.join("\n");
   const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
@@ -2937,7 +3027,7 @@ export async function renderMemoryConf() {
   const G = (dom.guards && dom.guards.keys) || {};
   const half = Number(values.memory_decay_half_life_days) || 21;
   const rows = [
-    ["memory_summary_prompt", "总结自定义提示词", "空=用内置；支持 {transcript} 占位；请保留输出格式行（摘要|类型|强度|情绪浓度）", "area"],
+    ["memory_summary_prompt", "总结自定义提示词", "空=用内置；支持 {transcript} 占位；请保留输出格式行（摘要|类型|强度|情绪浓度|归属|引文）", "area"],
     ["memory_inject_enabled", "记忆注入", "开关：把召回到的记忆拼进 prompt", "bool"],
     ["memory_inject_top_k", "注入条数", "每轮最多注入几条记忆", "num", 1, 20],
     ["memory_inject_budget_tokens", "注入预算", "记忆部分的 token 上限（超了会截断）", "num", 100, 6000],

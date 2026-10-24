@@ -236,6 +236,8 @@ def build_memory_context(memories: list[dict[str, Any]], budget_chars: int = 900
     if today_label:
         head += f"；今天是 {today_label}"
     head += ("—— 它是参考不是证据，不要拿它去质疑对方「刚才在哪说过什么」。"
+             "每条前面的「（TA 说的 / 我说的…）」是归属：标「我说的」是你自己说过的话，"
+             "绝不能当成 TA 的原话去引用或质问；标「TA 说的」才是 TA 的原话。"
              "引用旧事按方括号里的时间说：超过一天的事不许说成「今天/昨天/刚才」；"
              "同一件事有多个说法时以时间较新的为准；记忆里没写的地点、计划、约定一律不许补，"
              "拿不准就不提）：\n")
@@ -243,12 +245,36 @@ def build_memory_context(memories: list[dict[str, Any]], budget_chars: int = 900
 
 
 def _memory_subject_note(mem: dict[str, Any]) -> str:
-    """给「动作留痕」记忆加主语标注。
+    """给记忆加主语标注：这句话是谁说的、是谁的事。
 
-    这类记忆（跨会话排定时消息等）的 summary 里带着目标消息原文，模型读到的
-    只有「到杭州家门口了吧 电费别忘了交」，会当成对方说过的话。真机事故：
-    10-20 主动开口把它说成「昨儿不是说去杭州了 到家没」。
+    没有这个标注时，模型会把「我（bot）说过的话」当成「TA 的原话」甩回去
+    （真机事故：10-22 的「抱枕收下～但不够 要更顶的」是我说的，隔天被当成
+    TA 的原话，用户回「我没说」）。
+    2026-10-24 起带渠道与说话人（确定性字段 speaker_id/speaker_name/channel）：
+    群聊里发生的事标「在群里听 XX 说过」，不再一律「TA 说的」——
+    群聊里 B 的事被安到眼前这个人头上，就是这个标注缺位造成的。
     """
+    said = str(mem.get("said_by") or "").strip().lower()
+    channel = str(mem.get("channel") or "").strip().lower()
+    spk_id = str(mem.get("speaker_id") or "").strip()
+    spk_name = str(mem.get("speaker_name") or "").strip()
+    if channel == "group" and said == "user":
+        # 群聊来源：点名「在群里听谁说的」（昵称快照优先；纯数字号显示 QQ 号）
+        if spk_name:
+            who = spk_name
+        elif spk_id and not spk_id.isdigit():
+            who = spk_id
+        elif spk_id:
+            who = f"QQ{spk_id[-4:]}"
+        else:
+            who = "群里的人"
+        return f"（在群里听 {who} 说过 · {who} 的事）"
+    if said == "user":
+        return "（TA 说的 / TA 的事）"
+    if said == "bot":
+        return "（我说的 / 我的事，不是 TA 的原话）"
+    if said == "both":
+        return "（双方一起的事）"
     tags = mem.get("tags") or []
     if isinstance(tags, str):
         try:
@@ -260,6 +286,165 @@ def _memory_subject_note(mem: dict[str, Any]) -> str:
     if any(str(t) in ("跨会话", "动作留痕") for t in tags) or str(mem.get("source_mode") or "") == "action":
         return "（这是我做过的事，不是 TA 说的）"
     return ""
+
+
+# ---------------- 记忆归属：谁说的 / 是谁的事 ----------------
+# said_by 取值：user（TA 的）/ bot（我的）/ both（双方）/ none（中性事实）/ ''（未标注）
+OWNER_ALIASES: dict[str, str] = {
+    "ta": "user", "他": "user", "她": "user", "用户": "user", "对方": "user",
+    "user": "user", "对方说的": "user",
+    "我": "bot", "助手": "bot", "bot": "bot", "自己": "bot",
+    "双方": "both", "两人": "both", "我们": "both", "both": "both", "互动": "both",
+    "无": "none", "中性": "none", "none": "none", "事实": "none",
+}
+# 把动作明确归给对方的说法：一旦归属被判成「我说的」，摘要里还这么写就是归属错
+_TA_SUBJECT_VERBS = ("说", "送", "要求", "发", "让", "叫", "提", "答应", "讲", "问")
+_OWNER_CONFLICT_MAX = 3
+
+
+def norm_quote(text: str) -> str:
+    """引文归一化：去掉空白与标点再比对。
+
+    模型「逐字复制」时标点经常走样（～/，/…… 被换掉），只认文字，
+    否则一条真事故会因为一个波浪号被判成「查无出处」。
+    """
+    t = re.sub(r"[\s\u3000]+", "", str(text or ""))
+    return re.sub(r"[^\w\u4e00-\u9fff]+", "", t)
+
+
+def says_ta_subject(summary: str, user_name: str = "") -> bool:
+    """摘要是否把动作归给 TA（「TA说…」「纸心送…」）。"""
+    s = str(summary or "")
+    names = ["TA", "ta", "Ta"]
+    if user_name:
+        names.append(str(user_name))
+    for n in names:
+        for v in _TA_SUBJECT_VERBS:
+            if f"{n}{v}" in s:
+                return True
+    return False
+
+
+def verify_memory_owner(
+    summary: str,
+    said_by_raw: str,
+    quote: str,
+    user_text: str,
+    bot_text: str,
+    user_name: str = "",
+) -> tuple[str, str, str]:
+    """校验一条记忆的归属，返回 (said_by, 引文, 结论)。
+
+    结论：ok / owner_fixed（按引文纠正）/ owner_conflict（摘要把我说的话写成 TA，需丢弃）
+          / quote_not_found（引文在对话里找不到）/ no_quote（模型没给引文）
+
+    规则：**引文是证据，模型的自述不是。** 引文只出现在 TA 那侧就是 TA 的，
+    只出现在我这就必须是「我说的」；摘要却把动作写成 TA 做的 —— 这条不能要，
+    留着以后必被当成 TA 的原话。
+    """
+    said = OWNER_ALIASES.get(str(said_by_raw or "").strip().lower(), "")
+    q = norm_quote(quote)[:60]
+    if not q:
+        return said or "none", "", "no_quote"
+    u, b = norm_quote(user_text), norm_quote(bot_text)
+    in_u, in_b = bool(u) and q in u, bool(b) and q in b
+    if in_u and in_b:
+        derived = "both"
+    elif in_u:
+        derived = "user"
+    elif in_b:
+        derived = "bot"
+    else:
+        return said or "none", q, "quote_not_found"
+    if said in ("", "none"):
+        return derived, q, "owner_fixed"
+    if said == "both" or said == derived:
+        return said, q, "ok"
+    # 归属与引文冲突：以引文为准；但如果摘要把动作写成 TA 做的而引文其实是我说的，
+    # 光改字段会把语义留在错的一侧 —— 直接判冲突，由调用方丢弃。
+    if derived == "bot" and said == "user" and says_ta_subject(summary, user_name):
+        return "bot", q, "owner_conflict"
+    return derived, q, "owner_fixed"
+
+
+def _char_grams(text: str, n: int = 3) -> set[str]:
+    """字符 n-gram（去空白/标点后），用于「摘要 ↔ 原句」的确定性匹配。"""
+    t = _norm_for_similarity(text)
+    if not t:
+        return set()
+    if len(t) <= n:
+        return {t}
+    return {t[i:i + n] for i in range(len(t) - n + 1)}
+
+
+def _lcs_len(a: str, b: str) -> int:
+    """最长公共**子串**长度（连续），用来衡量「摘要里有多少字是逐字来自这句原话」。"""
+    a, b = _norm_for_similarity(a), _norm_for_similarity(b)
+    if not a or not b:
+        return 0
+    if len(a) > len(b):
+        a, b = b, a
+    prev = [0] * (len(b) + 1)
+    best = 0
+    for ch in a:
+        cur = [0] * (len(b) + 1)
+        for j, c2 in enumerate(b, 1):
+            if ch == c2:
+                cur[j] = prev[j - 1] + 1
+                if cur[j] > best:
+                    best = cur[j]
+        prev = cur
+    return best
+
+
+def infer_owner(
+    summary: str,
+    turns: list[tuple[str, str]],
+    *,
+    n: int = 3,
+    hi: float = 0.28,
+    lo: float = 0.12,
+    min_lcs: int = 6,
+) -> tuple[str, str, dict[str, float]]:
+    """按**原对话自带的 role** 判定这条记忆是谁说的 —— 不调模型。
+
+    turns: [(role, text)]，role 用 'user' / 'assistant'（bot 也认）。
+    两步：
+      1) 摘要切成字符 n-gram，看被哪一侧的原句覆盖得更多；
+      2) **硬门槛**：命中的那一侧至少要有 min_lcs 个字是逐字重合的，
+         否则判 none（只对上「reset」「好吧」这种短词不算证据 —— 真机误判过）。
+    两侧都覆盖不到 or 门槛不过 → none：宁可标「未标注」，也不猜。
+    """
+    g = _char_grams(summary, n)
+    cov: dict[str, float] = {"user": 0.0, "bot": 0.0, "user_lcs": 0.0, "bot_lcs": 0.0}
+    best: dict[str, str] = {"user": "", "bot": ""}
+    if not g:
+        return "none", "", cov
+    for role, text in turns or []:
+        side = "user" if str(role or "").lower() in ("user", "ta", "对方") else "bot"
+        cg = _char_grams(text, n)
+        if not cg:
+            continue
+        c = len(g & cg) / len(g)
+        l = _lcs_len(summary, text)
+        if c > cov[side] or l > cov[f"{side}_lcs"]:
+            if c > cov[side]:
+                cov[side] = c
+                best[side] = str(text or "")[:80]
+            cov[f"{side}_lcs"] = float(max(cov[f"{side}_lcs"], l))
+    u, b = cov["user"], cov["bot"]
+    lu, lb = cov["user_lcs"], cov["bot_lcs"]
+    # 证据门槛（两选一，真机校准过）：
+    #   覆盖率 ≥ 25%                     → 这段原话明显就是摘要的来源
+    #   或 逐字重合 ≥ 6 字               → 摘要里有整段原话
+    # 只对上「reset」「好吧」这种短词（覆盖率 13%、重合 5 字）一律不认。
+    if max(u, b) < lo or (max(u, b) < 0.25 and max(lu, lb) < min_lcs):
+        return "none", "", cov
+    if u >= hi and b >= hi:
+        return "both", best["user"] or best["bot"], cov
+    if lb > lu or (lb == lu and b >= u):
+        return "bot", best["bot"], cov
+    return "user", best["user"], cov
 
 
 def _norm_for_similarity(text: str) -> str:
@@ -362,7 +547,9 @@ def tokenize(text: str) -> list[str]:
 # 旧实现把 stale / archived 挡在召回外，于是「没被召回 → 归档 → 更不可能被召回 → 遗忘」
 # 变成一条自毁链。乘子让旧记忆变淡，但仍有机会被一句话提起。
 RECALL_STATUSES = ("active", "decayed", "stale", "archived")
-STATUS_WEIGHT = {"active": 1.0, "decayed": 0.85, "stale": 0.7, "archived": 0.4}
+STATUS_WEIGHT = {"active": 1.0, "decayed": 0.85, "stale": 0.7, "archived": 0.4,
+                 # P0-4：forgotten = 降权不降态（旧实现从召回 SQL 硬排除 = 事实丢弃）
+                 "forgotten": 0.2}
 
 
 def status_weight(status: str) -> float:
@@ -383,7 +570,7 @@ async def retrieve_memories(
     tokens = tokenize(query)
     # 实词 token：只命中「今天/什么/记得」这类脚手架的记忆不算被问到（见 QUERY_STOPWORDS）
     ctokens = content_tokens(tokens)
-    base = "SELECT * FROM hf_memories WHERE status NOT IN ('deleted','forgotten') AND COALESCE(muted,0)=0"
+    base = "SELECT * FROM hf_memories WHERE status!='deleted' AND COALESCE(muted,0)=0"
     if not include_archived:
         base += " AND status!='archived'"
 

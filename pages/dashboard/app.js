@@ -7,18 +7,19 @@
  * 「先读到数据再画」，不会出现图表画在空容器上的空白页。
  */
 
-import * as charts from "./charts.js?v=1.0.5-3";
-import { MemoryGraph } from "./graph.js?v=1.0.5-3";
-import { Graph3D } from "./graph3d.js?v=1.0.5-3";
+import * as charts from "./charts.js?v=1.0.6";
+import { MemoryGraph } from "./graph.js?v=1.0.6";
+import { Graph3D } from "./graph3d.js?v=1.0.6";
 import {
   $, $$, STATE, initBridge, setLive, setRefreshHook, goPage, toggleTheme, toast, openDrawer, closeDrawer, esc,
    syncSeg, jsStr, emptyBlock, refreshCurrent, hfGoParams, consumeParamsAnchor, noteConfigDirty,
-} from "./store.js?v=1.0.5-3";
-import * as mem from "./views-memory.js?v=1.0.5-3";
-import * as evt from "./views-events.js?v=1.0.5-3";
-import * as sys from "./views-system.js?v=1.0.5-3";
-import * as act from "./views-actor.js?v=1.0.5-3";
-import { hfSaveDomain } from "./views-conf.js?v=1.0.5-3";
+} from "./store.js?v=1.0.6";
+import * as mem from "./views-memory.js?v=1.0.6";
+import * as evt from "./views-events.js?v=1.0.6";
+import * as sys from "./views-system.js?v=1.0.6";
+import * as act from "./views-actor.js?v=1.0.6";
+import * as chats from "./views-chats.js?v=1.0.6";
+import { hfSaveDomain } from "./views-conf.js?v=1.0.6";
 
 /* ---------------- 页面表 ---------------- */
 const PAGES = {
@@ -57,13 +58,14 @@ const PAGES = {
     // 5 个平级子页签，**页内不再有任何第二层导航**（用户不要"子菜单里藏子菜单"，也不要页顶 chips 栏）；
     // 「名单 / 洞察 / 参数」都收进对应域页**页底默认折叠的卡**里，点开才见。
     subs: [
+      { id: "chats", label: "消息浏览", hint: "所有会话的完整聊天记录（双方气泡，像 QQ 一样按最近聊天排序）" },
       { id: "hub", label: "事件总览", hint: "现象：KPI / 节律热力 / 开口转化 / 为什么没发" },
       { id: "gate", label: "门控", hint: "该不该开口：决策流水（行内展开因子）+ 页底折叠参数" },
       { id: "proactive", label: "主动", hint: "主动投递：倒计时/额度 + 审计 + 页底折叠名单与参数" },
       { id: "recall", label: "撤回", hint: "谁撤回了什么（含图片）+ 页底折叠参数" },
       { id: "favour", label: "好感", hint: "关系结算列表 + 页底折叠洞察与参数" },
     ],
-    render: (sub) => evt.renderMsgDomain(sub || "hub"),
+    render: (sub) => (sub === "chats" ? chats.renderChats() : evt.renderMsgDomain(sub || "hub")),
   },
   settings: {
     title: "设置",
@@ -80,7 +82,7 @@ const PAGES = {
   },
 };
 
-const DEFAULT_SUB = { memory: "graph", actor: "review", messages: "hub", settings: "main" };
+const DEFAULT_SUB = { memory: "graph", actor: "review", messages: "chats", settings: "main" };
 
 /* ---------------- 路由 ---------------- */
 /** 上一次解析到的原始 hash：用来判断「这次是导航还是同 hash 的软刷新」
@@ -429,6 +431,7 @@ function bindActions() {
     hfPersonsRefresh: mem.hfPersonsRefresh,
     hfMemDelete: mem.hfMemDelete,
     hfMemRestore: mem.hfMemRestore,
+    hfConflictResolve: mem.hfConflictResolve,
     hfStyleLearn: sys.hfStyleLearn,
     hfStyleToggle: sys.hfStyleToggle,
     hfStyleRename: sys.hfStyleRename,
